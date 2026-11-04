@@ -1,3 +1,4 @@
+use super::pinned_executor::PluginWork;
 use super::{PinnedExecutor, PluginId, PluginInstruction};
 use crate::global_async_runtime::get_tokio_runtime;
 use crate::plugins::pipes::{
@@ -726,7 +727,12 @@ impl WasmBridge {
             plugin_map.remove_plugins(pid).into_iter().collect()
         };
 
-        // Schedule cleanup on each plugin's pinned thread
+        // Schedule cleanup of every client instance as a single job on the
+        // plugin's pinned thread: all instances share one executor
+        // assignment, and submitting a separate unload per instance lets the
+        // first job's unregistration drop the remaining submissions before
+        // their cleanup runs.
+        let mut cleanups: Vec<PluginWork> = Vec::with_capacity(plugins_to_cleanup.len());
         for ((plugin_id, client_id), (running_plugin, subscriptions, workers)) in plugins_to_cleanup
         {
             // Clear key intercepts if needed (on main thread is OK)
@@ -745,8 +751,7 @@ impl WasmBridge {
                 drop(worker_sender.send(MessageToWorker::Exit));
             }
 
-            self.plugin_executor.execute_plugin_unload(
-                plugin_id,
+            cleanups.push(Box::new(
                 move |senders, _plugin_map, _connected_clients, _plugin_cache, _engine| {
                     let subscriptions_guard = subscriptions.lock().unwrap();
                     let needs_before_close = subscriptions_guard.contains(&EventType::BeforeClose);
@@ -788,7 +793,11 @@ impl WasmBridge {
                     drop(running_plugin);
                     drop(subscriptions);
                 },
-            );
+            ));
+        }
+        if !cleanups.is_empty() {
+            self.plugin_executor
+                .execute_plugin_unload_many(pid, cleanups);
         }
 
         // Main thread cleanup
