@@ -314,6 +314,53 @@ fn spawn_render_scheduler(senders: crate::thread_bus::ThreadSenders) -> SharedRe
 static HELP_TEXT_DEBOUNCE_DURATION: u64 = 5000;
 static COMMAND_OUTPUT_FLASH_DURATION_MS: u64 = 400;
 static HOST_PROGRAM_STATUS_INTERVAL_MS: u64 = 500;
+const RUNNING_JOBS_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct FrameColorGenerations {
+    current: HashMap<PaneId, u64>,
+    next: u64,
+}
+
+impl FrameColorGenerations {
+    fn begin(&mut self, pane_ids: &[PaneId]) -> Vec<(PaneId, u64)> {
+        pane_ids
+            .iter()
+            .map(|pane_id| {
+                self.next = self.next.wrapping_add(1);
+                self.current.insert(*pane_id, self.next);
+                (*pane_id, self.next)
+            })
+            .collect()
+    }
+
+    fn take_current(&mut self, tokens: &[(PaneId, u64)]) -> Vec<PaneId> {
+        let current = tokens
+            .iter()
+            .filter_map(|(pane_id, generation)| {
+                (self.current.get(pane_id) == Some(generation)).then_some(*pane_id)
+            })
+            .collect::<Vec<_>>();
+        for pane_id in &current {
+            self.current.remove(pane_id);
+        }
+        current
+    }
+
+    fn invalidate(&mut self, pane_ids: &[PaneId]) {
+        for pane_id in pane_ids {
+            self.current.remove(pane_id);
+        }
+    }
+}
+
+fn lock_frame_color_generations(
+    generations: &Mutex<FrameColorGenerations>,
+) -> std::sync::MutexGuard<'_, FrameColorGenerations> {
+    generations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Clone)]
 pub struct SessionScanState {
@@ -339,6 +386,8 @@ pub(crate) fn background_jobs_main(
 ) -> Result<()> {
     let err_context = || "failed to write to pty".to_string();
     let mut running_jobs: HashMap<BackgroundJob, Instant> = HashMap::new();
+    let mut last_running_jobs_prune = Instant::now();
+    let frame_color_generations = Arc::new(Mutex::new(FrameColorGenerations::default()));
     let mut loading_plugins: HashMap<u32, Arc<AtomicBool>> = HashMap::new(); // u32 - plugin_id
     let current_session_name = Arc::new(Mutex::new(String::default()));
     let current_session_info = Arc::new(Mutex::new(SessionInfo::default()));
@@ -460,6 +509,12 @@ pub(crate) fn background_jobs_main(
     }
 
     loop {
+        if last_running_jobs_prune.elapsed() >= RUNNING_JOBS_PRUNE_INTERVAL {
+            running_jobs.retain(|_, started| {
+                started.elapsed() <= Duration::from_millis(LONG_FLASH_DURATION_MS)
+            });
+            last_running_jobs_prune = Instant::now();
+        }
         let (event, mut err_ctx) = bus.recv().with_context(err_context)?;
         err_ctx.add_call(ContextType::BackgroundJob((&event).into()));
         match event {
@@ -470,8 +525,11 @@ pub(crate) fn background_jobs_main(
                 ) {
                     continue;
                 }
+                let frame_color_tokens =
+                    lock_frame_color_generations(&frame_color_generations).begin(&pane_ids);
                 runtime.spawn({
                     let senders = bus.senders.clone();
+                    let frame_color_generations = frame_color_generations.clone();
                     async move {
                         let _ = senders.send_to_screen(
                             ScreenInstruction::AddRedPaneFrameColorOverride(
@@ -483,9 +541,13 @@ pub(crate) fn background_jobs_main(
                             LONG_FLASH_DURATION_MS,
                         ))
                         .await;
-                        let _ = senders.send_to_screen(
-                            ScreenInstruction::ClearPaneFrameColorOverride(pane_ids),
-                        );
+                        let pane_ids = lock_frame_color_generations(&frame_color_generations)
+                            .take_current(&frame_color_tokens);
+                        if !pane_ids.is_empty() {
+                            let _ = senders.send_to_screen(
+                                ScreenInstruction::ClearPaneFrameColorOverride(pane_ids),
+                            );
+                        }
                     }
                 });
             },
@@ -709,8 +771,11 @@ pub(crate) fn background_jobs_main(
                 ) {
                     continue;
                 }
+                let frame_color_tokens =
+                    lock_frame_color_generations(&frame_color_generations).begin(&pane_ids);
                 runtime.spawn({
                     let senders = bus.senders.clone();
+                    let frame_color_generations = frame_color_generations.clone();
                     async move {
                         let _ = senders.send_to_screen(
                             ScreenInstruction::AddHighlightPaneFrameColorOverride(
@@ -720,9 +785,13 @@ pub(crate) fn background_jobs_main(
                         );
                         tokio::time::sleep(std::time::Duration::from_millis(FLASH_DURATION_MS))
                             .await;
-                        let _ = senders.send_to_screen(
-                            ScreenInstruction::ClearPaneFrameColorOverride(pane_ids),
-                        );
+                        let pane_ids = lock_frame_color_generations(&frame_color_generations)
+                            .take_current(&frame_color_tokens);
+                        if !pane_ids.is_empty() {
+                            let _ = senders.send_to_screen(
+                                ScreenInstruction::ClearPaneFrameColorOverride(pane_ids),
+                            );
+                        }
                     }
                 });
             },
@@ -948,6 +1017,8 @@ pub(crate) fn background_jobs_main(
             },
             BackgroundJob::FlashPaneBell(pane_ids) => {
                 let is_flashing = Arc::new(AtomicBool::new(true));
+                let frame_color_tokens =
+                    lock_frame_color_generations(&frame_color_generations).begin(&pane_ids);
                 for &pane_id in &pane_ids {
                     flashing_pane_bells.insert(pane_id, is_flashing.clone());
                 }
@@ -955,6 +1026,7 @@ pub(crate) fn background_jobs_main(
                     let senders = bus.senders.clone();
                     let pane_ids_clone = pane_ids.clone();
                     let flag = is_flashing.clone();
+                    let frame_color_generations = frame_color_generations.clone();
                     async move {
                         let _ = senders.send_to_screen(
                             ScreenInstruction::AddHighlightPaneFrameColorOverride(
@@ -965,14 +1037,19 @@ pub(crate) fn background_jobs_main(
                         tokio::time::sleep(std::time::Duration::from_millis(FLASH_DURATION_MS))
                             .await;
                         if flag.load(Ordering::SeqCst) {
-                            let _ = senders.send_to_screen(
-                                ScreenInstruction::ClearPaneFrameColorOverride(pane_ids_clone),
-                            );
+                            let pane_ids = lock_frame_color_generations(&frame_color_generations)
+                                .take_current(&frame_color_tokens);
+                            if !pane_ids.is_empty() {
+                                let _ = senders.send_to_screen(
+                                    ScreenInstruction::ClearPaneFrameColorOverride(pane_ids),
+                                );
+                            }
                         }
                     }
                 });
             },
             BackgroundJob::StopFlashPaneBell(pane_ids) => {
+                lock_frame_color_generations(&frame_color_generations).invalidate(&pane_ids);
                 for &pane_id in &pane_ids {
                     if let Some(flag) = flashing_pane_bells.remove(&pane_id) {
                         flag.store(false, Ordering::SeqCst);
@@ -1377,6 +1454,28 @@ mod tests {
         let folder = info_dir.join(session);
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("session-layout.kdl"), "layout { }").unwrap();
+    }
+
+    #[test]
+    fn a_newer_frame_color_override_invalidates_the_older_expiry() {
+        let pane_id = PaneId::Terminal(1);
+        let mut generations = FrameColorGenerations::default();
+        let older = generations.begin(&[pane_id]);
+        let newer = generations.begin(&[pane_id]);
+
+        assert!(generations.take_current(&older).is_empty());
+        assert_eq!(generations.take_current(&newer), vec![pane_id]);
+    }
+
+    #[test]
+    fn an_explicit_clear_invalidates_a_pending_expiry() {
+        let pane_id = PaneId::Terminal(1);
+        let mut generations = FrameColorGenerations::default();
+        let pending = generations.begin(&[pane_id]);
+
+        generations.invalidate(&[pane_id]);
+
+        assert!(generations.take_current(&pending).is_empty());
     }
 
     #[test]
