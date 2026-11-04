@@ -12,8 +12,8 @@ use wasmi::Engine;
 /// A dynamic thread pool that pins jobs to specific threads based on plugin_id
 /// Starts with 1 thread and expands when threads are busy, shrinks when plugins unload
 pub struct PinnedExecutor {
-    // Sparse vector - Some(thread) for active threads, None for removed threads
-    execution_threads: Arc<Mutex<Vec<Option<ExecutionThread>>>>,
+    // Live workers keyed by monotonically increasing, non-reused thread ids
+    execution_threads: Arc<Mutex<HashMap<usize, ExecutionThread>>>,
 
     // Maps plugin_id -> thread_index (permanent assignment)
     plugin_assignments: Arc<Mutex<HashMap<u32, usize>>>,
@@ -79,7 +79,7 @@ impl PinnedExecutor {
         );
 
         PinnedExecutor {
-            execution_threads: Arc::new(Mutex::new(vec![Some(thread_0)])),
+            execution_threads: Arc::new(Mutex::new(HashMap::from([(0, thread_0)]))),
             plugin_assignments: Arc::new(Mutex::new(HashMap::new())),
             thread_plugins: Arc::new(Mutex::new(HashMap::new())),
             next_thread_idx: AtomicUsize::new(1), // Next will be index 1
@@ -156,14 +156,17 @@ impl PinnedExecutor {
         // Find a non-busy thread with assigned plugins (prefer reusing threads)
         let mut best_thread: Option<(usize, usize)> = None; // (index, load)
 
-        for (idx, thread_opt) in threads.iter().enumerate() {
-            if let Some(thread) = thread_opt {
-                let is_busy = thread.jobs_in_flight.load(Ordering::SeqCst) > 0;
-                if !is_busy {
-                    let load = thread_plugins.get(&idx).map(|s| s.len()).unwrap_or(0);
-                    if best_thread.is_none() || best_thread.map(|b| load < b.1).unwrap_or(false) {
-                        best_thread = Some((idx, load));
-                    }
+        for (idx, thread) in threads.iter() {
+            let is_busy = thread.jobs_in_flight.load(Ordering::SeqCst) > 0;
+            if !is_busy {
+                let load = thread_plugins.get(idx).map(|s| s.len()).unwrap_or(0);
+                let is_better = best_thread
+                    .map(|(best_idx, best_load)| {
+                        load < best_load || (load == best_load && *idx < best_idx)
+                    })
+                    .unwrap_or(true);
+                if is_better {
+                    best_thread = Some((*idx, load));
                 }
             }
         }
@@ -173,8 +176,7 @@ impl PinnedExecutor {
             idx
         } else {
             // All threads are busy - need to expand
-            let active_thread_count = threads.iter().filter(|thread| thread.is_some()).count();
-            if active_thread_count < self.max_threads {
+            if threads.len() < self.max_threads {
                 // Spawn a new thread
                 let new_idx = self.next_thread_idx.fetch_add(1, Ordering::SeqCst);
                 drop(threads); // Release lock before spawning
@@ -183,10 +185,14 @@ impl PinnedExecutor {
             } else {
                 // At max capacity, assign to least-loaded thread
                 threads
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, t)| t.as_ref().map(|_| idx))
-                    .min_by_key(|&idx| thread_plugins.get(&idx).map(|s| s.len()).unwrap_or(0))
+                    .keys()
+                    .min_by_key(|idx| {
+                        (
+                            thread_plugins.get(*idx).map(|s| s.len()).unwrap_or(0),
+                            **idx,
+                        )
+                    })
+                    .copied()
                     .unwrap_or_else(|| {
                         log::error!("Failed to find free thread to run the plugin!");
                         0 // this is a misconfiguration, but we don't want to crash the app
@@ -216,11 +222,7 @@ impl PinnedExecutor {
             self.engine.clone(),
         );
 
-        // Extend vector if needed
-        while threads.len() <= thread_idx {
-            threads.push(None);
-        }
-        threads[thread_idx] = Some(new_thread);
+        threads.insert(thread_idx, new_thread);
     }
 
     /// Execute job pinned to plugin's assigned thread
@@ -247,8 +249,7 @@ impl PinnedExecutor {
 
         // Get thread and mark as busy
         let threads = self.execution_threads.lock().unwrap();
-        let thread = threads[thread_idx].as_ref();
-        let Some(thread) = thread else {
+        let Some(thread) = threads.get(&thread_idx) else {
             log::error!("Failed to find thread for plugin with id: {}", plugin_id);
             return;
         };
@@ -333,47 +334,34 @@ impl PinnedExecutor {
     }
 
     fn try_shrink_pool(&self) {
-        let thread_plugins = self.thread_plugins.lock().unwrap();
+        let mut thread_plugins = self.thread_plugins.lock().unwrap();
         let mut threads = self.execution_threads.lock().unwrap();
 
         // Find threads with no assigned plugins (except thread 0, always keep it)
         let threads_to_remove: Vec<usize> = threads
-            .iter()
-            .enumerate()
-            .skip(1) // Never remove thread 0
-            .filter_map(|(idx, thread_opt)| {
-                if thread_opt.is_some() {
-                    let has_plugins = thread_plugins
-                        .get(&idx)
+            .keys()
+            .copied()
+            .filter(|idx| {
+                *idx != 0
+                    && !thread_plugins
+                        .get(idx)
                         .map(|s| !s.is_empty())
-                        .unwrap_or(false);
-                    if !has_plugins {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                        .unwrap_or(false)
             })
             .collect();
 
         // Shutdown and remove idle threads
         for idx in threads_to_remove {
-            if let Some(thread) = threads[idx].take() {
+            if let Some(thread) = threads.remove(&idx) {
                 let _ = thread.sender.send(Job::Shutdown);
+                thread_plugins.remove(&idx);
             }
         }
     }
 
     #[cfg(test)]
     pub fn thread_count(&self) -> usize {
-        self.execution_threads
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|t| t.is_some())
-            .count()
+        self.execution_threads.lock().unwrap().len()
     }
 }
 
@@ -382,10 +370,8 @@ impl Drop for PinnedExecutor {
         let mut threads = self.execution_threads.lock().unwrap();
 
         // Send shutdown to all threads
-        for thread_opt in threads.iter_mut() {
-            if let Some(thread) = thread_opt {
-                let _ = thread.sender.send(Job::Shutdown);
-            }
+        for thread in threads.values_mut() {
+            let _ = thread.sender.send(Job::Shutdown);
         }
     }
 }
@@ -574,6 +560,10 @@ mod tests {
             .expect("Unload should complete");
         thread::sleep(Duration::from_millis(100));
         assert_eq!(executor.thread_count(), 1);
+        assert!(
+            !executor.thread_plugins.lock().unwrap().contains_key(&1),
+            "retired worker bookkeeping must be removed"
+        );
 
         barrier.wait();
         thread::sleep(Duration::from_millis(50));
