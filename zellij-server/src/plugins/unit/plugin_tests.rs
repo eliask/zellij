@@ -13837,6 +13837,7 @@ fn plugin_env_without_read_pane_contents() -> super::plugin_map::PluginEnv {
             initial_userspace_configuration: PluginUserConfiguration::new(BTreeMap::new()),
             initial_cwd: None,
         },
+        plugin_digest: "test-digest".to_owned(),
         permissions: Arc::new(Mutex::new(Some(permissions))),
         senders: Default::default(),
         wasi_ctx,

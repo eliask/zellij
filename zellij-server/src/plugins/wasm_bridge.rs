@@ -2317,11 +2317,13 @@ impl WasmBridge {
             return Ok(());
         }
 
-        let mut permission_cache = PermissionCache::from_path_or_default(cache_path);
-        permission_cache.cache(
-            running_plugin.store.data().plugin.location.to_string(),
-            permissions,
+        let permission_cache_key = format!(
+            "{}#{}",
+            running_plugin.store.data().plugin.location,
+            running_plugin.store.data().plugin_digest
         );
+        let mut permission_cache = PermissionCache::from_path_or_default(cache_path);
+        permission_cache.cache(permission_cache_key, permissions);
 
         permission_cache.write_to_file().with_context(err_context)
     }
