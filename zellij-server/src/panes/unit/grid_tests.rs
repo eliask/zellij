@@ -10618,6 +10618,130 @@ fn scrollback_length_matches_a_full_recount_when_long_wrapped_lines_are_evicted(
 }
 
 #[test]
+fn scrollback_length_counts_unsplittable_wide_characters_exactly() {
+    // Three width-2 characters at width 3 wrap onto three display rows:
+    // the naive ceil(6/3) = 2 undercounts because a wide character can
+    // never straddle a wrap boundary.
+    let wide_line = "\u{4e16}\u{4e16}\u{4e16}".as_bytes();
+    let mut grid = create_grid_with_size_and_raw(2, 3, b"");
+    let mut content: Vec<u8> = Vec::new();
+    for _ in 0..40 {
+        content.extend_from_slice(wide_line);
+        content.extend_from_slice(b"\r\n");
+    }
+    feed_bytes(&mut grid, &content);
+    assert_eq!(grid.width, 3);
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        scrollback_recount(&mut grid),
+        "the reported length must match a character-exact recount"
+    );
+    // With each width-2 character alone on a display row, the recount is
+    // at least the stored row count; the aggregate estimate
+    // (ceil(6/3) = 2 per line of three stored rows) would undercount it.
+    assert!(scrollback_recount(&mut grid) >= grid.lines_above.len());
+}
+
+#[test]
+fn scrollback_length_stays_exact_while_wide_char_runs_are_evicted() {
+    let scroll_buffer_size = *SCROLL_BUFFER_SIZE.get_or_init(|| 10_000);
+    let wide_line = "\u{4e16}\u{4e16}\u{4e16}\u{4e16}".as_bytes();
+    let mut grid = filled_scrollback(3, 4, wide_line, scroll_buffer_size / 2 + 50);
+    assert_eq!(grid.lines_above.len(), scroll_buffer_size);
+    grid.change_size(3, 3);
+    let batch = repeated_lines("\u{4e16}\u{4e16}".as_bytes(), 300);
+    for round in 0..6 {
+        feed_bytes(&mut grid, &batch);
+        assert_eq!(
+            grid.scrollback_position_and_length().1,
+            scrollback_recount(&mut grid),
+            "wide-character runs must be accounted exactly on eviction, round {round}"
+        );
+    }
+}
+
+#[test]
+fn evicting_from_a_stale_long_wrapped_line_stays_cheap_and_exact() {
+    // One logical line of 2,000 rows at width 200 at the very front of a
+    // nearly full scrollback, then a resize (which leaves the stored wrap
+    // stale). Every later eviction used to re-wrap the whole remaining
+    // run character by character, so the work grew with
+    // evictions * cells in the run.
+    let scroll_buffer_size = *SCROLL_BUFFER_SIZE.get_or_init(|| 10_000);
+    let columns = 200;
+    let run_rows = 2_000;
+    let mut grid = create_grid_with_size_and_raw(5, columns, b"");
+    let mut long_line = vec![b'a'; columns * run_rows];
+    long_line.extend_from_slice(b"\r\n");
+    feed_bytes(&mut grid, &long_line);
+    let filler = scroll_buffer_size - run_rows - 100;
+    feed_bytes(&mut grid, &repeated_lines(b"short", filler));
+    assert!(grid.lines_above.len() < scroll_buffer_size);
+    grid.change_size(5, columns - 1);
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        scrollback_recount(&mut grid),
+        "the length must be exact right after the resize"
+    );
+
+    super::reset_wrap_character_step_count();
+    let evictions = 400;
+    feed_bytes(&mut grid, &repeated_lines(b"short", 100 + evictions));
+    assert_eq!(grid.lines_above.len(), scroll_buffer_size);
+    let steps = super::wrap_character_step_count();
+    assert!(
+        steps <= 10 * evictions,
+        "stale-run evictions must not walk the run character by character: {steps} steps for {evictions} evictions"
+    );
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        scrollback_recount(&mut grid),
+        "single-width stale runs must be accounted exactly on eviction"
+    );
+}
+
+#[test]
+fn evicting_from_a_stale_wide_character_run_is_bounded_per_eviction() {
+    // A run of width-2 characters is beyond the exact budget: each
+    // eviction steps at most a fixed number of characters, and the
+    // reported length may differ from a full recount by only a few rows.
+    let scroll_buffer_size = *SCROLL_BUFFER_SIZE.get_or_init(|| 10_000);
+    let columns = 100;
+    let run_rows = 1_500;
+    let mut grid = create_grid_with_size_and_raw(5, columns, b"");
+    let mut long_line = "\u{4e16}".repeat(columns / 2 * run_rows).into_bytes();
+    long_line.extend_from_slice(b"\r\n");
+    feed_bytes(&mut grid, &long_line);
+    feed_bytes(
+        &mut grid,
+        &repeated_lines(b"short", scroll_buffer_size - run_rows - 100),
+    );
+    grid.change_size(5, columns - 1);
+
+    super::reset_wrap_character_step_count();
+    let evictions = 300;
+    feed_bytes(&mut grid, &repeated_lines(b"short", 100 + evictions));
+    let steps = super::wrap_character_step_count();
+    let budget = super::EVICTION_WIDE_CHARACTER_BUDGET;
+    assert!(
+        steps <= 2 * evictions * budget,
+        "wide-character stale runs must stay within the per-eviction budget: {steps} steps"
+    );
+    let reported = grid.scrollback_position_and_length().1;
+    let recount = scrollback_recount(&mut grid);
+    assert!(
+        reported.abs_diff(recount) <= 2 * evictions,
+        "estimated eviction deltas may drift by a row at most each: reported {reported}, recount {recount}"
+    );
+    grid.change_size(5, columns);
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        scrollback_recount(&mut grid),
+        "a resize recounts the whole scrollback exactly"
+    );
+}
+
+#[test]
 fn scrollback_length_matches_a_full_recount_while_a_drag_changes_the_width_under_output() {
     let scroll_buffer_size = *SCROLL_BUFFER_SIZE.get_or_init(|| 10_000);
     let mut grid = filled_scrollback(5, 20, b"0123456789012345678901234", scroll_buffer_size / 2);
@@ -11598,4 +11722,58 @@ fn a_url_with_a_suggestion_after_the_cursor_waits_until_the_line_is_final() {
         linked_uris(&grid),
         vec!["http://www.example.org".to_owned()]
     );
+}
+
+#[test]
+fn evicting_a_stored_row_of_wide_characters_debits_its_exact_display_rows() {
+    // 5,000 width-2 characters wrap to one character per row at width
+    // 3: 5,000 display rows. Estimating from the 10,000-cell total gave
+    // ceil(10000 / 3) = 3,334, a 1,666-row phantom per eviction.
+    let scroll_buffer_size = *SCROLL_BUFFER_SIZE.get_or_init(|| 10_000);
+    let mut grid = create_grid_with_size_and_raw(5, 10_000, b"");
+    let mut wide_line = "\u{4e16}".repeat(5_000).into_bytes();
+    wide_line.extend_from_slice(b"\r\n");
+    feed_bytes(&mut grid, &wide_line);
+    feed_bytes(&mut grid, &repeated_lines(b"x", 20));
+    grid.change_size(5, 3);
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        scrollback_recount(&mut grid)
+    );
+    assert!(grid.scrollback_position_and_length().1 >= 5_000);
+    feed_bytes(&mut grid, &repeated_lines(b"x", scroll_buffer_size + 10));
+    assert!(grid.lines_above.iter().all(|row| row.columns.len() <= 3));
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        scrollback_recount(&mut grid),
+        "the wide row's rows must be debited exactly when it is evicted"
+    );
+}
+
+#[test]
+fn evicting_a_row_whose_character_is_wider_than_the_pane_stays_exact() {
+    // "你a" wraps at width 2 into [你] and [a]. At width 1 the wide
+    // character overflows its row, so the single-cell shortcut must not
+    // treat the open row as having room: evicting the 你 row removes one
+    // display row, not two.
+    let scroll_buffer_size = *SCROLL_BUFFER_SIZE.get_or_init(|| 10_000);
+    let mut grid = create_grid_with_size_and_raw(5, 2, b"");
+    feed_bytes(&mut grid, "\u{4f60}a\r\n".as_bytes());
+    feed_bytes(&mut grid, &repeated_lines(b"x", 10));
+    grid.change_size(5, 1);
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        scrollback_recount(&mut grid)
+    );
+    let missing = scroll_buffer_size - grid.lines_above.len() - 1;
+    feed_bytes(&mut grid, &repeated_lines(b"x", missing));
+    for _ in 0..30 {
+        feed_bytes(&mut grid, b"x\r\n");
+        assert_eq!(
+            grid.scrollback_position_and_length().1,
+            scrollback_recount(&mut grid),
+            "after {} stored rows",
+            grid.lines_above.len()
+        );
+    }
 }
