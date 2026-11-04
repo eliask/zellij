@@ -10017,6 +10017,20 @@ fn same_size_forced_reflow_keeps_cursor_at_start_of_wrapped_row() {
 }
 
 #[test]
+fn forced_reflow_normalizes_an_orphaned_continuation_row() {
+    let mut grid = create_sized_grid_with_content(3, 10, "");
+    grid.lines_above.clear();
+    grid.viewport.clear();
+    grid.viewport.push_back(row_from_str("orphan"));
+
+    grid.force_change_size(3, 10);
+
+    assert_eq!(grid.viewport.len(), 1);
+    assert!(grid.viewport[0].is_canonical);
+    assert_eq!(row_to_string(&grid.viewport[0]), "orphan");
+}
+
+#[test]
 fn height_only_resize_keeps_cursor_at_start_of_wrapped_row() {
     let mut grid = create_sized_grid_with_content(5, 10, "0123456789a\u{8}");
 

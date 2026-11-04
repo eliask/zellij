@@ -1936,11 +1936,10 @@ impl Grid {
                             last_line.append(&mut row);
                         },
                         None => {
-                            // the state is corrupted somehow
-                            // this is a bug and I'm not yet sure why it happens
-                            // usually it fixes itself and is a result of some race
-                            // TODO: investigate why this happens and solve it
-                            return;
+                            log::warn!(
+                                "viewport began with a continuation row and no scrollback; normalizing it as canonical"
+                            );
+                            viewport_canonical_lines.push(row.canonical());
                         },
                     }
                 }
