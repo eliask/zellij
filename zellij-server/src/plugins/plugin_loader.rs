@@ -47,6 +47,26 @@ fn open_dir(path: &std::path::Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+// The supported initialization ABI: if a module exports `_initialize`, it
+// must be `() -> ()` and must not trap. Either failure aborts the load so a
+// failed initializer can never reach the running plugin map.
+fn run_initialize_hook<T>(
+    store: &mut Store<T>,
+    instance: &Instance,
+    plugin_id: PluginId,
+) -> Result<()> {
+    let Some(func) = instance.get_func(&mut *store, "_initialize") else {
+        return Ok(());
+    };
+    let typed_func = func.typed::<(), ()>(&*store).with_context(|| {
+        format!("plugin {plugin_id} exports _initialize with an unsupported signature")
+    })?;
+    typed_func
+        .call(&mut *store, ())
+        .with_context(|| format!("plugin {plugin_id} initialization failed"))?;
+    Ok(())
+}
+
 fn create_plugin_fs_entries(plugin_own_data_dir: &PathBuf, plugin_own_cache_dir: &PathBuf) {
     // Create filesystem entries mounted into WASM.
     // We create them here to get expressive error messages in case they fail.
@@ -356,11 +376,7 @@ impl PluginLoader {
             .instantiate_and_start(&mut store, &module)
             .with_context(err_context)?;
 
-        if let Some(func) = instance.get_func(&mut store, "_initialize") {
-            if let Ok(typed_func) = func.typed::<(), ()>(&store) {
-                let _ = typed_func.call(&mut store, ());
-            }
-        }
+        run_initialize_hook(&mut store, &instance, self.plugin_id)?;
 
         self.plugin_cache
             .lock()
@@ -472,11 +488,7 @@ impl PluginLoader {
             .instantiate_and_start(&mut store, module)
             .with_context(err_context)?;
 
-        if let Some(func) = instance.get_func(&mut store, "_initialize") {
-            if let Ok(typed_func) = func.typed::<(), ()>(&store) {
-                let _ = typed_func.call(&mut store, ());
-            }
-        }
+        run_initialize_hook(&mut store, &instance, self.plugin_id)?;
 
         Ok((store, instance))
     }
@@ -562,7 +574,44 @@ fn create_optimized_store_limits() -> StoreLimits {
 
 #[cfg(test)]
 mod tests {
-    use super::plugin_digest_from_bytes;
+    use super::{plugin_digest_from_bytes, run_initialize_hook};
+    use wasmi::{Engine, Linker, Module, Store};
+
+    fn instantiate(wat: &str) -> (Store<()>, wasmi::Instance) {
+        let engine = Engine::default();
+        let module = Module::new(&engine, wat::parse_str(wat).unwrap()).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = Linker::new(&engine)
+            .instantiate_and_start(&mut store, &module)
+            .unwrap();
+        (store, instance)
+    }
+
+    #[test]
+    fn a_trapping_initialize_is_rejected() {
+        let (mut store, instance) =
+            instantiate(r#"(module (func (export "_initialize") unreachable))"#);
+        assert!(run_initialize_hook(&mut store, &instance, 1).is_err());
+    }
+
+    #[test]
+    fn an_initialize_with_an_unsupported_signature_is_rejected() {
+        let (mut store, instance) =
+            instantiate(r#"(module (func (export "_initialize") (param i32)))"#);
+        assert!(run_initialize_hook(&mut store, &instance, 1).is_err());
+    }
+
+    #[test]
+    fn a_well_formed_initialize_runs() {
+        let (mut store, instance) = instantiate(r#"(module (func (export "_initialize")))"#);
+        assert!(run_initialize_hook(&mut store, &instance, 1).is_ok());
+    }
+
+    #[test]
+    fn a_module_without_initialize_is_accepted() {
+        let (mut store, instance) = instantiate(r#"(module (func (export "load")))"#);
+        assert!(run_initialize_hook(&mut store, &instance, 1).is_ok());
+    }
 
     #[test]
     fn plugin_digest_changes_when_module_bytes_change() {

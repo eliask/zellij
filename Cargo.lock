@@ -5567,6 +5567,7 @@ checksum = "8c9d90bb93e764f6beabf1d02028c70a2156a6583e63ac4218dd07ef733368b0"
 dependencies = [
  "bitflags 2.11.0",
  "indexmap 2.14.0",
+ "semver",
 ]
 
 [[package]]
@@ -6616,6 +6617,7 @@ dependencies = [
  "uuid",
  "wasmi",
  "wasmi_wasi",
+ "wat",
  "windows-sys 0.59.0",
  "zellij-utils",
 ]

@@ -74,6 +74,7 @@ windows-sys = { workspace = true, features = [
 insta = "1.48"
 tempfile = "3.2.0"
 wasmi = { version = "1.1.0", features = ["std"] }
+wat = "1.239"
 
 [features]
 web_server_capability = ["zellij-utils/web_server_capability"]
