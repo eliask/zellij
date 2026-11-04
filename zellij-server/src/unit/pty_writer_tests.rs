@@ -204,12 +204,12 @@ fn pending_queue_tracks_remaining_bytes_incrementally() {
     queue.push_back(PendingWrite {
         bytes: b"hello".to_vec(),
         offset: 0,
-        _completion: None,
+        completion: None,
     });
     queue.push_back(PendingWrite {
         bytes: b" world".to_vec(),
         offset: 2,
-        _completion: None,
+        completion: None,
     });
 
     assert_eq!(queue.remaining_bytes, 9);
@@ -510,13 +510,13 @@ fn empty_writes_spend_the_turn_budget() {
         queue.push_back(PendingWrite {
             bytes: Vec::new(),
             offset: 0,
-            _completion: None,
+            completion: None,
         });
     }
     queue.push_back(PendingWrite {
         bytes: b"tail".to_vec(),
         offset: 0,
-        _completion: None,
+        completion: None,
     });
 
     assert!(drain_terminal_turn(&mut queue, 1, &mock));

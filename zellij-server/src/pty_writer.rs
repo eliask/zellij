@@ -58,7 +58,7 @@ const MAX_DRAIN_CALLS_PER_TURN: usize = 32;
 struct PendingWrite {
     bytes: Vec<u8>,
     offset: usize,
-    _completion: Option<NotificationEnd>,
+    completion: Option<NotificationEnd>,
 }
 
 #[derive(Default)]
@@ -95,8 +95,15 @@ impl PendingQueue {
         }
     }
 
-    fn clear(&mut self) {
-        self.writes.clear();
+    /// Discard every queued write, reporting the discard as a truthful
+    /// failure on each write's completion token instead of the silent
+    /// success an unmarked drop would produce.
+    fn fail_all(&mut self, reason: &str) {
+        for mut write in self.writes.drain(..) {
+            if let Some(mut completion) = write.completion.take() {
+                completion.set_error_message(reason.to_string());
+            }
+        }
         self.remaining_bytes = 0;
     }
 }
@@ -149,12 +156,21 @@ pub(crate) fn pty_writer_main(bus: Bus<PtyWriteInstruction>) -> Result<()> {
                             bytes.len(),
                             MAX_PENDING_BYTES,
                         );
-                        queue.clear();
+                        queue.fail_all(
+                            "pty write queue overflowed the pending byte limit; \
+                             the write was discarded before reaching the terminal",
+                        );
+                        if let Some(mut completion) = completion {
+                            completion.set_error_message(
+                                "pty write rejected: pending byte limit already exceeded"
+                                    .to_string(),
+                            );
+                        }
                     } else {
                         queue.push_back(PendingWrite {
                             bytes,
                             offset: 0,
-                            _completion: completion,
+                            completion,
                         });
                     }
                 },
@@ -246,14 +262,90 @@ fn drain_terminal_turn(queue: &mut PendingQueue, tid: u32, os_input: &dyn Server
                 progress = true;
             },
             Err(e) => {
-                // Terminal error (EBADF, EIO, etc) — clear its queue
+                // Terminal error (EBADF, EIO, etc) — report every
+                // discarded write as failed rather than completed.
+                let reason = format!(
+                    "pty write failed ({e}); the write was discarded before \
+                     reaching the terminal"
+                );
                 Err::<(), _>(e).with_context(err_context).non_fatal();
-                queue.clear();
+                queue.fail_all(&reason);
                 break;
             },
         }
     }
     progress
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn discarded_writes_report_failure_and_drained_writes_report_success() {
+        // Three queued writes: one drains fully, two are discarded by a
+        // failure. Each token must tell the truth about its outcome.
+        let mut queue = PendingQueue::default();
+        let (ok_tx, ok_rx) = oneshot::channel();
+        let (fail_tx1, fail_rx1) = oneshot::channel();
+        let (fail_tx2, fail_rx2) = oneshot::channel();
+        queue.push_back(PendingWrite {
+            bytes: b"done".to_vec(),
+            offset: 0,
+            completion: Some(NotificationEnd::new(ok_tx)),
+        });
+        queue.push_back(PendingWrite {
+            bytes: b"lost1".to_vec(),
+            offset: 0,
+            completion: Some(NotificationEnd::new(fail_tx1)),
+        });
+        queue.push_back(PendingWrite {
+            bytes: b"lost2".to_vec(),
+            offset: 0,
+            completion: Some(NotificationEnd::new(fail_tx2)),
+        });
+
+        queue.advance(4);
+        let ok_result = ok_rx.blocking_recv().expect("completed write resolves");
+        assert_eq!(ok_result.error_message, None);
+
+        queue.fail_all("terminal went away");
+        let fail_result1 = fail_rx1.blocking_recv().expect("discarded write resolves");
+        let fail_result2 = fail_rx2.blocking_recv().expect("discarded write resolves");
+        assert_eq!(
+            fail_result1.error_message.as_deref(),
+            Some("terminal went away")
+        );
+        assert_eq!(
+            fail_result2.error_message.as_deref(),
+            Some("terminal went away")
+        );
+        assert_eq!(queue.remaining_bytes, 0);
+    }
+
+    #[test]
+    fn pending_byte_accounting_tracks_partial_drains() {
+        let mut queue = PendingQueue::default();
+        queue.push_back(PendingWrite {
+            bytes: vec![0u8; 10],
+            offset: 0,
+            completion: None,
+        });
+        queue.push_back(PendingWrite {
+            bytes: vec![0u8; 5],
+            offset: 0,
+            completion: None,
+        });
+        assert_eq!(queue.remaining_bytes, 15);
+        queue.advance(4);
+        assert_eq!(queue.remaining_bytes, 11);
+        queue.advance(6);
+        assert_eq!(queue.remaining_bytes, 5);
+        queue.advance(5);
+        assert_eq!(queue.remaining_bytes, 0);
+        assert!(queue.is_empty());
+    }
 }
 
 #[cfg(test)]
