@@ -13820,6 +13820,7 @@ fn plugin_env_without_read_pane_contents() -> super::plugin_map::PluginEnv {
         &dir,
         &"file:/tmp/third-party.wasm".to_owned(),
         1,
+        false,
         stdin_pipe.clone(),
         stdout_pipe.clone(),
     )

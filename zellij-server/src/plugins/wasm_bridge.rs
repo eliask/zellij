@@ -1372,6 +1372,7 @@ impl WasmBridge {
                                 &ZELLIJ_TMP_DIR,
                                 &plugin_env.plugin.location.to_string(),
                                 plugin_env.plugin_id,
+                                plugin_env.plugin.is_builtin(),
                                 stdin_pipe.clone(),
                                 stdout_pipe.clone(),
                             );
@@ -3774,6 +3775,7 @@ fn change_host_dir_of_running_plugin(
         &ZELLIJ_TMP_DIR,
         &plugin_env.plugin.location.to_string(),
         plugin_env.plugin_id,
+        plugin_env.plugin.is_builtin(),
         plugin_env.stdin_pipe.clone(),
         plugin_env.stdout_pipe.clone(),
     )?;
