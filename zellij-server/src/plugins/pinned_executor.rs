@@ -173,7 +173,8 @@ impl PinnedExecutor {
             idx
         } else {
             // All threads are busy - need to expand
-            if threads.len() < self.max_threads {
+            let active_thread_count = threads.iter().filter(|thread| thread.is_some()).count();
+            if active_thread_count < self.max_threads {
                 // Spawn a new thread
                 let new_idx = self.next_thread_idx.fetch_add(1, Ordering::SeqCst);
                 drop(threads); // Release lock before spawning
@@ -550,6 +551,47 @@ mod tests {
         assert_eq!(executor.thread_count(), 2);
 
         // Release barrier
+        barrier.wait();
+    }
+
+    #[test]
+    fn test_pool_expands_after_retired_thread_slots() {
+        let executor = create_test_executor(2);
+        executor.register_plugin(1);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_clone = barrier.clone();
+        executor.execute_for_plugin(1, move |_s, _p, _c, _ca, _e| {
+            barrier_clone.wait();
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        assert_eq!(executor.register_plugin(2), 1);
+        let (tx_unload, rx_unload) = channel();
+        executor.execute_plugin_unload(2, make_signaling_job(tx_unload));
+        rx_unload
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Unload should complete");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(executor.thread_count(), 1);
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(50));
+
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_clone = barrier.clone();
+        executor.execute_for_plugin(1, move |_s, _p, _c, _ca, _e| {
+            barrier_clone.wait();
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        assert_ne!(
+            executor.register_plugin(3),
+            0,
+            "A retired slot must not prevent the pool from expanding"
+        );
+        assert_eq!(executor.thread_count(), 2);
+
         barrier.wait();
     }
 
