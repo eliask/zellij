@@ -7,6 +7,7 @@ use crate::plugins::wasm_bridge::{LoadingContext, PluginCache};
 use crate::plugins::zellij_exports::{wasi_write_object, zellij_exports};
 use crate::plugins::PluginId;
 use prost::Message;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -83,6 +84,7 @@ pub struct PluginLoader {
     engine: Engine,
     plugin_cache: PluginCache,
     plugin_map: Arc<Mutex<PluginMap>>,
+    plugin_digest: String,
     connected_clients: Option<Arc<Mutex<Vec<ClientId>>>>,
 }
 
@@ -124,6 +126,7 @@ impl PluginLoader {
             engine,
             plugin_cache,
             plugin_map,
+            plugin_digest: String::new(),
             connected_clients: Some(connected_clients),
             loading_indication,
         }
@@ -134,6 +137,7 @@ impl PluginLoader {
     }
     pub fn start_plugin(&mut self) -> Result<()> {
         self.record_plugin_metadata();
+        self.ensure_plugin_digest()?;
         let module = if self.skip_cache {
             self.interpret_module()?
         } else {
@@ -146,6 +150,7 @@ impl PluginLoader {
         Ok(())
     }
     pub fn start_shared_plugin(&mut self) -> Result<Arc<Mutex<RunningPlugin>>> {
+        self.ensure_plugin_digest()?;
         let module = if self.skip_cache {
             self.interpret_module()?
         } else {
@@ -168,6 +173,13 @@ impl PluginLoader {
                 is_background: self.tab_index.is_none(),
             },
         );
+    }
+    fn ensure_plugin_digest(&mut self) -> Result<()> {
+        if self.plugin_digest.is_empty() {
+            let wasm_bytes = self.plugin_config.resolve_wasm_bytes(&self.plugin_dir)?;
+            self.plugin_digest = plugin_digest_from_bytes(&wasm_bytes);
+        }
+        Ok(())
     }
     fn interpret_module(&mut self) -> Result<Module> {
         self.loading_indication.override_previous_error();
@@ -306,6 +318,7 @@ impl PluginLoader {
             generation: self.generation,
             client_id: self.client_id,
             plugin: self.plugin_config.clone(), // TODO: change field name in PluginEnv to plugin_config
+            plugin_digest: self.plugin_digest.clone(),
             permissions: Arc::new(Mutex::new(None)),
             senders: self.senders.clone(),
             wasi_ctx,
@@ -421,6 +434,7 @@ impl PluginLoader {
             generation: self.generation,
             client_id: self.client_id,
             plugin: plugin_config,
+            plugin_digest: self.plugin_digest.clone(),
             permissions: Arc::new(Mutex::new(None)),
             senders: self.senders.clone(),
             wasi_ctx,
@@ -528,6 +542,13 @@ impl PluginLoader {
     }
 }
 
+pub(crate) fn plugin_digest_from_bytes(wasm_bytes: &[u8]) -> String {
+    Sha256::digest(wasm_bytes)
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
+}
+
 fn create_optimized_store_limits() -> StoreLimits {
     use wasmi::StoreLimitsBuilder;
     StoreLimitsBuilder::new()
@@ -537,4 +558,21 @@ fn create_optimized_store_limits() -> StoreLimits {
         .tables(16) // Small table element limit
         .trap_on_grow_failure(true) // Fail fast on resource exhaustion
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plugin_digest_from_bytes;
+
+    #[test]
+    fn plugin_digest_changes_when_module_bytes_change() {
+        assert_eq!(
+            plugin_digest_from_bytes(b"module-one"),
+            plugin_digest_from_bytes(b"module-one")
+        );
+        assert_ne!(
+            plugin_digest_from_bytes(b"module-one"),
+            plugin_digest_from_bytes(b"module-two")
+        );
+    }
 }

@@ -725,6 +725,14 @@ pub(crate) fn e2e_plugin_path(name: &str) -> PathBuf {
         .join(format!("{}.wasm", name))
 }
 
+// Permissions are cached per plugin location and module digest.
+fn fixture_permission_cache_key() -> String {
+    let digest = crate::plugins::plugin_loader::plugin_digest_from_bytes(
+        &std::fs::read(&*PLUGIN_FIXTURE).unwrap(),
+    );
+    format!("{}#{}", PathBuf::from(&*PLUGIN_FIXTURE).display(), digest)
+}
+
 lazy_static! {
     static ref PLUGIN_FIXTURE: String = e2e_plugin_path("fixture-plugin-for-tests")
         .display()
@@ -6315,7 +6323,7 @@ pub fn granted_permission_request_result() {
 
     let permission_cache = PermissionCache::from_path_or_default(Some(cache_path));
     let mut permissions = permission_cache
-        .get_permissions(PathBuf::from(&*PLUGIN_FIXTURE).display().to_string())
+        .get_permissions(fixture_permission_cache_key())
         .clone();
     let permissions = permissions.as_mut().map(|p| {
         let mut permissions = p.clone();
@@ -6410,8 +6418,7 @@ pub fn denied_permission_request_result() {
     teardown();
 
     let permission_cache = PermissionCache::from_path_or_default(Some(cache_path));
-    let permissions =
-        permission_cache.get_permissions(PathBuf::from(&*PLUGIN_FIXTURE).display().to_string());
+    let permissions = permission_cache.get_permissions(fixture_permission_cache_key());
 
     assert_snapshot!(format!("{:#?}", permissions));
 }
@@ -13838,6 +13845,7 @@ fn plugin_env_without_read_pane_contents() -> super::plugin_map::PluginEnv {
             initial_userspace_configuration: PluginUserConfiguration::new(BTreeMap::new()),
             initial_cwd: None,
         },
+        plugin_digest: "test-digest".to_owned(),
         permissions: Arc::new(Mutex::new(Some(permissions))),
         senders: Default::default(),
         wasi_ctx,

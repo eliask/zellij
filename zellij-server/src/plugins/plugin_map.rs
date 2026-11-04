@@ -349,6 +349,7 @@ pub struct PluginEnv {
     pub plugin_id: PluginId,
     pub generation: u64,
     pub plugin: PluginConfig,
+    pub plugin_digest: String,
     pub permissions: Arc<Mutex<Option<HashSet<PermissionType>>>>,
     pub senders: ThreadSenders,
     pub wasi_ctx: WasiCtx,

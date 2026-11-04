@@ -1687,9 +1687,10 @@ fn show_cursor(env: &PluginEnv, cursor_position: Option<(usize, usize)>) {
 }
 
 fn request_permission(env: &PluginEnv, permissions: Vec<PermissionType>) -> Result<()> {
+    let permission_cache_key = permission_cache_key(env);
     if env.plugin.is_builtin()
         || PermissionCache::from_path_or_default(None)
-            .check_permissions(env.plugin.location.to_string(), &permissions)
+            .check_permissions(permission_cache_key, &permissions)
     {
         return env
             .senders
@@ -1715,6 +1716,10 @@ fn request_permission(env: &PluginEnv, permissions: Vec<PermissionType>) -> Resu
             permission_pane_id(env),
             PluginPermission::new(env.plugin.location.to_string(), permissions),
         ))
+}
+
+fn permission_cache_key(env: &PluginEnv) -> String {
+    format!("{}#{}", env.plugin.location, env.plugin_digest)
 }
 
 fn get_plugin_ids(env: &PluginEnv) {
