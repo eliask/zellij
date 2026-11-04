@@ -5565,7 +5565,7 @@ fn get_session_list(env: &PluginEnv) {
                 .send_to_screen(ScreenInstruction::UpdateSessionInfos(
                     live_sessions_map.clone(),
                     resurrectable_sessions_map.clone(),
-                    Some((env.plugin_id, env.client_id)),
+                    None,
                 ));
 
             let snapshot = SessionListSnapshot {
