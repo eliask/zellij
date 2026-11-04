@@ -2,7 +2,7 @@ use std::io::prelude::*;
 use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 pub struct CopyCommand {
     command: String,
@@ -11,14 +11,21 @@ pub struct CopyCommand {
 
 impl CopyCommand {
     pub fn new(command: String) -> Self {
-        let mut command_with_args = command.split(' ').map(String::from);
+        let mut command_with_args = shell_words::split(&command)
+            .ok()
+            .filter(|parts| !parts.is_empty())
+            .unwrap_or_else(|| command.split_ascii_whitespace().map(String::from).collect())
+            .into_iter();
 
         Self {
-            command: command_with_args.next().expect("missing command"),
+            command: command_with_args.next().unwrap_or_default(),
             args: command_with_args.collect(),
         }
     }
     pub fn set(&self, value: String) -> Result<()> {
+        if self.command.is_empty() {
+            bail!("copy_command is empty");
+        }
         let mut process = Command::new(self.command.clone())
             .args(self.args.clone())
             .stdin(Stdio::piped())
@@ -75,6 +82,49 @@ mod tests {
         // run it through `sh` rather than making it executable, so that a concurrent fork/exec
         // elsewhere in the test binary can't make this spawn fail with ETXTBSY
         format!("sh {}", script.display())
+    }
+
+    #[test]
+    fn copy_command_preserves_quoted_and_empty_arguments() {
+        let copy_command =
+            CopyCommand::new("sh '/tmp/path with spaces' --flag '' trailing\\ value".to_owned());
+
+        assert_eq!(copy_command.command, "sh");
+        assert_eq!(
+            copy_command.args,
+            vec![
+                "/tmp/path with spaces".to_owned(),
+                "--flag".to_owned(),
+                String::new(),
+                "trailing value".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_command_falls_back_for_malformed_quotes() {
+        let copy_command = CopyCommand::new("helper 'unterminated".to_owned());
+
+        assert_eq!(copy_command.command, "helper");
+        assert_eq!(copy_command.args, vec!["'unterminated".to_owned()]);
+    }
+
+    #[test]
+    fn copy_command_collapses_repeated_whitespace_without_creating_arguments() {
+        let copy_command = CopyCommand::new("helper   --flag\t\tvalue".to_owned());
+
+        assert_eq!(copy_command.command, "helper");
+        assert_eq!(
+            copy_command.args,
+            vec!["--flag".to_owned(), "value".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_empty_copy_command_is_an_error_not_a_panic() {
+        let copy_command = CopyCommand::new("   ".to_owned());
+
+        assert!(copy_command.set("text".to_owned()).is_err());
     }
 
     #[test]
