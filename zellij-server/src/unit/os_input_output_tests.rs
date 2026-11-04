@@ -330,7 +330,7 @@ fn tcgetpgrp_returns_foreground_group() {
 
 #[test]
 fn client_buffer_refuses_messages_when_limit_is_reached() {
-    let (buffer, receiver) = client_buffer(CLIENT_BUFFER_LIMIT);
+    let (buffer, receiver) = client_buffer(CLIENT_BUFFER_LIMIT, CLIENT_BUFFER_BYTE_LIMIT);
     let msg = || ServerToClientMsg::Exit {
         exit_reason: ExitReason::Normal,
     };
@@ -345,8 +345,54 @@ fn client_buffer_refuses_messages_when_limit_is_reached() {
 }
 
 #[test]
+fn client_buffer_refuses_payloads_over_the_byte_limit() {
+    // A handful of large frames must trip the byte budget long before
+    // the message-count cap — the queue retains payload bytes, not
+    // just envelopes.
+    let byte_limit = 1024;
+    let (buffer, receiver) = client_buffer(CLIENT_BUFFER_LIMIT, byte_limit);
+    let frame = |bytes: usize| ServerToClientMsg::RenderFrame {
+        frame: vec![0u8; bytes],
+    };
+    assert!(buffer.try_send(frame(600)).is_ok());
+    assert!(matches!(
+        buffer.try_send(frame(600)),
+        Err(TrySendError::Full(_))
+    ));
+    // A small payload still fits inside the remaining byte budget.
+    assert!(buffer.try_send(frame(400)).is_ok());
+    assert!(matches!(
+        buffer.try_send(frame(100)),
+        Err(TrySendError::Full(_))
+    ));
+    // Draining returns budget: after the receiver takes both frames,
+    // another full frame is admitted.
+    assert!(receiver.recv().is_some());
+    assert!(receiver.recv().is_some());
+    assert!(buffer.try_send(frame(1024)).is_ok());
+}
+
+#[test]
+fn client_buffer_admits_an_oversized_message_into_an_empty_queue() {
+    // A single message larger than the budget (e.g. a pane's initial
+    // scrollback) must not disconnect a client that is keeping up.
+    let byte_limit = 1024;
+    let (buffer, receiver) = client_buffer(CLIENT_BUFFER_LIMIT, byte_limit);
+    let frame = |bytes: usize| ServerToClientMsg::RenderFrame {
+        frame: vec![0u8; bytes],
+    };
+    assert!(buffer.try_send(frame(4096)).is_ok());
+    assert!(matches!(
+        buffer.try_send(frame(1)),
+        Err(TrySendError::Full(_))
+    ));
+    assert!(receiver.recv().is_some());
+    assert!(buffer.try_send(frame(4096)).is_ok());
+}
+
+#[test]
 fn client_buffer_reports_disconnect_when_receiver_is_gone() {
-    let (buffer, receiver) = client_buffer(CLIENT_BUFFER_LIMIT);
+    let (buffer, receiver) = client_buffer(CLIENT_BUFFER_LIMIT, CLIENT_BUFFER_BYTE_LIMIT);
     drop(receiver);
     let result = buffer.try_send(ServerToClientMsg::Exit {
         exit_reason: ExitReason::Normal,
@@ -408,4 +454,187 @@ fn the_pane_environment_is_added_to_and_removed_from_the_child_environment() {
     });
     assert!(output.contains(expected), "got: '{}'", output);
     assert!(std::env::var("ZELLIJ_PANE_ENV_TEST").is_err());
+}
+
+// --- Client byte budget accounting ---
+
+mod payload_accounting {
+    use super::*;
+    use zellij_utils::attention::{AttentionItem, PaneAttention, SessionAttention};
+    use zellij_utils::data::{
+        ConnectToSession, PaneId as DataPaneId, SessionPreview, SessionPreviewPane,
+        SessionPreviewTab,
+    };
+    use zellij_utils::input::terminal::TerminalSettings;
+    use zellij_utils::ipc::{
+        MobilePanePayload, MobileSessionPayload, MobileStatePayload, MobileTabPayload,
+    };
+
+    #[test]
+    fn many_short_scrollback_lines_are_charged_for_their_string_headers() {
+        let lines = 10_000;
+        let msg = ServerToClientMsg::PaneRenderUpdate {
+            pane_id: DataPaneId::Terminal(1),
+            viewport: vec![],
+            scrollback: Some(vec!["x".to_owned(); lines]),
+            is_initial: true,
+        };
+        assert!(
+            server_msg_payload_bytes(&msg) >= lines * (std::mem::size_of::<String>() + 1),
+            "a Vec<String> costs its 24-byte headers, not only the text"
+        );
+    }
+
+    #[test]
+    fn session_preview_charges_tabs_and_pane_titles() {
+        let title = "t".repeat(1024 * 1024);
+        let msg = ServerToClientMsg::SessionPreview {
+            preview: Some(SessionPreview {
+                tabs: vec![SessionPreviewTab {
+                    name: "tab".to_owned(),
+                    active: true,
+                    panes: vec![SessionPreviewPane {
+                        id: 1,
+                        title: title.clone(),
+                        contents: Some("c".repeat(4096)),
+                        ..Default::default()
+                    }],
+                }],
+                error: Some("e".repeat(512)),
+                ..Default::default()
+            }),
+        };
+        assert!(server_msg_payload_bytes(&msg) >= title.len() + 4096 + 512);
+    }
+
+    #[test]
+    fn mobile_state_charges_its_titles_names_and_sessions() {
+        let msg = ServerToClientMsg::MobileState {
+            payload: MobileStatePayload {
+                session_name: "s".repeat(100),
+                tabs: vec![MobileTabPayload {
+                    position: 0,
+                    name: "n".repeat(200),
+                    active: true,
+                }],
+                panes: vec![MobilePanePayload {
+                    tab_position: 0,
+                    pane_id: 1,
+                    is_plugin: false,
+                    title: "p".repeat(1024 * 1024),
+                    is_floating: false,
+                    last_activity_secs_ago: 0,
+                }],
+                sessions: vec![MobileSessionPayload {
+                    name: "m".repeat(300),
+                    web_clients_allowed: false,
+                    tab_count: 1,
+                    pane_count: 1,
+                    connected_clients: 0,
+                    creation_secs_ago: 0,
+                }],
+                ..Default::default()
+            },
+        };
+        assert!(server_msg_payload_bytes(&msg) >= 1024 * 1024 + 100 + 200 + 300);
+    }
+
+    /// Every variant that owns heap data must be charged for it. The
+    /// accounting function is an exhaustive match, so a new variant cannot
+    /// be added without deciding what it is charged; this makes sure that
+    /// the decision is not "nothing" for one that carries heap data.
+    #[test]
+    fn every_message_carrying_heap_data_is_charged() {
+        let big = || "z".repeat(10_000);
+        let with_heap = vec![
+            ServerToClientMsg::Render { content: big() },
+            ServerToClientMsg::RenderFrame {
+                frame: vec![0; 10_000],
+            },
+            ServerToClientMsg::Exit {
+                exit_reason: ExitReason::Error(big()),
+            },
+            ServerToClientMsg::Log { lines: vec![big()] },
+            ServerToClientMsg::LogError { lines: vec![big()] },
+            ServerToClientMsg::SwitchSession {
+                connect_to_session: ConnectToSession {
+                    name: Some(big()),
+                    cwd: Some(PathBuf::from(big())),
+                    ..Default::default()
+                },
+            },
+            ServerToClientMsg::UnblockCliPipeInput {
+                pipe_name: big(),
+                exit_code: None,
+            },
+            ServerToClientMsg::CliPipeOutput {
+                pipe_name: big(),
+                output: String::new(),
+            },
+            ServerToClientMsg::RenamedSession { name: big() },
+            ServerToClientMsg::PaneRenderUpdate {
+                pane_id: DataPaneId::Terminal(1),
+                viewport: vec![big()],
+                scrollback: None,
+                is_initial: false,
+            },
+            ServerToClientMsg::ForwardQueryToHost {
+                token: 1,
+                query_bytes: vec![0; 10_000],
+                resolve_async: false,
+            },
+            ServerToClientMsg::EmitNestedSessionFrame {
+                payload_bytes: vec![0; 10_000],
+            },
+            ServerToClientMsg::MobileState {
+                payload: MobileStatePayload {
+                    session_name: big(),
+                    ..Default::default()
+                },
+            },
+            ServerToClientMsg::HostProgramStatus {
+                status: Some(zellij_utils::attention::HostProgramStatus {
+                    state: big(),
+                    kind: None,
+                    progress: None,
+                    msg: String::new(),
+                }),
+            },
+            ServerToClientMsg::SessionAttention {
+                attention: SessionAttention {
+                    items: vec![AttentionItem {
+                        pane_id: DataPaneId::Terminal(1).into(),
+                        tab_id: 0,
+                        tab_name: big(),
+                        pane_title: String::new(),
+                        attention: PaneAttention::default(),
+                    }],
+                    ..Default::default()
+                },
+            },
+            ServerToClientMsg::SessionPreview {
+                preview: Some(SessionPreview {
+                    session_name: big(),
+                    ..Default::default()
+                }),
+            },
+            ServerToClientMsg::PaneMirror {
+                payload: vec![0; 10_000],
+            },
+        ];
+        for msg in with_heap {
+            assert!(
+                server_msg_payload_bytes(&msg) >= 10_000,
+                "{:?} carries heap data but is charged too little",
+                std::mem::discriminant(&msg)
+            );
+        }
+        // The terminal settings come from the server's own configuration:
+        // they still cost at least their own size.
+        assert!(
+            server_msg_payload_bytes(&ServerToClientMsg::TerminalSettingsChanged {
+                settings: Box::new(TerminalSettings::default()),
+            }) >= std::mem::size_of::<TerminalSettings>()
+        );
+    }
 }

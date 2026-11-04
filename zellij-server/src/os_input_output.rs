@@ -230,49 +230,230 @@ fn build_command(
 // If the client ever becomes responsive again, we'll send one final "Buffer full" message so it
 // knows what happened.
 const CLIENT_BUFFER_LIMIT: usize = 5000;
+// A message-count cap does not bound retained payload: 5000 render
+// frames can hold gigabytes. The queue is therefore also bounded by
+// buffered payload bytes. A message is always admitted into a queue that
+// holds no payload, so a single large message cannot disconnect a client.
+const CLIENT_BUFFER_BYTE_LIMIT: usize = 256 * 1024 * 1024;
+
+/// Heap overhead charged per `String` held in a `Vec<String>`: the 24-byte
+/// header in the vector's backing allocation, plus allocator rounding. A
+/// message of many short lines is dominated by this, not by the text.
+const STRING_OVERHEAD: usize = std::mem::size_of::<String>() + 16;
+
+fn strings_bytes(strings: &[String]) -> usize {
+    strings
+        .iter()
+        .map(|string| string.len().saturating_add(STRING_OVERHEAD))
+        .sum()
+}
+
+fn opt_str_bytes(string: &Option<String>) -> usize {
+    string.as_ref().map(String::len).unwrap_or(0)
+}
+
+/// Size of the JSON form of a value, as an estimate for deeply nested
+/// types that are not worth walking by hand. Never less than the size of
+/// the value itself.
+fn serialized_bytes<T: serde::Serialize>(value: &T) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0.max(std::mem::size_of::<T>())
+}
+
+fn session_preview_bytes(preview: &zellij_utils::data::SessionPreview) -> usize {
+    use zellij_utils::data::{SessionPreviewPane, SessionPreviewTab};
+    let panes_bytes = |panes: &[SessionPreviewPane]| -> usize {
+        panes
+            .iter()
+            .map(|pane| {
+                std::mem::size_of::<SessionPreviewPane>()
+                    .saturating_add(pane.title.len())
+                    .saturating_add(opt_str_bytes(&pane.contents))
+            })
+            .sum()
+    };
+    let tabs_bytes: usize = preview
+        .tabs
+        .iter()
+        .map(|tab| {
+            std::mem::size_of::<SessionPreviewTab>()
+                .saturating_add(tab.name.len())
+                .saturating_add(panes_bytes(&tab.panes))
+        })
+        .sum();
+    preview
+        .contents
+        .len()
+        .saturating_add(preview.session_name.len())
+        .saturating_add(strings_bytes(&preview.tab_names))
+        .saturating_add(opt_str_bytes(&preview.error))
+        .saturating_add(tabs_bytes)
+}
+
+fn mobile_state_bytes(payload: &zellij_utils::ipc::MobileStatePayload) -> usize {
+    use zellij_utils::ipc::{MobilePanePayload, MobileSessionPayload, MobileTabPayload};
+    payload
+        .session_name
+        .len()
+        .saturating_add(
+            payload
+                .tabs
+                .iter()
+                .map(|tab| std::mem::size_of::<MobileTabPayload>() + tab.name.len())
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            payload
+                .panes
+                .iter()
+                .map(|pane| std::mem::size_of::<MobilePanePayload>() + pane.title.len())
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            payload
+                .sessions
+                .iter()
+                .map(|session| std::mem::size_of::<MobileSessionPayload>() + session.name.len())
+                .sum::<usize>(),
+        )
+}
+
+/// Approximate heap payload of a client-bound message, so the queue byte
+/// budget accounts for what it retains and not just message envelopes.
+/// Deliberately exhaustive: a new variant must decide what it is charged.
+fn server_msg_payload_bytes(msg: &ServerToClientMsg) -> usize {
+    match msg {
+        ServerToClientMsg::Render { content } => content.len(),
+        ServerToClientMsg::RenderFrame { frame } => frame.len(),
+        ServerToClientMsg::Log { lines } | ServerToClientMsg::LogError { lines } => {
+            strings_bytes(lines)
+        },
+        ServerToClientMsg::CliPipeOutput { pipe_name, output } => {
+            pipe_name.len().saturating_add(output.len())
+        },
+        ServerToClientMsg::UnblockCliPipeInput { pipe_name, .. } => pipe_name.len(),
+        ServerToClientMsg::PaneRenderUpdate {
+            viewport,
+            scrollback,
+            ..
+        } => strings_bytes(viewport).saturating_add(
+            scrollback
+                .as_ref()
+                .map(|scrollback| strings_bytes(scrollback))
+                .unwrap_or(0),
+        ),
+        ServerToClientMsg::EmitNestedSessionFrame { payload_bytes } => payload_bytes.len(),
+        ServerToClientMsg::PaneMirror { payload } => payload.len(),
+        ServerToClientMsg::ForwardQueryToHost { query_bytes, .. } => query_bytes.len(),
+        ServerToClientMsg::RenamedSession { name } => name.len(),
+        ServerToClientMsg::SessionPreview { preview } => {
+            preview.as_ref().map(session_preview_bytes).unwrap_or(0)
+        },
+        ServerToClientMsg::MobileState { payload } => mobile_state_bytes(payload),
+        ServerToClientMsg::Exit { exit_reason } => match exit_reason {
+            ExitReason::Error(error) => error.len(),
+            _ => 0,
+        },
+        ServerToClientMsg::SwitchSession { connect_to_session } => {
+            serialized_bytes(connect_to_session)
+        },
+        ServerToClientMsg::TerminalSettingsChanged { settings } => serialized_bytes(&**settings),
+        ServerToClientMsg::SessionAttention { attention } => serialized_bytes(attention),
+        ServerToClientMsg::HostProgramStatus { status } => status
+            .as_ref()
+            .map(|status| {
+                status
+                    .state
+                    .len()
+                    .saturating_add(opt_str_bytes(&status.kind))
+                    .saturating_add(status.msg.len())
+            })
+            .unwrap_or(0),
+        // No owned heap data.
+        ServerToClientMsg::UnblockInputThread
+        | ServerToClientMsg::Connected
+        | ServerToClientMsg::QueryTerminalSize
+        | ServerToClientMsg::SetSoftKeyboard { .. }
+        | ServerToClientMsg::PasteFromClipboard { .. }
+        | ServerToClientMsg::StartWebServer
+        | ServerToClientMsg::ConfigFileUpdated
+        | ServerToClientMsg::HostTerminalThemeChanged { .. }
+        | ServerToClientMsg::SubscribedPaneClosed { .. } => 0,
+    }
+}
 
 #[derive(Clone)]
 struct ClientBuffer {
-    sender: channels::Sender<ServerToClientMsg>,
+    sender: channels::Sender<(ServerToClientMsg, usize)>,
     queued: Arc<AtomicUsize>,
+    queued_bytes: Arc<AtomicUsize>,
     limit: usize,
+    byte_limit: usize,
 }
 
 struct ClientBufferReceiver {
-    receiver: channels::Receiver<ServerToClientMsg>,
+    receiver: channels::Receiver<(ServerToClientMsg, usize)>,
     queued: Arc<AtomicUsize>,
+    queued_bytes: Arc<AtomicUsize>,
 }
 
-fn client_buffer(limit: usize) -> (ClientBuffer, ClientBufferReceiver) {
+fn client_buffer(limit: usize, byte_limit: usize) -> (ClientBuffer, ClientBufferReceiver) {
     let (sender, receiver) = channels::unbounded();
     let queued = Arc::new(AtomicUsize::new(0));
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
     (
         ClientBuffer {
             sender,
             queued: queued.clone(),
+            queued_bytes: queued_bytes.clone(),
             limit,
+            byte_limit,
         },
-        ClientBufferReceiver { receiver, queued },
+        ClientBufferReceiver {
+            receiver,
+            queued,
+            queued_bytes,
+        },
     )
 }
 
 impl ClientBuffer {
     fn try_send(&self, msg: ServerToClientMsg) -> Result<(), TrySendError<ServerToClientMsg>> {
+        let payload = server_msg_payload_bytes(&msg);
         if self.queued.fetch_add(1, Ordering::AcqRel) >= self.limit {
             self.queued.fetch_sub(1, Ordering::AcqRel);
             return Err(TrySendError::Full(msg));
         }
-        self.sender.send(msg).map_err(|err| {
+        let queued_bytes = self.queued_bytes.fetch_add(payload, Ordering::AcqRel);
+        if queued_bytes > 0 && queued_bytes.saturating_add(payload) > self.byte_limit {
+            self.queued_bytes.fetch_sub(payload, Ordering::AcqRel);
             self.queued.fetch_sub(1, Ordering::AcqRel);
-            TrySendError::Disconnected(err.0)
+            return Err(TrySendError::Full(msg));
+        }
+        self.sender.send((msg, payload)).map_err(|err| {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            self.queued_bytes.fetch_sub(payload, Ordering::AcqRel);
+            TrySendError::Disconnected(err.0 .0)
         })
     }
 }
 
 impl ClientBufferReceiver {
     fn recv(&self) -> Option<ServerToClientMsg> {
-        let msg = self.receiver.recv().ok()?;
+        let (msg, payload) = self.receiver.recv().ok()?;
         self.queued.fetch_sub(1, Ordering::AcqRel);
+        self.queued_bytes.fetch_sub(payload, Ordering::AcqRel);
         Some(msg)
     }
 }
@@ -295,7 +476,8 @@ impl ClientSender {
         // We, the zellij maintainers, have decided against an unbounded
         // queue for the time being because we want to prevent e.g. the whole session being killed
         // (by OOM-killers or some other mechanism) just because a single client doesn't respond.
-        let (client_buffer_sender, client_buffer_receiver) = client_buffer(CLIENT_BUFFER_LIMIT);
+        let (client_buffer_sender, client_buffer_receiver) =
+            client_buffer(CLIENT_BUFFER_LIMIT, CLIENT_BUFFER_BYTE_LIMIT);
         std::thread::spawn(move || {
             let err_context = || format!("failed to send message to client {client_id}");
             let mut stream_failed = false;
