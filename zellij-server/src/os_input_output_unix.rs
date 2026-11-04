@@ -336,13 +336,33 @@ pub(crate) struct UnixPtyBackend {
 /// Try to write as many bytes from `buf` as possible to `fd` without blocking.
 ///
 /// Loops on successful short writes and EINTR to drain as much as the kernel
-/// will accept. On EAGAIN (fd buffer full), stops and returns how many bytes
-/// were written so far (which may be 0). The caller is expected to re-queue
-/// any unwritten remainder.
+/// will accept, but issues at most `MAX_WRITE_SYSCALLS_PER_CALL` write(2)
+/// calls (EINTR retries included) so a consumer that takes a few bytes per
+/// call cannot turn one call into hundreds of syscalls. On EAGAIN (fd buffer
+/// full) or when the syscall budget is spent, stops and returns how many
+/// bytes were written so far (which may be 0). The caller is expected to
+/// re-queue any unwritten remainder.
 fn try_write_to_fd(fd: RawFd, buf: &[u8]) -> Result<usize> {
+    write_bounded(buf, MAX_WRITE_SYSCALLS_PER_CALL, |chunk| {
+        unistd::write(unsafe { BorrowedFd::borrow_raw(fd) }, chunk)
+    })
+}
+
+/// Upper bound on write(2) calls made by one `try_write_to_fd` call. Together
+/// with the pty writer's per-turn call limit this bounds the syscalls a
+/// terminal can spend in one turn (calls per turn x this value).
+const MAX_WRITE_SYSCALLS_PER_CALL: usize = 4;
+
+fn write_bounded(
+    buf: &[u8],
+    max_syscalls: usize,
+    mut write: impl FnMut(&[u8]) -> nix::Result<usize>,
+) -> Result<usize> {
     let mut written = 0;
-    while written < buf.len() {
-        match unistd::write(unsafe { BorrowedFd::borrow_raw(fd) }, &buf[written..]) {
+    let mut syscalls = 0;
+    while written < buf.len() && syscalls < max_syscalls {
+        syscalls += 1;
+        match write(&buf[written..]) {
             Ok(0) => break, // fd returned 0 on non-empty buf; treat like EAGAIN
             Ok(n) => written += n,
             Err(nix::errno::Errno::EINTR) => continue,
@@ -623,6 +643,43 @@ mod tests {
             libc::close(master_fd);
             libc::close(slave_fd);
         }
+    }
+
+    #[test]
+    fn write_bounded_stops_after_the_syscall_budget() {
+        let buf = vec![0u8; 1024 * 1024];
+
+        // A consumer taking 1 KiB per call.
+        let mut calls = 0;
+        let written = write_bounded(&buf, 4, |_| {
+            calls += 1;
+            Ok(1024)
+        })
+        .unwrap();
+        assert_eq!((calls, written), (4, 4096));
+
+        // EINTR retries spend budget too.
+        let mut calls = 0;
+        let written = write_bounded(&buf, 4, |_| {
+            calls += 1;
+            Err(nix::errno::Errno::EINTR)
+        })
+        .unwrap();
+        assert_eq!((calls, written), (4, 0));
+
+        // EAGAIN still ends the call early, and errors still propagate.
+        let mut calls = 0;
+        let written = write_bounded(&buf, 4, |_| {
+            calls += 1;
+            if calls == 1 {
+                Ok(10)
+            } else {
+                Err(nix::errno::Errno::EAGAIN)
+            }
+        })
+        .unwrap();
+        assert_eq!((calls, written), (2, 10));
+        assert!(write_bounded(&buf, 4, |_| Err(nix::errno::Errno::EBADF)).is_err());
     }
 
     /// Verify that `try_write_to_fd` returns Ok(0) — not an error — when the
