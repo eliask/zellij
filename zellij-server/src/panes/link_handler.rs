@@ -7,7 +7,7 @@ const TERMINATOR: &str = "\u{1b}\\";
 #[derive(Debug, Clone)]
 pub struct LinkHandler {
     links: HashMap<u16, Link>,
-    link_index: u16,
+    next_link_index: Option<u16>,
 }
 #[derive(Debug, Clone)]
 pub struct Link {
@@ -19,8 +19,14 @@ impl LinkHandler {
     pub fn new() -> Self {
         Self {
             links: HashMap::new(),
-            link_index: 0,
+            next_link_index: Some(0),
         }
+    }
+
+    fn allocate_link_index(&mut self) -> Option<u16> {
+        let index = self.next_link_index?;
+        self.next_link_index = index.checked_add(1);
+        Some(index)
     }
 
     pub fn dispatch_osc8(&mut self, params: &[&[u8]]) -> Option<LinkAnchor> {
@@ -32,41 +38,39 @@ impl LinkHandler {
         );
 
         if !uri.is_empty() {
-            // save the link, and the id if present to hashmap
-            String::from_utf8(uri.to_vec()).ok().map(|uri| {
-                let id = link_params
-                    .split(|&b| b == b':')
-                    .find(|kv| kv.starts_with(b"id="))
-                    .and_then(|kv| String::from_utf8(kv[3..].to_vec()).ok());
-                if let Some(previous_index) = self.link_index.checked_sub(1) {
-                    if let Some(previous) = self.links.get(&previous_index) {
-                        if previous.id == id && previous.uri == uri {
-                            return LinkAnchor::Start(previous_index);
-                        }
+            let uri = String::from_utf8(uri.to_vec()).ok()?;
+            let id = link_params
+                .split(|&b| b == b':')
+                .find(|kv| kv.starts_with(b"id="))
+                .and_then(|kv| String::from_utf8(kv[3..].to_vec()).ok());
+            if let Some(previous_index) =
+                self.next_link_index.and_then(|index| index.checked_sub(1))
+            {
+                if let Some(previous) = self.links.get(&previous_index) {
+                    if previous.id == id && previous.uri == uri {
+                        return Some(LinkAnchor::Start(previous_index));
                     }
                 }
-                let anchor = LinkAnchor::Start(self.link_index);
-                self.links.insert(self.link_index, Link { id, uri });
-                self.link_index += 1;
-                anchor
-            })
+            }
+            let index = self.allocate_link_index()?;
+            self.links.insert(index, Link { id, uri });
+            Some(LinkAnchor::Start(index))
         } else {
             // there is no link, so consider it a link end
             Some(LinkAnchor::End)
         }
     }
 
-    pub fn new_link_from_url(&mut self, url: String) -> LinkAnchor {
-        let anchor = LinkAnchor::Start(self.link_index);
+    pub fn new_link_from_url(&mut self, url: String) -> Option<LinkAnchor> {
+        let index = self.allocate_link_index()?;
         self.links.insert(
-            self.link_index,
+            index,
             Link {
-                id: Some(self.link_index.to_string()),
+                id: Some(index.to_string()),
                 uri: url,
             },
         );
-        self.link_index += 1;
-        anchor
+        Some(LinkAnchor::Start(index))
     }
 
     pub fn uri(&self, link_anchor: Option<LinkAnchor>) -> Option<&str> {
@@ -158,5 +162,21 @@ mod tests {
         let link_handler = LinkHandler::default();
         let anchor = LinkAnchor::Start(100);
         assert_eq!(link_handler.output_osc8(Some(anchor)), None);
+    }
+
+    #[test]
+    fn link_ids_are_not_reused_after_exhaustion() {
+        let mut link_handler = LinkHandler::default();
+        link_handler.next_link_index = Some(u16::MAX);
+
+        let first = link_handler.new_link_from_url("https://first.example".to_owned());
+        assert_eq!(first, Some(LinkAnchor::Start(u16::MAX)));
+        let first_uri = link_handler.uri(first).map(str::to_owned);
+
+        assert_eq!(
+            link_handler.new_link_from_url("https://second.example".to_owned()),
+            None
+        );
+        assert_eq!(link_handler.uri(first).map(str::to_owned), first_uri);
     }
 }

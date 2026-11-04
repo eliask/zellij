@@ -189,10 +189,13 @@ fn link_urls_in_line(
         if is_valid_url(url) {
             let previous = start_anchor_at(lines_above, viewport, cells[at]);
             if !linked_exactly(lines_above, viewport, &cells[at..], kept, previous) {
-                let anchor = link_handler.new_link_from_url(url.to_owned());
-                mark_link(lines_above, viewport, &cells[at..at + kept], anchor);
-                clear_stale_link(lines_above, viewport, &cells[at + kept..], previous);
-                mark_end(lines_above, viewport, cells, at + kept);
+                if let Some(anchor) = link_handler.new_link_from_url(url.to_owned()) {
+                    mark_link(lines_above, viewport, &cells[at..at + kept], anchor);
+                    clear_stale_link(lines_above, viewport, &cells[at + kept..], previous);
+                    mark_end(lines_above, viewport, cells, at + kept);
+                } else {
+                    clear_stale_link(lines_above, viewport, &cells[at..], previous);
+                }
             }
         }
         at = end + 1;
@@ -624,6 +627,27 @@ mod tests {
             expanded.columns[url.len()].styles.link_anchor,
             Some(LinkAnchor::End)
         );
+    }
+
+    #[test]
+    fn changed_url_clears_the_old_anchor_when_link_ids_are_exhausted() {
+        let old_url = "https://example.com";
+        let changed_url = "https://example.com/extra";
+        let mut viewport = screen(&[(old_url, true)], 80);
+        let mut handler = LinkHandler::new();
+        link_all(&mut VecDeque::new(), &mut viewport, None, &mut handler);
+        assert!(is_start(&anchors(&viewport[0])[0]));
+
+        while handler
+            .new_link_from_url("https://filler.example".to_owned())
+            .is_some()
+        {}
+        for (cell, character) in viewport[0].columns.iter_mut().zip(changed_url.chars()) {
+            cell.character = character;
+        }
+        link_all(&mut VecDeque::new(), &mut viewport, None, &mut handler);
+
+        assert!(anchors(&viewport[0]).iter().all(Option::is_none));
     }
 
     #[test]
