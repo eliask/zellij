@@ -810,19 +810,16 @@ pub fn start_instance_job(
         },
         None => HashMap::new(),
     };
-    let started = {
-        let mut plugin_map = plugin_map.lock().unwrap();
-        PluginLoader::new(
-            skip_cache,
-            loading_context,
-            senders.clone(),
-            engine,
-            plugin_cache,
-            &mut plugin_map,
-            connected_clients.clone(),
-        )
-        .start_shared_plugin()
-    };
+    let started = PluginLoader::new(
+        skip_cache,
+        loading_context,
+        senders.clone(),
+        engine,
+        plugin_cache,
+        plugin_map.clone(),
+        connected_clients.clone(),
+    )
+    .start_shared_plugin();
     let running_plugin = match started {
         Ok(running_plugin) => running_plugin,
         Err(e) => {
