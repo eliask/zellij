@@ -4,6 +4,7 @@ use std::thread::JoinHandle;
 
 use anyhow::{bail, Context, Result};
 
+#[derive(Clone)]
 pub struct CopyCommand {
     command: String,
     args: Vec<String>,
