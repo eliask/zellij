@@ -3,6 +3,7 @@ use std::str;
 const PARAMETER_LIMIT: usize = 32;
 const COLLECT_LIMIT: usize = 2;
 const OSC_FIELD_LIMIT: usize = 16;
+const MAX_OSC_PAYLOAD_BYTES: usize = 1024 * 1024;
 const FAST_SGR_LIMIT: usize = 31;
 const ESC: u8 = 0x1b;
 
@@ -252,6 +253,7 @@ pub struct Parser {
     collected_count: usize,
     overflowed: bool,
     osc: Vec<u8>,
+    osc_overflowed: bool,
     carry: [u8; 3],
     carry_len: usize,
     without_shortcuts: bool,
@@ -508,8 +510,17 @@ impl Parser {
     }
 
     fn osc_start(&mut self) {
-        self.osc.clear();
+        self.reset_osc();
         self.state = State::OscString;
+    }
+
+    fn reset_osc(&mut self) {
+        if self.osc.capacity() > MAX_OSC_PAYLOAD_BYTES {
+            self.osc = Vec::new();
+        } else {
+            self.osc.clear();
+        }
+        self.osc_overflowed = false;
     }
 
     fn osc_finish<H: Handler>(&self, handler: &mut H, ended_by_bell: bool) {
@@ -664,20 +675,30 @@ impl Parser {
     fn osc_byte<H: Handler>(&mut self, handler: &mut H, byte: u8) {
         match byte {
             0x07 => {
-                self.osc_finish(handler, true);
+                if !self.osc_overflowed {
+                    self.osc_finish(handler, true);
+                }
+                self.reset_osc();
                 self.state = State::Ground;
             },
             0x18 | 0x1a => {
-                self.osc_finish(handler, false);
+                if !self.osc_overflowed {
+                    self.osc_finish(handler, false);
+                }
+                self.reset_osc();
                 handler.execute(byte);
                 self.state = State::Ground;
             },
             ESC => {
-                self.osc_finish(handler, false);
+                if !self.osc_overflowed {
+                    self.osc_finish(handler, false);
+                }
+                self.reset_osc();
                 self.enter_escape();
             },
             0x00..=0x1f => {},
-            _ => self.osc.push(byte),
+            _ if self.osc.len() < MAX_OSC_PAYLOAD_BYTES => self.osc.push(byte),
+            _ => self.osc_overflowed = true,
         }
     }
 
