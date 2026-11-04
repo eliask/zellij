@@ -38,6 +38,8 @@ pub enum DownloaderError {
     TooLarge,
     #[error("Download exceeded the deadline")]
     TimedOut,
+    #[error("Server returned an invalid Content-Range for a resumed download")]
+    InvalidContentRange,
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +137,25 @@ impl Downloader {
             .header("Range", format!("bytes={}-", file_part_size))
             .body(())?;
         let mut res = client.send_async(request).await?;
-        ensure_success_status(res.status())?;
+        let response_status = res.status();
+        ensure_success_status(response_status)?;
+        let mut file_part_size = file_part_size;
+        if file_part_size > 0 {
+            if response_status == StatusCode::PARTIAL_CONTENT {
+                let content_range = res
+                    .headers()
+                    .get("content-range")
+                    .and_then(|value| value.to_str().ok());
+                validate_content_range(content_range, file_part_size)?;
+            } else if response_status == StatusCode::OK {
+                target = tokio::fs::File::create(&file_part_path)
+                    .await
+                    .map_err(DownloaderError::Io)?;
+                file_part_size = 0;
+            } else {
+                return Err(DownloaderError::InvalidContentRange);
+            }
+        }
         let body = res.body_mut();
         let mut stream = ReaderStream::with_capacity(body.compat(), STREAM_BUFFER_SIZE_BYTES);
         let mut downloaded_bytes =
@@ -279,6 +299,25 @@ fn checked_download_total(current: usize, additional: usize) -> Result<usize, Do
     Ok(total)
 }
 
+fn validate_content_range(
+    content_range: Option<&str>,
+    expected_start: u64,
+) -> Result<(), DownloaderError> {
+    let content_range = content_range.ok_or(DownloaderError::InvalidContentRange)?;
+    let range = content_range
+        .strip_prefix("bytes ")
+        .and_then(|value| value.split('/').next())
+        .ok_or(DownloaderError::InvalidContentRange)?;
+    let start = range
+        .split_once('-')
+        .and_then(|(start, _end)| start.parse::<u64>().ok())
+        .ok_or(DownloaderError::InvalidContentRange)?;
+    if start != expected_start {
+        return Err(DownloaderError::InvalidContentRange);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +347,19 @@ mod tests {
         assert!(matches!(
             checked_download_total(MAX_DOWNLOAD_BYTES, 1),
             Err(DownloaderError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn resumed_download_requires_matching_content_range() {
+        assert!(validate_content_range(Some("bytes 100-199/200"), 100).is_ok());
+        assert!(matches!(
+            validate_content_range(Some("bytes 0-99/200"), 100),
+            Err(DownloaderError::InvalidContentRange)
+        ));
+        assert!(matches!(
+            validate_content_range(None, 100),
+            Err(DownloaderError::InvalidContentRange)
         ));
     }
 
