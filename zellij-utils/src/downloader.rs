@@ -2,6 +2,7 @@ use isahc::http::StatusCode;
 use isahc::prelude::*;
 use isahc::{config::RedirectPolicy, HttpClient, Request};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +41,10 @@ pub enum DownloaderError {
     TimedOut,
     #[error("Server returned an invalid Content-Range for a resumed download")]
     InvalidContentRange,
+    #[error("Refusing insecure download URL: {0}")]
+    InsecureUrl(String),
+    #[error("Invalid download URL: {0}")]
+    InvalidUrl(String),
 }
 
 #[derive(Debug, Clone)]
@@ -84,13 +89,14 @@ impl Downloader {
         url: &str,
         file_name: Option<&str>,
     ) -> Result<(), DownloaderError> {
+        let url = ensure_allowed_download_url(url)?;
         let Some(client) = &self.client else {
             log::error!("No Http client found, cannot perform requests - this is likely a misconfiguration of isahc::HttpClient");
             return Err(DownloaderError::ClientUnavailable);
         };
         let file_name = match file_name {
             Some(name) => name.to_string(),
-            None => self.parse_name(url)?,
+            None => self.parse_name(url.as_str())?,
         };
 
         // we do this to make sure only one download of a specific url is happening at a time
@@ -132,7 +138,7 @@ impl Downloader {
                 (file_part, 0)
             }
         };
-        let request = Request::get(url)
+        let request = Request::get(url.as_str())
             .header("Content-Type", "application/octet-stream")
             .header("Range", format!("bytes={}-", file_part_size))
             .body(())?;
@@ -192,7 +198,8 @@ impl Downloader {
         Ok(())
     }
     pub async fn download_without_cache(url: &str) -> Result<String, DownloaderError> {
-        let request = Request::get(url)
+        let url = ensure_allowed_download_url(url)?;
+        let request = Request::get(url.as_str())
             .header("Content-Type", "application/octet-stream")
             .body(())?;
         let client = HttpClient::builder()
@@ -299,6 +306,24 @@ fn checked_download_total(current: usize, additional: usize) -> Result<usize, Do
     Ok(total)
 }
 
+fn ensure_allowed_download_url(url: &str) -> Result<Url, DownloaderError> {
+    let parsed = Url::parse(url).map_err(|_| DownloaderError::InvalidUrl(url.to_owned()))?;
+    match parsed.scheme() {
+        "https" => Ok(parsed),
+        "http" if parsed.host_str().is_some_and(is_loopback_host) => Ok(parsed),
+        _ => Err(DownloaderError::InsecureUrl(url.to_owned())),
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false)
+}
+
 fn validate_content_range(
     content_range: Option<&str>,
     expected_start: u64,
@@ -360,6 +385,18 @@ mod tests {
         assert!(matches!(
             validate_content_range(None, 100),
             Err(DownloaderError::InvalidContentRange)
+        ));
+    }
+
+    #[test]
+    fn only_https_or_loopback_http_downloads_are_allowed() {
+        assert!(ensure_allowed_download_url("https://example.com/plugin.wasm").is_ok());
+        assert!(ensure_allowed_download_url("http://localhost/plugin.wasm").is_ok());
+        assert!(ensure_allowed_download_url("http://127.0.0.1/plugin.wasm").is_ok());
+        assert!(ensure_allowed_download_url("http://[::1]/plugin.wasm").is_ok());
+        assert!(matches!(
+            ensure_allowed_download_url("http://example.com/plugin.wasm"),
+            Err(DownloaderError::InsecureUrl(_))
         ));
     }
 
