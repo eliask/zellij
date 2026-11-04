@@ -8,7 +8,7 @@ use crate::terminal_bytes::TerminalBytes;
 use crate::{
     panes::PaneId,
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction},
-    screen::{ScreenInstruction, TabOverrideResult},
+    screen::{ClosePaneSource, ScreenInstruction, TabOverrideResult},
     session_layout_metadata::SessionLayoutMetadata,
     thread_bus::{Bus, ThreadSenders},
     ClientId, ServerInstruction,
@@ -107,6 +107,7 @@ pub enum PtyInstruction {
     ),
     ClosePane(PaneId, Option<NotificationEnd>),
     ClosePaneThatWasNotCreated(PaneId, Option<NotificationEnd>),
+    ClearPaneProcessIdentity(PaneId),
     CloseTab(Vec<PaneId>),
     ReRunCommandInPane(PaneId, RunCommand, Option<NotificationEnd>),
     DropToShellInPane {
@@ -202,6 +203,7 @@ impl From<&PtyInstruction> for PtyContext {
             PtyInstruction::ClosePaneThatWasNotCreated(..) => {
                 PtyContext::ClosePaneThatWasNotCreated
             },
+            PtyInstruction::ClearPaneProcessIdentity(..) => PtyContext::ClosePane,
             PtyInstruction::CloseTab(_) => PtyContext::CloseTab,
             PtyInstruction::NewTab(..) => PtyContext::NewTab,
             PtyInstruction::OverrideLayout(..) => PtyContext::OverrideLayout,
@@ -648,6 +650,10 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: Str
                 drop(completion_tx);
                 close_result.with_context(|| format!("failed to close pane {:?}", id))?;
             },
+            PtyInstruction::ClearPaneProcessIdentity(PaneId::Terminal(id)) => {
+                pty.id_to_child_pid.remove(&id);
+            },
+            PtyInstruction::ClearPaneProcessIdentity(PaneId::Plugin(_)) => {},
             PtyInstruction::CloseTab(ids) => {
                 pty.close_tab(ids)
                     .and_then(|_| {
@@ -1257,6 +1263,7 @@ impl Pty {
                 }
 
                 if hold_on_close {
+                    let _ = senders.send_to_pty(PtyInstruction::ClearPaneProcessIdentity(pane_id));
                     let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                         pane_id,
                         exit_status,
@@ -1268,6 +1275,7 @@ impl Pty {
                         None,
                         None,
                         exit_status,
+                        ClosePaneSource::ChildExit,
                     ));
                 }
             }
@@ -1767,6 +1775,7 @@ impl Pty {
                     None,
                     None,
                     exit_status,
+                    ClosePaneSource::ChildExit,
                 ));
             }
         });
@@ -1802,6 +1811,8 @@ impl Pty {
                         }
 
                         if hold_on_close {
+                            let _ = senders
+                                .send_to_pty(PtyInstruction::ClearPaneProcessIdentity(pane_id));
                             let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                                 pane_id,
                                 exit_status,
@@ -1813,6 +1824,7 @@ impl Pty {
                                 None,
                                 None,
                                 exit_status,
+                                ClosePaneSource::ChildExit,
                             ));
                         }
                     }
@@ -2098,6 +2110,8 @@ impl Pty {
                             }
                         }
                         if hold_on_close {
+                            let _ = senders
+                                .send_to_pty(PtyInstruction::ClearPaneProcessIdentity(pane_id));
                             let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                                 pane_id,
                                 exit_status,
@@ -2109,6 +2123,7 @@ impl Pty {
                                 None,
                                 None,
                                 exit_status,
+                                ClosePaneSource::ChildExit,
                             ));
                         }
                     }
