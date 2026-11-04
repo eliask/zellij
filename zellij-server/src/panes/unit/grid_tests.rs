@@ -11824,6 +11824,31 @@ fn scrolling_down_through_a_line_taller_than_the_viewport_does_not_rewrap_it_per
 }
 
 #[test]
+fn evicting_validly_wrapped_rows_does_not_rescan_the_run() {
+    use crate::panes::grid::{evicted_run_rescan_count, reset_evicted_run_rescan_count};
+    let scroll_buffer_size = *SCROLL_BUFFER_SIZE.get_or_init(|| 10_000);
+    let mut grid = create_grid_with_size_and_raw(5, 10, b"");
+    // 24-column lines at width 10 wrap to three display rows each;
+    // overfill so every feed below evicts stored rows from valid runs
+    let mut content: Vec<u8> = Vec::new();
+    for _ in 0..scroll_buffer_size {
+        content.extend_from_slice(b"012345678901234567890123\r\n");
+    }
+    feed_bytes(&mut grid, &content);
+    reset_evicted_run_rescan_count();
+    let mut more: Vec<u8> = Vec::new();
+    for _ in 0..100 {
+        more.extend_from_slice(b"abcdefghij0123456789wxyz\r\n");
+    }
+    feed_bytes(&mut grid, &more);
+    assert_eq!(
+        evicted_run_rescan_count(),
+        0,
+        "evictions through still-valid stored wraps must not rescan the run"
+    );
+}
+
+#[test]
 fn evicting_a_stored_row_of_wide_characters_debits_its_exact_display_rows() {
     // 5,000 width-2 characters wrap to one character per row at width
     // 3: 5,000 display rows. Estimating from the 10,000-cell total gave

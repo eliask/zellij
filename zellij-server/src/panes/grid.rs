@@ -669,6 +669,41 @@ fn evicted_row_display_row_delta(
         // Every logical line occupies exactly one row.
         return if remaining_run_rows == 0 { -1 } else { 0 };
     }
+    // Fast path: when the stored wrap of the affected run is still
+    // valid at this width, dropping its first row removes exactly one
+    // display row — the remaining stored rows are already the greedy
+    // wrap of the remaining characters. Validity is decided per stored
+    // row from cached widths (the evicted row must fit one display row
+    // and each non-final row must be full at this width), which is
+    // O(rows in the run) and never looks at individual characters.
+    // Rows carrying wraps from before a resize fail the check and take
+    // the bounded recomputation below.
+    let evicted_cells = evicted.width_cached();
+    if remaining_run_rows == 0 && evicted_cells <= width {
+        return -1;
+    }
+    if remaining_run_rows > 0 && evicted_cells <= width {
+        let mut stored_run_is_valid = true;
+        let mut previous_row_width = evicted_cells;
+        for index in 0..remaining_run_rows {
+            let row = match lines_above.get_mut(index) {
+                Some(row) => row,
+                None => break,
+            };
+            let row_width = row.width_cached();
+            if row_width > width || previous_row_width + first_character_width(row) <= width {
+                stored_run_is_valid = false;
+                break;
+            }
+            previous_row_width = row_width;
+        }
+        if stored_run_is_valid {
+            return -1;
+        }
+    }
+    #[cfg(test)]
+    EVICTED_RUN_RESCANS.with(|c| c.set(c.get() + 1));
+
     let mut wide_budget = EVICTION_WIDE_CHARACTER_BUDGET;
     let mut with_evicted = WrapState::default();
     push_evicted_row_to_wrap_state(&mut with_evicted, evicted, width);
@@ -925,6 +960,17 @@ fn transfer_rows_from_lines_below_to_viewport(
 #[cfg(test)]
 thread_local! {
     static REWRAP_ROWS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EVICTED_RUN_RESCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn evicted_run_rescan_count() -> usize {
+    EVICTED_RUN_RESCANS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_evicted_run_rescan_count() {
+    EVICTED_RUN_RESCANS.with(|c| c.set(0));
 }
 
 #[cfg(test)]
