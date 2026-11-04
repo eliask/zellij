@@ -1,3 +1,4 @@
+use isahc::http::StatusCode;
 use isahc::prelude::*;
 use isahc::{config::RedirectPolicy, HttpClient, Request};
 use std::collections::HashMap;
@@ -26,6 +27,10 @@ pub enum DownloaderError {
     NotFoundFileName(String),
     #[error("Failed to parse URL body: {0}")]
     InvalidUrlBody(String),
+    #[error("HTTP client could not be initialized")]
+    ClientUnavailable,
+    #[error("Unexpected HTTP status: {0}")]
+    UnexpectedStatus(u16),
 }
 
 #[derive(Debug, Clone)]
@@ -72,7 +77,7 @@ impl Downloader {
     ) -> Result<(), DownloaderError> {
         let Some(client) = &self.client else {
             log::error!("No Http client found, cannot perform requests - this is likely a misconfiguration of isahc::HttpClient");
-            return Ok(());
+            return Err(DownloaderError::ClientUnavailable);
         };
         let file_name = match file_name {
             Some(name) => name.to_string(),
@@ -123,6 +128,7 @@ impl Downloader {
             .header("Range", format!("bytes={}-", file_part_size))
             .body(())?;
         let mut res = client.send_async(request).await?;
+        ensure_success_status(res.status())?;
         let body = res.body_mut();
         let mut stream = ReaderStream::with_capacity(body.compat(), STREAM_BUFFER_SIZE_BYTES);
         while let Some(chunk) = stream.next().await {
@@ -151,6 +157,7 @@ impl Downloader {
             .build()?;
 
         let mut res = client.send_async(request).await?;
+        ensure_success_status(res.status())?;
 
         let mut downloaded_bytes: Vec<u8> = vec![];
         let body = res.body_mut();
@@ -223,11 +230,50 @@ impl Downloader {
     }
 }
 
+fn ensure_success_status(status: StatusCode) -> Result<(), DownloaderError> {
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(DownloaderError::UnexpectedStatus(status.as_u16()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use tempfile::tempdir;
+
+    #[test]
+    fn success_statuses_are_accepted() {
+        assert!(ensure_success_status(StatusCode::OK).is_ok());
+        assert!(ensure_success_status(StatusCode::PARTIAL_CONTENT).is_ok());
+    }
+
+    #[test]
+    fn non_success_statuses_are_rejected() {
+        assert!(matches!(
+            ensure_success_status(StatusCode::NOT_FOUND),
+            Err(DownloaderError::UnexpectedStatus(404))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_missing_http_client_is_not_reported_as_success() {
+        let location = tempdir().expect("Failed to create temp directory");
+        let downloader = Downloader {
+            client: None,
+            location: location.path().to_path_buf(),
+            download_locks: Default::default(),
+        };
+
+        assert!(matches!(
+            downloader
+                .download("https://example.com/plugin.wasm", Some("plugin.wasm"))
+                .await,
+            Err(DownloaderError::ClientUnavailable)
+        ));
+    }
 
     #[ignore]
     #[tokio::test]
