@@ -120,9 +120,12 @@ pub fn atomic_create_dir(dir_name: &Path) -> io::Result<()> {
     result
 }
 
-pub fn debug_to_file(message: &[u8], terminal_id: i32) -> io::Result<()> {
+pub fn debug_to_file(message: &[u8], terminal_id: i32, session_id: &str) -> io::Result<()> {
     let mut path = PathBuf::new();
     path.push(&*ZELLIJ_TMP_LOG_DIR);
+    path.push("terminal-logs");
+    path.push(encode_path_component(session_id));
+    atomic_create_dir(&path)?;
     path.push(format!(
         "{}-{}.log",
         crate::distribution::name(),
@@ -135,4 +138,38 @@ pub fn debug_to_file(message: &[u8], terminal_id: i32) -> io::Result<()> {
         .open(&path)?;
     set_permissions(&path, 0o600)?;
     file.write_all(message)
+}
+
+fn encode_path_component(component: &str) -> String {
+    let mut encoded = String::new();
+    for byte in component.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{:02X}", byte));
+        }
+    }
+    encoded
+}
+
+#[cfg(test)]
+mod debug_log_tests {
+    use super::encode_path_component;
+
+    #[test]
+    fn session_log_directories_cannot_escape_their_parent() {
+        assert_eq!(
+            encode_path_component("../session/one"),
+            "%2E%2E%2Fsession%2Fone"
+        );
+        assert_eq!(encode_path_component("session-1_ok"), "session-1_ok");
+    }
+
+    #[test]
+    fn distinct_session_ids_cannot_encode_to_the_same_directory() {
+        assert_ne!(
+            encode_path_component("session/one"),
+            encode_path_component("session_one")
+        );
+    }
 }
