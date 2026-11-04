@@ -797,7 +797,7 @@ pub fn start_subscribe_client(
     os_input: Box<dyn ClientOsApi>,
     session_name: &str,
     subscribe_cli: SubscribeCli,
-) {
+) -> i32 {
     let zellij_ipc_pipe: PathBuf = {
         let sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
         fs::create_dir_all(&sock_dir).unwrap();
@@ -882,20 +882,34 @@ pub fn start_subscribe_client(
                     },
                 }
                 if remaining_panes.is_empty() {
-                    break;
+                    os_input.send_to_server(ClientToServerMsg::ClientExited);
+                    return 0;
                 }
             },
-            Some((ServerToClientMsg::Exit { .. }, _)) => break,
+            Some((ServerToClientMsg::Exit { exit_reason }, _)) => {
+                os_input.send_to_server(ClientToServerMsg::ClientExited);
+                return match exit_reason {
+                    ExitReason::Normal | ExitReason::NormalDetached => 0,
+                    ExitReason::CustomExitStatus(status) => status,
+                    other => {
+                        eprintln!("{}", other);
+                        1
+                    },
+                };
+            },
             Some((ServerToClientMsg::LogError { lines }, _)) => {
                 for line in lines {
                     eprintln!("{}", line);
                 }
-                process::exit(2);
+                os_input.send_to_server(ClientToServerMsg::ClientExited);
+                return 2;
             },
-            None => break,
+            None => {
+                eprintln!("subscribe connection closed unexpectedly");
+                os_input.send_to_server(ClientToServerMsg::ClientExited);
+                return 1;
+            },
             _ => {},
         }
     }
-
-    os_input.send_to_server(ClientToServerMsg::ClientExited);
 }
