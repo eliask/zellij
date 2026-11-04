@@ -77,7 +77,18 @@ impl KittyImageStore {
                 quiet: 0,
             });
         }
-        self.evict_to_fit(size, None);
+        // evict_to_fit stops when only referenced images remain; without an
+        // admission check the insert below would exceed the declared quota.
+        if !self.evict_to_fit(size, None) {
+            return Err(KittyError {
+                code: KittyErrorCode::Einval,
+                message: "image storage quota exhausted by referenced images".to_owned(),
+                image_id: None,
+                image_number: None,
+                placement_id: None,
+                quiet: 0,
+            });
+        }
         let id = self.next_image_id;
         self.next_image_id += 1;
         let lru_stamp = self.bump_lru();
@@ -235,7 +246,22 @@ impl KittyImageStore {
             self.total_bytes -= Self::stored_image_bytes(&stored);
         }
     }
-    fn evict_to_fit(&mut self, incoming_bytes: usize, protected: Option<InternalImageId>) {
+    /// Evict unreferenced images until `incoming_bytes` fit under the quota.
+    /// Returns whether the admission can proceed within the hard limit.
+    /// A request that cannot be satisfied evicts nothing.
+    fn evict_to_fit(&mut self, incoming_bytes: usize, protected: Option<InternalImageId>) -> bool {
+        if self.total_bytes + incoming_bytes <= self.quota_bytes {
+            return true;
+        }
+        let evictable: usize = self
+            .images
+            .iter()
+            .filter(|(id, stored)| stored.refcount == 0 && Some(**id) != protected)
+            .map(|(_, stored)| Self::stored_image_bytes(stored))
+            .sum();
+        if self.total_bytes + incoming_bytes - evictable > self.quota_bytes {
+            return false;
+        }
         while self.total_bytes + incoming_bytes > self.quota_bytes {
             let candidate = self
                 .images
@@ -248,6 +274,7 @@ impl KittyImageStore {
                 None => break,
             }
         }
+        self.total_bytes + incoming_bytes <= self.quota_bytes
     }
     fn normalize_to_rgba(image: DecodedImage) -> (Vec<u8>, u32, u32) {
         match image.format {

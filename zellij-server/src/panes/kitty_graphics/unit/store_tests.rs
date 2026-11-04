@@ -132,9 +132,51 @@ fn remove_placement_ref_keeps_data_but_makes_image_evictable() {
     assert!(store.get(id_b).is_some());
     assert!(store.get(id_c).is_some());
     store.add_placement_ref(id_c);
-    let id_d = store.store_image(rgba_image(10, 10)).unwrap();
-    assert!(store.get(id_d).is_some());
-    assert_eq!(store.total_bytes(), 1200);
+    let result = store.store_image(rgba_image(10, 10));
+    match result {
+        Err(err) => assert_eq!(err.code, KittyErrorCode::Einval),
+        Ok(_) => panic!("admission must fail when only referenced images remain"),
+    }
+    assert_eq!(store.total_bytes(), 800);
+}
+
+#[test]
+fn store_image_rejects_when_referenced_images_fill_the_quota() {
+    // Pin enough images to fill the quota: nothing is evictable, so the
+    // next admission must fail and the retained bytes must stay within
+    // the declared hard limit rather than silently exceeding it.
+    let mut store = KittyImageStore::with_quota(1000);
+    let id_a = store.store_image(rgba_image(10, 10)).unwrap();
+    let id_b = store.store_image(rgba_image(10, 10)).unwrap();
+    store.add_placement_ref(id_a);
+    store.add_placement_ref(id_b);
+    assert_eq!(store.total_bytes(), 800);
+
+    let result = store.store_image(rgba_image(10, 10));
+    match result {
+        Err(err) => assert_eq!(err.code, KittyErrorCode::Einval),
+        Ok(_) => panic!("admission must fail when the quota is pinned"),
+    }
+
+    // The store stays within quota and existing placements remain valid.
+    assert_eq!(store.total_bytes(), 800);
+    assert!(store.get(id_a).is_some());
+    assert!(store.get(id_b).is_some());
+
+    // A smaller image still fits within the quota without evicting
+    // anything; a full-size one cannot be admitted while nothing is
+    // evictable. Once a placement is released, its image becomes
+    // evictable and admission succeeds again.
+    assert!(store.store_image(rgba_image(5, 5)).is_ok());
+    assert_eq!(store.total_bytes(), 900);
+    assert!(store.store_image(rgba_image(10, 10)).is_err());
+    assert_eq!(store.total_bytes(), 900);
+    store.remove_placement_ref(id_a);
+    let id_c = store.store_image(rgba_image(10, 10)).unwrap();
+    assert!(store.get(id_a).is_none());
+    assert!(store.get(id_b).is_some());
+    assert!(store.get(id_c).is_some());
+    assert_eq!(store.total_bytes(), 900);
 }
 
 #[test]
