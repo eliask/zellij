@@ -34,6 +34,7 @@ impl RunningWorker {
             .get_typed_func::<(), ()>(&mut self.store, &self.name)
             .with_context(err_context)?;
         wasi_write_object(self.store.data(), &protobuf_bytes).with_context(err_context)?;
+        crate::plugins::shared::refuel_for_callback(&mut self.store);
         work_function
             .call(&mut self.store, ())
             .with_context(err_context)?;

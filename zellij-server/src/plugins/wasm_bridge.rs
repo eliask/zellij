@@ -1139,6 +1139,9 @@ impl WasmBridge {
                             // in the below conditional, we check if event_id == 0 so that we'll
                             // make sure to always render on the first resize event
                             if old_rows != new_rows || old_columns != new_columns || event_id == 0 {
+                                crate::plugins::shared::refuel_for_callback(
+                                    &mut running_plugin.store,
+                                );
                                 let rendered_bytes = running_plugin
                                     .instance
                                     .clone()
@@ -3742,6 +3745,7 @@ pub fn apply_event_to_plugin(
                         .with_context(err_context)?;
                     wasi_write_object(running_plugin.store.data(), &protobuf_event.encode_to_vec())
                         .with_context(err_context)?;
+                    crate::plugins::shared::refuel_for_callback(&mut running_plugin.store);
                     let should_render = update
                         .call(&mut running_plugin.store, ())
                         .with_context(err_context)?;
@@ -3760,6 +3764,9 @@ pub fn apply_event_to_plugin(
                         let rendered_bytes = instance
                             .get_typed_func::<(i32, i32), ()>(&mut running_plugin.store, "render")
                             .and_then(|render| {
+                                crate::plugins::shared::refuel_for_callback(
+                                    &mut running_plugin.store,
+                                );
                                 render
                                     .call(&mut running_plugin.store, (rows as i32, columns as i32))
                             })
@@ -3855,6 +3862,7 @@ pub fn apply_before_close_event_to_plugin(
         .with_context(err_context)?;
     wasi_write_object(running_plugin.store.data(), &protobuf_event.encode_to_vec())
         .with_context(err_context)?;
+    crate::plugins::shared::refuel_for_callback(&mut running_plugin.store);
     let _should_render = update
         .call(&mut running_plugin.store, ())
         .with_context(err_context)?;

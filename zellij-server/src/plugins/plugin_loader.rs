@@ -61,6 +61,7 @@ fn run_initialize_hook<T>(
     let typed_func = func.typed::<(), ()>(&*store).with_context(|| {
         format!("plugin {plugin_id} exports _initialize with an unsupported signature")
     })?;
+    crate::plugins::shared::refuel_for_callback(&mut *store);
     typed_func
         .call(&mut *store, ())
         .with_context(|| format!("plugin {plugin_id} initialization failed"))?;
@@ -248,6 +249,7 @@ impl PluginLoader {
                 let start_function_for_worker = instance
                     .get_typed_func::<(), ()>(&mut store, "_start")
                     .with_context(err_context)?;
+                crate::plugins::shared::refuel_for_callback(&mut store);
                 start_function_for_worker
                     .call(&mut store, ())
                     .with_context(err_context)?;
@@ -289,6 +291,7 @@ impl PluginLoader {
             }
         }
 
+        crate::plugins::shared::refuel_for_callback(&mut plugin.lock().unwrap().store);
         start_function
             .call(&mut plugin.lock().unwrap().store, ())
             .with_context(err_context)?;
@@ -302,6 +305,7 @@ impl PluginLoader {
         let protobuf_bytes = protobuf_plugin_configuration.encode_to_vec();
         wasi_write_object(plugin.lock().unwrap().store.data(), &protobuf_bytes)
             .with_context(err_context)?;
+        crate::plugins::shared::refuel_for_callback(&mut plugin.lock().unwrap().store);
         load_function
             .call(&mut plugin.lock().unwrap().store, ())
             .with_context(err_context)?;
@@ -372,8 +376,7 @@ impl PluginLoader {
         })?;
         zellij_exports(&mut linker);
 
-        let instance = linker
-            .instantiate_and_start(&mut store, &module)
+        let instance = crate::plugins::shared::instantiate_metered(&linker, &mut store, &module)
             .with_context(err_context)?;
 
         run_initialize_hook(&mut store, &instance, self.plugin_id)?;
@@ -484,8 +487,7 @@ impl PluginLoader {
         })?;
         zellij_exports(&mut linker);
 
-        let instance = linker
-            .instantiate_and_start(&mut store, module)
+        let instance = crate::plugins::shared::instantiate_metered(&linker, &mut store, module)
             .with_context(err_context)?;
 
         run_initialize_hook(&mut store, &instance, self.plugin_id)?;
