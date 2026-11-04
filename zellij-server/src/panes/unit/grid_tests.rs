@@ -11848,6 +11848,123 @@ fn evicting_validly_wrapped_rows_does_not_rescan_the_run() {
     );
 }
 
+/// A grid `columns` cells wide whose scrollback holds `line_count`
+/// full-width rows, each starting with its five-digit index and an `x`
+/// after it, so that serialized output can be inspected by row.
+fn wide_marked_scrollback(columns: usize, line_count: usize) -> Grid {
+    let mut grid = create_grid_with_size_and_raw(5, columns, b"");
+    let mut content: Vec<u8> = Vec::with_capacity(line_count * (columns + 2));
+    for index in 0..line_count {
+        content.extend_from_slice(format!("{index:05}").as_bytes());
+        content.resize(content.len() + columns - 5, b'x');
+        content.extend_from_slice(b"\r\n");
+    }
+    feed_bytes(&mut grid, &content);
+    grid
+}
+
+#[test]
+fn serialize_snapshot_is_bounded_by_cells_not_just_rows() {
+    // 8,000 rows of 1,000 cells is 8M cells: nearly twice the snapshot budget
+    // while far below the row cap, so only the cell budget can cut it.
+    let budget = super::MAX_SERIALIZE_SNAPSHOT_CELLS;
+    let line_count = 8_000;
+    let mut grid = wide_marked_scrollback(1_000, line_count);
+    assert!(grid.lines_above.len() < *SCROLL_BUFFER_SIZE.get_or_init(|| 10_000));
+    let stored_cells: usize = grid
+        .lines_above
+        .iter_mut()
+        .map(|row| row.width_cached())
+        .sum();
+    assert!(stored_cells > budget + budget / 2);
+
+    let serialized = grid
+        .serialize(Some(usize::MAX))
+        .expect("viewport+scrollback serializes");
+    let serialized_filler = serialized.matches('x').count();
+    assert!(
+        serialized_filler <= budget,
+        "{serialized_filler} serialized cells exceed the {budget} budget"
+    );
+    assert!(
+        serialized_filler > budget / 2,
+        "{serialized_filler} serialized cells: the budget must be used, not undershot"
+    );
+    assert!(
+        !serialized.contains("00000x"),
+        "the oldest rows must be the ones dropped"
+    );
+    for index in (line_count - 200)..line_count {
+        assert!(
+            serialized.contains(&format!("{index:05}x")),
+            "newest row {index} must survive the budget"
+        );
+    }
+}
+
+#[test]
+fn serialize_budget_only_scans_the_requested_rows() {
+    // Well under the cell budget, so a scan that ignored the request
+    // would walk all 3,000 rows before running out of history.
+    let grid = wide_marked_scrollback(1_000, 3_000);
+    super::reset_serialize_budget_rows_scanned();
+    let serialized = grid
+        .serialize(Some(100))
+        .expect("viewport+scrollback serializes");
+    let scanned = super::serialize_budget_rows_scanned();
+    assert!(
+        scanned <= 200,
+        "a 100-row request scanned {scanned} history rows"
+    );
+    assert!(serialized.contains("02990x"));
+    assert!(!serialized.contains("02000x"));
+}
+
+#[test]
+fn repeated_osc133_markers_on_one_row_are_bounded() {
+    // `ESC ] 133 ; D ; 0 BEL` prints nothing and does not move the
+    // cursor, so every repeat used to add one more marker to the same
+    // row at zero cell cost.
+    let mut grid = create_grid_with_size_and_raw(5, 20, b"");
+    let marker = b"\x1b]133;D;0\x07";
+    let mut content: Vec<u8> = Vec::new();
+    for _ in 0..50_000 {
+        content.extend_from_slice(marker);
+    }
+    feed_bytes(&mut grid, &content);
+    let markers: usize = grid
+        .viewport
+        .iter()
+        .map(|row| row.osc133_markers.iter().count())
+        .sum();
+    assert_eq!(markers, 1, "repeats at one position collapse to one marker");
+
+    // Distinct positions are capped per row, keeping the newest.
+    let mut grid = create_grid_with_size_and_raw(5, 1_000, b"");
+    let mut content: Vec<u8> = Vec::new();
+    for _ in 0..500 {
+        content.extend_from_slice(b"x\x1b]133;D;0\x07");
+    }
+    feed_bytes(&mut grid, &content);
+    let row = &grid.viewport[0];
+    let kept: Vec<usize> = row.osc133_markers.iter().map(|m| m.column).collect();
+    assert_eq!(kept.len(), super::MAX_OSC133_MARKERS_PER_ROW);
+    assert_eq!(*kept.last().unwrap(), 500, "the newest marker is kept");
+}
+
+#[test]
+fn serialization_snapshot_budget_counts_osc133_markers() {
+    let mut grid = create_grid_with_size_and_raw(5, 20, b"abc\x1b]133;D;0\x07\x1b]133;C\x07");
+    let row = &grid.viewport[0];
+    assert_eq!(row.osc133_markers.iter().count(), 2);
+    assert_eq!(row.snapshot_cost(), row.width() + 2);
+    // an empty row still pays for the markers a clone would copy
+    feed_bytes(&mut grid, b"\r\n\x1b]133;D;0\x07\x1b]133;C\x07");
+    let empty_row = &grid.viewport[1];
+    assert_eq!(empty_row.width(), 0);
+    assert_eq!(empty_row.snapshot_cost(), 2);
+}
+
 #[test]
 fn evicting_a_stored_row_of_wide_characters_debits_its_exact_display_rows() {
     // 5,000 width-2 characters wrap to one character per row at width

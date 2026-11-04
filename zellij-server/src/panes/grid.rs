@@ -957,6 +957,26 @@ fn transfer_rows_from_lines_below_to_viewport(
     reflowed
 }
 
+/// Cell budget for a pane serialization snapshot. Kept generous so
+/// ordinary scrollback serializes fully while pathological histories
+/// cannot copy unbounded state per snapshot pass.
+const MAX_SERIALIZE_SNAPSHOT_CELLS: usize = 4 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static SERIALIZE_BUDGET_ROWS_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn serialize_budget_rows_scanned() -> usize {
+    SERIALIZE_BUDGET_ROWS_SCANNED.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_serialize_budget_rows_scanned() {
+    SERIALIZE_BUDGET_ROWS_SCANNED.with(|c| c.set(0));
+}
+
 #[cfg(test)]
 thread_local! {
     static REWRAP_ROWS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2740,6 +2760,29 @@ impl Grid {
                         .map(|(index, _)| index)
                         .unwrap_or(first_requested_index)
                 };
+                // Budget the snapshot by cells, not just row count: a
+                // logical line can span many wrapped rows, so the row
+                // cap alone does not bound the bytes copied onto the
+                // serializing thread. Rows are accumulated newest-first
+                // and cut at the oldest index that fits the budget —
+                // truncation drops the oldest history, never the tail.
+                // Only the requested rows are examined, so a small
+                // request never pays for scanning the whole history.
+                let viewport_cells: usize =
+                    self.viewport.iter().map(|row| row.snapshot_cost()).sum();
+                let mut cell_budget = MAX_SERIALIZE_SNAPSHOT_CELLS.saturating_sub(viewport_cells);
+                let mut byte_bounded_first = self.lines_above.len();
+                for index in (first_index..self.lines_above.len()).rev() {
+                    #[cfg(test)]
+                    SERIALIZE_BUDGET_ROWS_SCANNED.with(|c| c.set(c.get() + 1));
+                    let row_cells = self.lines_above[index].snapshot_cost();
+                    if row_cells > cell_budget {
+                        break;
+                    }
+                    cell_budget -= row_cells;
+                    byte_bounded_first = index;
+                }
+                let first_index = first_index.max(byte_bounded_first);
                 let mut to_serialize = vec![];
                 for line in self.lines_above.iter().skip(first_index) {
                     to_serialize.push(line.with_trailing_blanks().into_owned());
@@ -7232,6 +7275,10 @@ fn decode_width(width: Option<NonZeroU32>) -> Option<usize> {
     width.map(|width| width.get() as usize - 1)
 }
 
+/// Most OSC 133 markers one row retains. A real prompt row carries a
+/// handful; the cap bounds what cloning a row can cost.
+const MAX_OSC133_MARKERS_PER_ROW: usize = 64;
+
 #[derive(Clone, Default)]
 struct Osc133Markers(Option<Box<Vec<Osc133Marker>>>);
 
@@ -7277,6 +7324,17 @@ impl Osc133Markers {
     fn extend(&mut self, markers: impl IntoIterator<Item = Osc133Marker>) {
         for marker in markers {
             self.push(marker);
+        }
+    }
+    /// Keeps the markers at the highest columns (the most recent ones,
+    /// as the cursor moves right) when a row exceeds the per-row cap.
+    /// Expects the markers sorted by column.
+    fn enforce_cap(&mut self) {
+        if let Some(markers) = self.0.as_mut() {
+            if markers.len() > MAX_OSC133_MARKERS_PER_ROW {
+                let excess = markers.len() - MAX_OSC133_MARKERS_PER_ROW;
+                markers.drain(..excess);
+            }
         }
     }
     fn sort_by_key(&mut self, f: impl FnMut(&Osc133Marker) -> usize) {
@@ -7409,6 +7467,12 @@ impl Row {
             width += terminal_character.width();
         }
         width
+    }
+    /// Cost of cloning this row into a serialization snapshot: its
+    /// display cells plus one unit per OSC 133 marker, which a clone
+    /// copies even when the row holds no characters at all.
+    fn snapshot_cost(&self) -> usize {
+        self.width() + self.osc133_markers.as_slice().len()
     }
     pub fn compress_trailing_blanks(&mut self) {
         let mut kept = self.columns.len();
@@ -7770,6 +7834,7 @@ impl Row {
                             marker
                         }),
                 );
+            self.osc133_markers.enforce_cap();
         }
         let combined_width = match (decode_width(self.width), decode_width(to_append.width)) {
             (Some(own), Some(appended)) => encode_width(own + appended),
@@ -7932,8 +7997,17 @@ impl Row {
         parts
     }
     fn add_osc133_marker(&mut self, column: usize, kind: Osc133MarkerKind) {
+        // A marker of the same type at the same column supersedes the
+        // earlier one (a repeated `D` there carries no new information),
+        // and the per-row total is capped, so a stream of markers that
+        // never advance the cursor cannot grow a row without bound.
+        self.osc133_markers.retain(|marker| {
+            marker.column != column
+                || std::mem::discriminant(&marker.kind) != std::mem::discriminant(&kind)
+        });
         self.osc133_markers.push(Osc133Marker { column, kind });
         self.osc133_markers.sort_by_key(|marker| marker.column);
+        self.osc133_markers.enforce_cap();
     }
     pub fn last_index_in_line(&self) -> usize {
         self.columns.len()
