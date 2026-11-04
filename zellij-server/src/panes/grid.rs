@@ -653,10 +653,14 @@ fn transfer_rows_from_lines_above_to_viewport(
     kitty_grid: &mut KittyGrid,
     count: usize,
     max_viewport_width: usize,
-) -> isize {
+) -> (isize, bool) {
     let mut next_lines: Vec<Row> = vec![];
     let mut lines_added_to_viewport: isize = 0;
     let mut display_row_delta: isize = 0;
+    // Whether the canonical structure changed (a logical line was
+    // rewrapped across the boundary). Consumers use this to decide
+    // whether canonical-space anchors must be re-derived.
+    let mut reflowed = false;
     loop {
         if lines_added_to_viewport as usize == count {
             break;
@@ -691,6 +695,7 @@ fn transfer_rows_from_lines_above_to_viewport(
             if next_lines.is_empty() {
                 break;
             }
+            reflowed = true;
             let row_count_delta = next_lines.len() as isize
                 - rows_taken_from_lines_above as isize
                 - merged_row_count as isize;
@@ -712,7 +717,7 @@ fn transfer_rows_from_lines_above_to_viewport(
         }
         display_row_delta += 1;
     }
-    display_row_delta
+    (display_row_delta, reflowed)
 }
 
 fn transfer_rows_from_viewport_to_lines_above(
@@ -1927,8 +1932,27 @@ impl Grid {
         self.kitty_grid
             .settle_placements_below_the_viewport(rows_below_the_viewport)
     }
+    #[cfg(test)]
+    pub(crate) fn kitty_reanchor_all_from_pixels_for_test(&mut self) {
+        self.kitty_reanchor_all_from_pixels();
+    }
     fn kitty_reanchor_all_from_pixels(&mut self) {
         self.kitty_settle_placements_below_the_viewport();
+        self.kitty_reanchor_canonical_structure();
+    }
+    /// Refresh kitty bookkeeping after an ordinary one-row scroll.
+    /// The canonical-line anchor space only has to be re-derived when
+    /// the scroll step actually reflowed a logical line; moving already
+    /// wrapped rows between the collections leaves every placement's
+    /// (canonical_line, offset) anchor valid, so the O(history) starts
+    /// scan is skipped on the common path.
+    fn kitty_refresh_after_scroll_step(&mut self, canonical_structure_changed: bool) {
+        self.kitty_settle_placements_below_the_viewport();
+        if canonical_structure_changed {
+            self.kitty_reanchor_canonical_structure();
+        }
+    }
+    fn kitty_reanchor_canonical_structure(&mut self) {
         if self.kitty_grid.placement_count() == 0 {
             return;
         }
@@ -1978,7 +2002,7 @@ impl Grid {
             let line_to_push_down = self.viewport.pop_back().unwrap();
             self.lines_below.push_front(line_to_push_down);
 
-            let display_row_delta = transfer_rows_from_lines_above_to_viewport(
+            let (display_row_delta, reflowed) = transfer_rows_from_lines_above_to_viewport(
                 &mut self.lines_above,
                 &mut self.viewport,
                 &mut self.sixel_grid,
@@ -1987,7 +2011,7 @@ impl Grid {
                 self.width,
             );
             self.apply_scrollback_display_row_delta(display_row_delta);
-            self.kitty_reanchor_all_from_pixels();
+            self.kitty_refresh_after_scroll_step(reflowed);
 
             self.selection.move_down(1);
             if let Some(command_output_flash) = self.command_output_flash.as_mut() {
@@ -2042,7 +2066,14 @@ impl Grid {
                 1,
                 self.width,
             );
-            self.kitty_reanchor_all_from_pixels();
+            // Rows pulled from lines_below keep their canonical
+            // boundaries (rewrapping at the unchanged width is
+            // idempotent for rows produced at that width), and the one
+            // structural change — normalizing the pushed-up first row —
+            // was already announced via
+            // insert_canonical_anchor_line_at_front. Only the
+            // below-viewport bookkeeping needs refreshing.
+            self.kitty_refresh_after_scroll_step(false);
 
             self.selection.move_up(1);
             if let Some(command_output_flash) = self.command_output_flash.as_mut() {

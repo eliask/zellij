@@ -11725,6 +11725,47 @@ fn a_url_with_a_suggestion_after_the_cursor_waits_until_the_line_is_final() {
 }
 
 #[test]
+fn kitty_anchors_survive_scroll_steps_without_full_reanchor() {
+    // Oracle: ordinary scroll steps take the incremental anchor path.
+    // If skipping the O(history) reanchor dropped a needed update, a
+    // manual full reanchor afterwards would change the placements —
+    // comparing before and after proves the skip is lossless.
+    let (mut grid, _kitty_image_store) = new_kitty_grid(20, 40);
+    let mut vte_parser = vt_parser::Parser::new();
+    let mut interceptor = KittyApcInterceptor::new();
+    for i in 0..45 {
+        let line = format!("scrollback line {i}\r\n");
+        feed_kitty_bytes(
+            &mut grid,
+            &mut vte_parser,
+            &mut interceptor,
+            line.as_bytes(),
+        );
+    }
+    build_three_kitty_placements(&mut grid, &mut vte_parser, &mut interceptor);
+
+    let snapshot = |grid: &Grid| grid.kitty_placements().to_vec();
+
+    for _ in 0..5 {
+        grid.scroll_up_one_line();
+    }
+    let before = snapshot(&grid);
+    grid.kitty_reanchor_all_from_pixels_for_test();
+    assert_eq!(before, snapshot(&grid), "stale anchors after scrolling up");
+
+    for _ in 0..5 {
+        grid.scroll_down_one_line();
+    }
+    let before = snapshot(&grid);
+    grid.kitty_reanchor_all_from_pixels_for_test();
+    assert_eq!(
+        before,
+        snapshot(&grid),
+        "stale anchors after scrolling down"
+    );
+}
+
+#[test]
 fn evicting_a_stored_row_of_wide_characters_debits_its_exact_display_rows() {
     // 5,000 width-2 characters wrap to one character per row at width
     // 3: 5,000 display rows. Estimating from the 10,000-cell total gave
