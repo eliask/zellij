@@ -60,7 +60,7 @@ fn create_plugin_fs_entries(plugin_own_data_dir: &PathBuf, plugin_own_cache_dir:
     }
 }
 
-pub struct PluginLoader<'a> {
+pub struct PluginLoader {
     skip_cache: bool,
     plugin_id: PluginId,
     generation: u64,
@@ -82,20 +82,18 @@ pub struct PluginLoader<'a> {
     senders: ThreadSenders,
     engine: Engine,
     plugin_cache: PluginCache,
-    plugin_map: &'a mut PluginMap, // we receive a mutable reference rather than the Arc so that it
-    // will be held for the lifetime of this struct and thus loading
-    // plugins for all connected clients will be one transaction
+    plugin_map: Arc<Mutex<PluginMap>>,
     connected_clients: Option<Arc<Mutex<Vec<ClientId>>>>,
 }
 
-impl<'a> PluginLoader<'a> {
+impl PluginLoader {
     pub fn new(
         skip_cache: bool,
         loading_context: LoadingContext,
         senders: ThreadSenders,
         engine: Engine,
         plugin_cache: PluginCache,
-        plugin_map: &'a mut PluginMap,
+        plugin_map: Arc<Mutex<PluginMap>>,
         connected_clients: Arc<Mutex<Vec<ClientId>>>,
     ) -> Self {
         let loading_indication = LoadingIndication::new("".into());
@@ -159,7 +157,7 @@ impl<'a> PluginLoader<'a> {
         self.load_plugin_instance(store, &instance, true)
     }
     fn record_plugin_metadata(&mut self) {
-        self.plugin_map.insert_metadata(
+        self.plugin_map.lock().unwrap().insert_metadata(
             self.plugin_id,
             PluginMetadata {
                 plugin_config: self.plugin_config.clone(),
@@ -240,20 +238,23 @@ impl<'a> PluginLoader<'a> {
             self.size.rows,
             self.size.cols,
         )));
-        if shared {
-            self.plugin_map.insert_shared(
-                self.plugin_id,
-                (plugin.clone(), subscriptions, workers),
-                in_blocking_call,
-            );
-        } else {
-            self.plugin_map.insert(
-                self.plugin_id,
-                self.client_id,
-                plugin.clone(),
-                subscriptions,
-                workers,
-            );
+        {
+            let mut plugin_map = self.plugin_map.lock().unwrap();
+            if shared {
+                plugin_map.insert_shared(
+                    self.plugin_id,
+                    (plugin.clone(), subscriptions, workers),
+                    in_blocking_call,
+                );
+            } else {
+                plugin_map.insert(
+                    self.plugin_id,
+                    self.client_id,
+                    plugin.clone(),
+                    subscriptions,
+                    workers,
+                );
+            }
         }
 
         start_function

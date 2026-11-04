@@ -600,20 +600,19 @@ impl WasmBridge {
                                   connected_clients: Arc<Mutex<Vec<ClientId>>>,
                                   plugin_cache: PluginCache,
                                   engine| {
-                                let mut plugin_map = plugin_map.lock().unwrap();
                                 match PluginLoader::new(
                                     skip_cache,
                                     loading_context,
                                     senders.clone(),
                                     engine.clone(),
                                     plugin_cache.clone(),
-                                    &mut plugin_map,
+                                    plugin_map.clone(),
                                     connected_clients.clone(),
                                 )
                                 .start_plugin()
                                 {
                                     Ok(_) => {
-                                        let plugin_list = plugin_map.list_plugins();
+                                        let plugin_list = plugin_map.lock().unwrap().list_plugins();
                                         handle_plugin_successful_loading(
                                             &senders,
                                             plugin_id,
@@ -649,20 +648,19 @@ impl WasmBridge {
                               connected_clients,
                               plugin_cache: PluginCache,
                               engine: Engine| {
-                            let mut plugin_map = plugin_map.lock().unwrap();
                             match PluginLoader::new(
                                 skip_cache,
                                 loading_context,
                                 senders.clone(),
                                 engine.clone(),
                                 plugin_cache.clone(),
-                                &mut plugin_map,
+                                plugin_map.clone(),
                                 connected_clients.clone(),
                             )
                             .start_plugin()
                             {
                                 Ok(_) => {
-                                    let plugin_list = plugin_map.list_plugins();
+                                    let plugin_list = plugin_map.lock().unwrap().list_plugins();
                                     handle_plugin_successful_loading(
                                         &senders,
                                         plugin_id,
@@ -901,20 +899,19 @@ impl WasmBridge {
             plugin_id,
             move |senders, plugin_map, connected_clients, plugin_cache, engine| {
                 let skip_cache = true; // we want to explicitly reload the plugin
-                let mut plugin_map = plugin_map.lock().unwrap();
                 match PluginLoader::new(
                     skip_cache,
                     loading_context,
                     senders.clone(),
                     engine.clone(),
                     plugin_cache.clone(),
-                    &mut plugin_map,
+                    plugin_map.clone(),
                     connected_clients.clone(),
                 )
                 .start_plugin()
                 {
                     Ok(_) => {
-                        let plugin_list = plugin_map.list_plugins();
+                        let plugin_list = plugin_map.lock().unwrap().list_plugins();
                         handle_plugin_successful_loading(&senders, plugin_id, plugin_list);
                     },
                     Err(e) => handle_plugin_loading_failure(
@@ -1034,14 +1031,13 @@ impl WasmBridge {
                 plugin_id,
                 move |senders, plugin_map, connected_clients, plugin_cache, engine| {
                     let skip_cache = false;
-                    let mut plugin_map = plugin_map.lock().unwrap();
                     match PluginLoader::new(
                         skip_cache,
                         loading_context,
                         senders.clone(),
                         engine.clone(),
                         plugin_cache.clone(),
-                        &mut plugin_map,
+                        plugin_map.clone(),
                         connected_clients.clone(),
                     )
                     .without_connected_clients()
