@@ -11766,6 +11766,64 @@ fn kitty_anchors_survive_scroll_steps_without_full_reanchor() {
 }
 
 #[test]
+fn scrolling_down_through_wrapped_lines_does_not_rewrap_them_again() {
+    // Rows that are already wrapped at the current width move between
+    // lines_below and the viewport directly; reconstructing every
+    // pulled logical line was O(line length) per scroll step.
+    use crate::panes::grid::{reset_rewrap_rows_call_count, rewrap_rows_call_count};
+    let (mut grid, _kitty_image_store) = new_kitty_grid(10, 20);
+    let mut vte_parser = vt_parser::Parser::new();
+    // long lines that wrap into several display rows at width 20
+    for i in 0..30 {
+        let line = format!("a very long wrapped line number {i} that spans rows\r\n");
+        vte_parser.feed(&mut grid, line.as_bytes());
+    }
+    for _ in 0..8 {
+        grid.scroll_up_one_line();
+    }
+    reset_rewrap_rows_call_count();
+    for _ in 0..8 {
+        grid.scroll_down_one_line();
+    }
+    assert_eq!(
+        rewrap_rows_call_count(),
+        0,
+        "scroll-down through already-wrapped rows must not reflow them"
+    );
+}
+
+#[test]
+fn scrolling_down_through_a_line_taller_than_the_viewport_does_not_rewrap_it_per_step() {
+    // One logical line of 5,000 display rows at width 200 fills the
+    // 24-row viewport with continuation rows, so no canonical row is
+    // visible. The stored wrap is valid at this width, yet the fast
+    // path used to refuse such a viewport and rewrap the remaining
+    // line on every step (billions of cells in total).
+    use crate::panes::grid::{reset_rewrap_rows_call_count, rewrap_rows_call_count};
+    let columns = 200;
+    let run_rows = 5_000;
+    let mut grid = create_grid_with_size_and_raw(24, columns, b"");
+    let mut long_line = vec![b'a'; columns * run_rows];
+    long_line.extend_from_slice(b"\r\nend\r\n");
+    feed_bytes(&mut grid, &long_line);
+    let steps = 4_000;
+    for _ in 0..steps {
+        grid.scroll_up_one_line();
+    }
+    assert!(grid.viewport.iter().all(|row| !row.is_canonical));
+    reset_rewrap_rows_call_count();
+    for _ in 0..steps {
+        grid.scroll_down_one_line();
+    }
+    assert!(
+        rewrap_rows_call_count() <= 2,
+        "{} rewraps while scrolling down through one stored line",
+        rewrap_rows_call_count()
+    );
+    assert_eq!(grid.lines_below.len(), 0, "scrolled back to the bottom");
+}
+
+#[test]
 fn evicting_a_stored_row_of_wide_characters_debits_its_exact_display_rows() {
     // 5,000 width-2 characters wrap to one character per row at width
     // 3: 5,000 display rows. Estimating from the 10,000-cell total gave

@@ -422,6 +422,112 @@ fn scrollback_tail_is_wrapped_at(
     }
 }
 
+/// Whether the canonical line at the head of `lines_below` is already
+/// wrapped at `width`: every stored row except the line's last must be
+/// full, meaning the next row's first character could not have fit.
+/// Rows can still carry wraps produced at a previous width after a
+/// resize (lines_below is not reflowed on resize); those fail the
+/// check and take the reflow path.
+fn lines_below_head_is_wrapped_at(lines_below: &mut VecDeque<Row>, width: usize) -> bool {
+    let Some(first) = lines_below.front() else {
+        return false;
+    };
+    if !first.is_canonical || width == 0 {
+        return false;
+    }
+    let mut previous_row_width: Option<usize> = None;
+    for index in 0..lines_below.len() {
+        if index > 0 && lines_below[index].is_canonical {
+            break; // reached the next canonical line: end of the run
+        }
+        let row = match lines_below.get_mut(index) {
+            Some(row) => row,
+            None => break,
+        };
+        let row_width = row.width_cached();
+        if row_width > width {
+            return false;
+        }
+        if let Some(previous_row_width) = previous_row_width {
+            if previous_row_width + first_character_width(row) <= width {
+                return false;
+            }
+        }
+        previous_row_width = Some(row_width);
+    }
+    true
+}
+
+/// Width of the viewport's last row when the logical line it belongs
+/// to is wrapped at `width` within the viewport: every stored row of
+/// that line except the last must be full. The line starts at the
+/// viewport's bottom canonical row, or at the viewport's first row when
+/// the viewport is all continuation rows of a line that began above it
+/// (a line taller than the viewport) — rows above the viewport are not
+/// needed to judge the rows that follow.
+fn viewport_bottom_line_is_wrapped_at(viewport: &mut VecDeque<Row>, width: usize) -> Option<usize> {
+    if width == 0 || viewport.is_empty() {
+        return None;
+    }
+    let bottom_line_start = (0..viewport.len())
+        .rev()
+        .find(|&index| viewport[index].is_canonical)
+        .unwrap_or(0);
+    let mut previous_row_width: Option<usize> = None;
+    for index in bottom_line_start..viewport.len() {
+        let row = viewport.get_mut(index)?;
+        let row_width = row.width_cached();
+        if row_width > width {
+            return None;
+        }
+        if let Some(previous_row_width) = previous_row_width {
+            if previous_row_width + first_character_width(row) <= width {
+                return None;
+            }
+        }
+        previous_row_width = Some(row_width);
+    }
+    previous_row_width
+}
+
+/// Moves the continuation rows at the head of `lines_below` into the
+/// viewport one at a time while they are still wrapped at `width`
+/// (each must fit and the row before it must be full), until the
+/// viewport holds `target_viewport_len` rows. `previous_row_width` is
+/// the width of the viewport's last row. Only the rows actually needed
+/// are touched, so scrolling through one huge logical line costs
+/// O(rows moved) per step. Returns the number of rows moved; zero means
+/// the next stored row is stale and the line must be reflowed.
+fn move_wrapped_continuation_rows_to_viewport(
+    lines_below: &mut VecDeque<Row>,
+    viewport: &mut VecDeque<Row>,
+    target_viewport_len: usize,
+    mut previous_row_width: usize,
+    width: usize,
+) -> usize {
+    let mut moved = 0;
+    while viewport.len() < target_viewport_len {
+        let Some(row) = lines_below.front_mut() else {
+            break;
+        };
+        if row.is_canonical {
+            break;
+        }
+        let row_width = row.width_cached();
+        if row_width > width || previous_row_width + first_character_width(row) <= width {
+            break;
+        }
+        let Some(mut row) = lines_below.pop_front() else {
+            break;
+        };
+        row.expand_trailing_blanks();
+        viewport.push_back(row);
+        previous_row_width = row_width;
+        moved += 1;
+    }
+    moved
+}
+
 fn scrollback_display_row_count(rows: &mut VecDeque<Row>, width: usize) -> usize {
     let mut display_rows = 0;
     let mut run_start = 0;
@@ -746,22 +852,63 @@ fn transfer_rows_from_lines_below_to_viewport(
     viewport: &mut VecDeque<Row>,
     count: usize,
     max_viewport_width: usize,
-) {
+) -> bool {
     let mut next_lines: Vec<Row> = vec![];
+    // Whether any logical line had to be reconstructed. Consumers use
+    // this to decide whether canonical-space anchors must be re-derived.
+    let mut reflowed = false;
     let target_viewport_len = viewport.len() + count;
     while viewport.len() < target_viewport_len {
         if next_lines.is_empty() {
             if lines_below.is_empty() {
                 break; // no more rows
             }
-            let mut top_non_canonical_rows_in_lines_below = get_top_non_canonical_rows(lines_below);
-            if !top_non_canonical_rows_in_lines_below.is_empty() {
-                let mut canonical_line = get_viewport_bottom_canonical_row_and_wraps(viewport);
-                canonical_line.append(&mut top_non_canonical_rows_in_lines_below);
-                next_lines = Row::rewrap_rows(canonical_line, max_viewport_width);
+            let boundary_is_continuation = lines_below
+                .front()
+                .map(|row| !row.is_canonical)
+                .unwrap_or(false);
+            if boundary_is_continuation {
+                // While the boundary line's stored wraps are still valid
+                // at this width, move just the continuation rows that
+                // are needed directly instead of reconstructing the
+                // whole line (which, for a line taller than the
+                // viewport, made every scroll step O(line length)).
+                let rows_moved =
+                    match viewport_bottom_line_is_wrapped_at(viewport, max_viewport_width) {
+                        Some(last_viewport_row_width) => {
+                            move_wrapped_continuation_rows_to_viewport(
+                                lines_below,
+                                viewport,
+                                target_viewport_len,
+                                last_viewport_row_width,
+                                max_viewport_width,
+                            )
+                        },
+                        None => 0,
+                    };
+                if rows_moved > 0 {
+                    continue;
+                } else {
+                    let mut top_non_canonical_rows_in_lines_below =
+                        get_top_non_canonical_rows(lines_below);
+                    let mut canonical_line = get_viewport_bottom_canonical_row_and_wraps(viewport);
+                    canonical_line.append(&mut top_non_canonical_rows_in_lines_below);
+                    next_lines = Row::rewrap_rows(canonical_line, max_viewport_width);
+                    reflowed = true;
+                }
+            } else if lines_below_head_is_wrapped_at(lines_below, max_viewport_width) {
+                // The stored run is already wrapped at this width, so
+                // the rows can move directly instead of being
+                // reconstructed — mirroring the lines_above fast path.
+                let mut stored_rows = get_top_canonical_row_and_wraps(lines_below);
+                for row in stored_rows.iter_mut() {
+                    row.expand_trailing_blanks();
+                }
+                next_lines = stored_rows;
             } else {
                 let canonical_row = get_top_canonical_row_and_wraps(lines_below);
                 next_lines = Row::rewrap_rows(canonical_row, max_viewport_width);
+                reflowed = true;
             }
             if next_lines.is_empty() {
                 break;
@@ -772,6 +919,22 @@ fn transfer_rows_from_lines_below_to_viewport(
     for excess_row in next_lines.into_iter().rev() {
         lines_below.push_front(excess_row);
     }
+    reflowed
+}
+
+#[cfg(test)]
+thread_local! {
+    static REWRAP_ROWS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn rewrap_rows_call_count() -> usize {
+    REWRAP_ROWS_CALLS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_rewrap_rows_call_count() {
+    REWRAP_ROWS_CALLS.with(|c| c.set(0));
 }
 
 thread_local! {
@@ -2060,20 +2223,18 @@ impl Grid {
             }
             self.apply_scrollback_display_row_delta(display_row_delta);
 
-            transfer_rows_from_lines_below_to_viewport(
+            let reflowed = transfer_rows_from_lines_below_to_viewport(
                 &mut self.lines_below,
                 &mut self.viewport,
                 1,
                 self.width,
             );
-            // Rows pulled from lines_below keep their canonical
-            // boundaries (rewrapping at the unchanged width is
-            // idempotent for rows produced at that width), and the one
-            // structural change — normalizing the pushed-up first row —
-            // was already announced via
-            // insert_canonical_anchor_line_at_front. Only the
-            // below-viewport bookkeeping needs refreshing.
-            self.kitty_refresh_after_scroll_step(false);
+            // Normalizing the pushed-up first row was already
+            // announced via insert_canonical_anchor_line_at_front; a
+            // reflow of pulled rows (stale wraps or a boundary merge)
+            // is the only other thing that can change canonical
+            // structure here.
+            self.kitty_refresh_after_scroll_step(reflowed);
 
             self.selection.move_up(1);
             if let Some(command_output_flash) = self.command_output_flash.as_mut() {
@@ -7658,6 +7819,8 @@ impl Row {
         Row::rewrap_rows(vec![std::mem::replace(self, drained)], max_row_length)
     }
     pub fn rewrap_rows(mut rows: Vec<Row>, max_row_length: usize) -> Vec<Row> {
+        #[cfg(test)]
+        REWRAP_ROWS_CALLS.with(|c| c.set(c.get() + 1));
         if rows.is_empty() {
             return vec![];
         }
