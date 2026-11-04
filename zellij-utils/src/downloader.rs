@@ -4,6 +4,7 @@ use isahc::{config::RedirectPolicy, HttpClient, Request};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt as _, sync::Mutex};
 use tokio_stream::StreamExt as _;
@@ -12,6 +13,8 @@ use tokio_util::io::ReaderStream;
 use url::Url;
 
 const STREAM_BUFFER_SIZE_BYTES: usize = 65535;
+const MAX_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Error, Debug)]
 pub enum DownloaderError {
@@ -31,6 +34,10 @@ pub enum DownloaderError {
     ClientUnavailable,
     #[error("Unexpected HTTP status: {0}")]
     UnexpectedStatus(u16),
+    #[error("Download exceeds the maximum allowed size")]
+    TooLarge,
+    #[error("Download exceeded the deadline")]
+    TimedOut,
 }
 
 #[derive(Debug, Clone)]
@@ -131,12 +138,29 @@ impl Downloader {
         ensure_success_status(res.status())?;
         let body = res.body_mut();
         let mut stream = ReaderStream::with_capacity(body.compat(), STREAM_BUFFER_SIZE_BYTES);
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(DownloaderError::Io)?;
-            target
-                .write_all(&chunk)
-                .await
-                .map_err(DownloaderError::Io)?;
+        let mut downloaded_bytes =
+            usize::try_from(file_part_size).map_err(|_| DownloaderError::TooLarge)?;
+        let download_result = tokio::time::timeout(DOWNLOAD_TIMEOUT, async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(DownloaderError::Io)?;
+                downloaded_bytes = checked_download_total(downloaded_bytes, chunk.len())?;
+                target
+                    .write_all(&chunk)
+                    .await
+                    .map_err(DownloaderError::Io)?;
+            }
+            Ok::<(), DownloaderError>(())
+        })
+        .await;
+        match download_result {
+            Ok(Ok(())) => {},
+            Ok(Err(error)) => {
+                if matches!(error, DownloaderError::TooLarge) {
+                    let _ = tokio::fs::remove_file(&file_part_path).await;
+                }
+                return Err(error);
+            },
+            Err(_) => return Err(DownloaderError::TimedOut),
         }
 
         log::debug!("Download complete: {:?}", file_part_path);
@@ -162,10 +186,17 @@ impl Downloader {
         let mut downloaded_bytes: Vec<u8> = vec![];
         let body = res.body_mut();
         let mut stream = ReaderStream::with_capacity(body.compat(), STREAM_BUFFER_SIZE_BYTES);
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(DownloaderError::Io)?;
-            downloaded_bytes.extend_from_slice(&*chunk);
-        }
+        let mut total_bytes = 0usize;
+        tokio::time::timeout(DOWNLOAD_TIMEOUT, async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(DownloaderError::Io)?;
+                total_bytes = checked_download_total(total_bytes, chunk.len())?;
+                downloaded_bytes.extend_from_slice(&*chunk);
+            }
+            Ok::<(), DownloaderError>(())
+        })
+        .await
+        .map_err(|_| DownloaderError::TimedOut)??;
 
         log::debug!("Download complete");
         let stringified = String::from_utf8(downloaded_bytes)
@@ -238,6 +269,16 @@ fn ensure_success_status(status: StatusCode) -> Result<(), DownloaderError> {
     }
 }
 
+fn checked_download_total(current: usize, additional: usize) -> Result<usize, DownloaderError> {
+    let total = current
+        .checked_add(additional)
+        .ok_or(DownloaderError::TooLarge)?;
+    if total > MAX_DOWNLOAD_BYTES {
+        return Err(DownloaderError::TooLarge);
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +296,18 @@ mod tests {
         assert!(matches!(
             ensure_success_status(StatusCode::NOT_FOUND),
             Err(DownloaderError::UnexpectedStatus(404))
+        ));
+    }
+
+    #[test]
+    fn download_byte_budget_is_enforced() {
+        assert_eq!(
+            checked_download_total(0, MAX_DOWNLOAD_BYTES).unwrap(),
+            MAX_DOWNLOAD_BYTES
+        );
+        assert!(matches!(
+            checked_download_total(MAX_DOWNLOAD_BYTES, 1),
+            Err(DownloaderError::TooLarge)
         ));
     }
 
