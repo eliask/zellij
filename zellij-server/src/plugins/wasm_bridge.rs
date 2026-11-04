@@ -292,6 +292,7 @@ pub struct WasmBridge {
     // payload>
     loading_plugins: HashSet<(PluginId, RunPlugin)>, // tracks loading plugins without handles
     plugins_to_unload_once_loaded: HashSet<PluginId>,
+    quarantined_plugins: HashSet<PluginId>,
     pending_plugin_reloads: HashSet<RunPlugin>,
     path_to_default_shell: PathBuf,
     watcher: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
@@ -370,6 +371,7 @@ impl WasmBridge {
             cached_worker_messages: HashMap::new(),
             loading_plugins: HashSet::new(),
             plugins_to_unload_once_loaded: HashSet::new(),
+            quarantined_plugins: HashSet::new(),
             pending_plugin_reloads: HashSet::new(),
             zellij_cwd,
             session_env_vars,
@@ -658,6 +660,7 @@ impl WasmBridge {
     }
     pub fn unload_plugin(&mut self, pid: PluginId) -> Result<()> {
         info!("Bye from plugin {}", &pid);
+        self.quarantined_plugins.remove(&pid);
         let _ = self
             .senders
             .send_to_screen(ScreenInstruction::ClearLiveViewsOfPlugin(pid));
@@ -766,6 +769,19 @@ impl WasmBridge {
 
         Ok(())
     }
+    pub fn quarantine_plugin(&mut self, pid: PluginId) {
+        if !self.quarantined_plugins.insert(pid) {
+            return;
+        }
+        log::error!("Quarantining plugin {} after a fatal callback error", pid);
+        self.plugin_ids_waiting_for_permission_request.remove(&pid);
+        self.cached_events_for_pending_plugins.remove(&pid);
+        self.cached_resizes_for_pending_plugins.remove(&pid);
+        self.cached_worker_messages.remove(&pid);
+        let pipes_to_release = self.pending_pipes.unload_plugin(&pid);
+        self.send_pipe_releases(pipes_to_release);
+        self.forget_pipe_popups_of_plugin(pid);
+    }
     fn prepare_plugin_reload(&mut self, plugin_id: PluginId) {
         let _ = self
             .senders
@@ -776,6 +792,7 @@ impl WasmBridge {
         self.unregister_settings_entry(plugin_id);
     }
     pub fn reload_plugin_with_id(&mut self, plugin_id: u32) -> Result<()> {
+        self.quarantined_plugins.remove(&plugin_id);
         if let Some(instance_id) = self.shared_instance_of(plugin_id) {
             self.prepare_plugin_reload(plugin_id);
             self.reload_shared_instance(instance_id);
@@ -1138,6 +1155,7 @@ impl WasmBridge {
                 !&self
                     .cached_events_for_pending_plugins
                     .contains_key(&plugin_id)
+                    && !self.quarantined_plugins.contains(plugin_id)
             })
             .collect();
 
@@ -1226,9 +1244,12 @@ impl WasmBridge {
 
         // loop once more to update the cached events for the pending plugins (probably currently
         // being loaded, we'll send them these events when they load)
+        let quarantined_plugins = self.quarantined_plugins.clone();
         for (pid, cid, event) in updates.drain(..) {
             for (plugin_id, cached_events) in self.cached_events_for_pending_plugins.iter_mut() {
-                if pid.is_none() || pid.as_ref() == Some(plugin_id) {
+                if !quarantined_plugins.contains(plugin_id)
+                    && (pid.is_none() || pid.as_ref() == Some(plugin_id))
+                {
                     cached_events.push(EventOrPipeMessage::Event(event.clone(), cid));
                 }
             }
@@ -1969,6 +1990,9 @@ impl WasmBridge {
         plugin_id: PluginId,
         shutdown_sender: Sender<()>,
     ) -> Result<()> {
+        if self.quarantined_plugins.contains(&plugin_id) {
+            return Ok(());
+        }
         let err_context = || format!("Failed to apply cached events to plugin");
         if let Some(events_or_pipe_messages) =
             self.cached_events_for_pending_plugins.remove(&plugin_id)
@@ -3725,6 +3749,7 @@ pub fn handle_plugin_crash(plugin_id: PluginId, message: String, senders: Thread
         loading_indication,
     ));
     let _ = senders.send_to_plugin(PluginInstruction::UnregisterSettingsEntry(plugin_id));
+    let _ = senders.send_to_plugin(PluginInstruction::Quarantine(plugin_id));
 }
 
 pub fn apply_before_close_event_to_plugin(
