@@ -4,6 +4,7 @@ use isahc::{config::RedirectPolicy, HttpClient, Request};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt as _, sync::Mutex};
 use tokio_stream::StreamExt as _;
@@ -12,6 +13,8 @@ use tokio_util::io::ReaderStream;
 use url::Url;
 
 const STREAM_BUFFER_SIZE_BYTES: usize = 65535;
+const MAX_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Error, Debug)]
 pub enum DownloaderError {
@@ -31,6 +34,10 @@ pub enum DownloaderError {
     ClientUnavailable,
     #[error("Unexpected HTTP status: {0}")]
     UnexpectedStatus(u16),
+    #[error("Download exceeds the maximum allowed size")]
+    TooLarge,
+    #[error("Download exceeded the deadline")]
+    TimedOut,
 }
 
 #[derive(Debug, Clone)]
@@ -155,12 +162,29 @@ impl Downloader {
         }
         let body = res.body_mut();
         let mut stream = ReaderStream::with_capacity(body.compat(), STREAM_BUFFER_SIZE_BYTES);
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(DownloaderError::Io)?;
-            target
-                .write_all(&chunk)
-                .await
-                .map_err(DownloaderError::Io)?;
+        let mut downloaded_bytes =
+            usize::try_from(file_part_size).map_err(|_| DownloaderError::TooLarge)?;
+        let download_result = tokio::time::timeout(DOWNLOAD_TIMEOUT, async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(DownloaderError::Io)?;
+                downloaded_bytes = checked_download_total(downloaded_bytes, chunk.len())?;
+                target
+                    .write_all(&chunk)
+                    .await
+                    .map_err(DownloaderError::Io)?;
+            }
+            Ok::<(), DownloaderError>(())
+        })
+        .await;
+        match download_result {
+            Ok(Ok(())) => {},
+            Ok(Err(error)) => {
+                if matches!(error, DownloaderError::TooLarge) {
+                    let _ = tokio::fs::remove_file(&file_part_path).await;
+                }
+                return Err(error);
+            },
+            Err(_) => return Err(DownloaderError::TimedOut),
         }
         // Writes to a tokio file complete in the background; flush so a
         // failed final write is reported instead of renaming a short file
@@ -190,10 +214,17 @@ impl Downloader {
         let mut downloaded_bytes: Vec<u8> = vec![];
         let body = res.body_mut();
         let mut stream = ReaderStream::with_capacity(body.compat(), STREAM_BUFFER_SIZE_BYTES);
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(DownloaderError::Io)?;
-            downloaded_bytes.extend_from_slice(&*chunk);
-        }
+        let mut total_bytes = 0usize;
+        tokio::time::timeout(DOWNLOAD_TIMEOUT, async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(DownloaderError::Io)?;
+                total_bytes = checked_download_total(total_bytes, chunk.len())?;
+                downloaded_bytes.extend_from_slice(&chunk);
+            }
+            Ok::<(), DownloaderError>(())
+        })
+        .await
+        .map_err(|_| DownloaderError::TimedOut)??;
 
         log::debug!("Download complete");
         let stringified = String::from_utf8(downloaded_bytes)
@@ -221,14 +252,18 @@ impl Downloader {
     /// sensibly be sync. Maybe in the future, when more code around here is async, we can drop
     /// this function.
     pub fn download_without_cache_blocking(url: &str) -> Result<String, DownloaderError> {
+        // The ephemeral runtime must outlive `block_on`, and needs its timer
+        // for the download deadline.
+        let ephemeral_runtime;
         let runtime_handle = match tokio::runtime::Handle::try_current() {
             Ok(handle) => handle.clone(),
             Err(e) if e.is_missing_context() => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                ephemeral_runtime = tokio::runtime::Builder::new_current_thread()
                     .thread_name("ephemeral runtime for downloader implementation")
+                    .enable_all()
                     .build()
                     .map_err(DownloaderError::Io)?;
-                runtime.handle().clone()
+                ephemeral_runtime.handle().clone()
             },
             _ => {
                 return Err(DownloaderError::Io(std::io::Error::new(
@@ -286,11 +321,47 @@ fn ensure_success_status(status: StatusCode) -> Result<(), DownloaderError> {
     }
 }
 
+fn checked_download_total(current: usize, additional: usize) -> Result<usize, DownloaderError> {
+    let total = current
+        .checked_add(additional)
+        .ok_or(DownloaderError::TooLarge)?;
+    if total > MAX_DOWNLOAD_BYTES {
+        return Err(DownloaderError::TooLarge);
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use tempfile::tempdir;
+
+    #[test]
+    fn the_blocking_entry_point_works_without_an_ambient_runtime() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("http://{}/layout.kdl", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match socket.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = socket.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nlayout",
+            );
+        });
+        assert_eq!(
+            Downloader::download_without_cache_blocking(&url).expect("blocking download"),
+            "layout"
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn success_statuses_are_accepted() {
@@ -303,6 +374,18 @@ mod tests {
         assert!(matches!(
             ensure_success_status(StatusCode::NOT_FOUND),
             Err(DownloaderError::UnexpectedStatus(404))
+        ));
+    }
+
+    #[test]
+    fn download_byte_budget_is_enforced() {
+        assert_eq!(
+            checked_download_total(0, MAX_DOWNLOAD_BYTES).unwrap(),
+            MAX_DOWNLOAD_BYTES
+        );
+        assert!(matches!(
+            checked_download_total(MAX_DOWNLOAD_BYTES, 1),
+            Err(DownloaderError::TooLarge)
         ));
     }
 
