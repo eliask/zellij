@@ -49,6 +49,23 @@ fn send_reports_flush_failure() {
     );
 }
 
+#[test]
+fn oversized_advertised_frames_are_rejected_before_allocation() {
+    let advertised_len = (crate::ipc::MAX_FRAME_BYTES + 1) as u32;
+    let mut frame = std::io::Cursor::new(advertised_len.to_le_bytes().to_vec());
+
+    assert!(matches!(
+        crate::ipc::read_protobuf_message::<crate::ipc::ProtoClientToServerMsg>(&mut frame),
+        Err(IpcReceiveError::Undecodable)
+    ));
+}
+
+#[test]
+fn outgoing_frames_enforce_the_same_size_limit() {
+    assert!(crate::ipc::validate_frame_length(crate::ipc::MAX_FRAME_BYTES).is_ok());
+    assert!(crate::ipc::validate_frame_length(crate::ipc::MAX_FRAME_BYTES + 1).is_err());
+}
+
 // --- Cross-platform IPC helpers ---
 // On Unix: use filesystem-based sockets (TempDir + PathBuf + GenericFilePath)
 // On Windows: use named pipes (no guard needed, String name + GenericNamespaced)
