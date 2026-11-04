@@ -322,7 +322,7 @@ impl SixelGrid {
         self.sixel_image_store
             .borrow_mut()
             .sixel_images
-            .insert(sixel_image_id, (sixel_image, HashMap::new()));
+            .insert(sixel_image_id, (sixel_image, SixelImageCache::default()));
         self.images_to_check_for_emptiness.insert(sixel_image_id);
     }
     pub fn remove_pixels_from_image(&mut self, image_id: usize, pixel_rect: PixelRect) {
@@ -438,11 +438,73 @@ impl SixelGrid {
     }
 }
 
-type SixelImageCache = HashMap<PixelRect, String>;
+/// Aggregate bound for serialized crop encodings cached per sixel image.
+/// Scrolling and resizing can generate many distinct crop rectangles;
+/// the cache is a pure regeneration cache, so entries are evicted
+/// least-recently-used first to stay inside this budget.
+const MAX_SIXEL_CROP_CACHE_BYTES_PER_IMAGE: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct SixelCropEntry {
+    stamp: u64,
+    text: std::sync::Arc<str>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SixelImageCache {
+    entries: HashMap<PixelRect, SixelCropEntry>,
+    bytes: usize,
+}
+
+impl SixelImageCache {
+    fn get(&mut self, rect: &PixelRect, stamp: u64) -> Option<std::sync::Arc<str>> {
+        let entry = self.entries.get_mut(rect)?;
+        entry.stamp = stamp;
+        Some(entry.text.clone())
+    }
+    fn insert(&mut self, rect: PixelRect, text: std::sync::Arc<str>, stamp: u64) {
+        if text.len() > MAX_SIXEL_CROP_CACHE_BYTES_PER_IMAGE {
+            return;
+        }
+        if let Some(old) = self.entries.insert(rect, SixelCropEntry { stamp, text }) {
+            self.bytes -= old.text.len();
+        }
+        self.bytes += self
+            .entries
+            .get(&rect)
+            .map(|entry| entry.text.len())
+            .unwrap_or(0);
+        while self.bytes > MAX_SIXEL_CROP_CACHE_BYTES_PER_IMAGE {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.stamp)
+                .map(|(rect, _)| *rect);
+            match oldest {
+                Some(rect) => {
+                    if let Some(entry) = self.entries.remove(&rect) {
+                        self.bytes -= entry.text.len();
+                    }
+                },
+                None => break,
+            }
+        }
+    }
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+    #[cfg(test)]
+    fn cached_bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SixelImageStore {
     sixel_images: HashMap<usize, (SixelImage, SixelImageCache)>,
     next_image_id: usize,
+    next_lru_stamp: u64,
 }
 
 impl SixelImageStore {
@@ -453,24 +515,20 @@ impl SixelImageStore {
         pixel_y: usize,
         pixel_width: usize,
         pixel_height: usize,
-    ) -> Option<String> {
+    ) -> Option<std::sync::Arc<str>> {
+        self.next_lru_stamp += 1;
+        let stamp = self.next_lru_stamp;
         self.sixel_images
             .get_mut(&image_id)
             .map(|(sixel_image, sixel_image_cache)| {
-                if let Some(cached_image) = sixel_image_cache.get(&PixelRect::new(
-                    pixel_x,
-                    pixel_y,
-                    pixel_height,
-                    pixel_width,
-                )) {
-                    cached_image.clone()
+                let rect = PixelRect::new(pixel_x, pixel_y, pixel_height, pixel_width);
+                if let Some(cached_image) = sixel_image_cache.get(&rect, stamp) {
+                    cached_image
                 } else {
-                    let serialized_image =
-                        sixel_image.serialize_range(pixel_x, pixel_y, pixel_width, pixel_height);
-                    sixel_image_cache.insert(
-                        PixelRect::new(pixel_x, pixel_y, pixel_height, pixel_width),
-                        serialized_image.clone(),
-                    );
+                    let serialized_image: std::sync::Arc<str> = sixel_image
+                        .serialize_range(pixel_x, pixel_y, pixel_width, pixel_height)
+                        .into();
+                    sixel_image_cache.insert(rect, serialized_image.clone(), stamp);
                     serialized_image
                 }
             })
@@ -489,6 +547,44 @@ mod tests {
             width: 10,
             height: 10,
         }
+    }
+
+    #[test]
+    fn crop_cache_is_bounded_and_evicts_oldest_first() {
+        let mut cache = SixelImageCache::default();
+        let cap = MAX_SIXEL_CROP_CACHE_BYTES_PER_IMAGE;
+        // Each entry uses 1/8 of the budget; inserting more than 8 crops
+        // must evict the oldest instead of growing past the cap.
+        let entry_len = cap / 8;
+        let mut inserted_rects = Vec::new();
+        for i in 0..12usize {
+            let rect = PixelRect::new(i, 0, 1, 1);
+            let text: std::sync::Arc<str> = "x".repeat(entry_len).into();
+            cache.insert(rect, text, i as u64);
+            inserted_rects.push(rect);
+            assert!(cache.cached_bytes() <= cap);
+        }
+        for evicted in &inserted_rects[..4] {
+            assert!(!cache.entries.contains_key(evicted));
+        }
+        for kept in &inserted_rects[4..] {
+            assert!(cache.entries.contains_key(kept));
+        }
+
+        // A hit refreshes the stamp so the hot crop survives the next
+        // eviction round.
+        let hot = inserted_rects[11];
+        let hit = cache.get(&hot, 100).unwrap();
+        let another = PixelRect::new(100, 0, 1, 1);
+        cache.insert(another, "x".repeat(entry_len).into(), 101);
+        assert!(cache.entries.contains_key(&hot));
+        assert!(std::sync::Arc::ptr_eq(&hit, &cache.get(&hot, 102).unwrap()));
+
+        // An oversized crop is never retained.
+        let huge = PixelRect::new(200, 0, 1, 1);
+        cache.insert(huge, "x".repeat(cap + 1).into(), 103);
+        assert!(!cache.entries.contains_key(&huge));
+        assert!(cache.cached_bytes() <= cap);
     }
 
     #[test]

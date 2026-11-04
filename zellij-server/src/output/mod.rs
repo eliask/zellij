@@ -905,7 +905,7 @@ fn flatten_chunks(
                         pixel_y: sixel_chunk.sixel_image_pixel_y as u32,
                         pixel_width: sixel_chunk.sixel_image_pixel_width as u32,
                         pixel_height: sixel_chunk.sixel_image_pixel_height as u32,
-                        payload: serialized_sixel_image.into_bytes(),
+                        payload: serialized_sixel_image.as_bytes().to_vec(),
                     });
                 }
             }
