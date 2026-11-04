@@ -391,14 +391,24 @@ fn report_instance_error(
     let _ = senders.send_to_plugin(PluginInstruction::UnregisterSettingsEntry(
         running_plugin.store.data().plugin_id,
     ));
-    report_error(senders, pane_slot_ids(running_plugin), error);
+    report_error(
+        senders,
+        pane_slot_ids(running_plugin),
+        running_plugin.store.data().generation,
+        error,
+    );
 }
 
-fn report_error(senders: &ThreadSenders, pane_slots: Vec<PluginId>, error: anyhow::Error) {
+fn report_error(
+    senders: &ThreadSenders,
+    pane_slots: Vec<PluginId>,
+    generation: u64,
+    error: anyhow::Error,
+) {
     log::error!("{:?}", error);
     let message = format!("{:?}", error).replace("\n", "\n\r");
     for slot_id in pane_slots {
-        handle_plugin_crash(slot_id, message.clone(), senders.clone());
+        handle_plugin_crash(slot_id, generation, message.clone(), senders.clone());
     }
 }
 
@@ -601,7 +611,12 @@ pub fn add_slot_job(
         Err(e) => {
             let _ =
                 senders.send_to_background_jobs(BackgroundJob::StopPluginLoadingAnimation(slot_id));
-            report_error(&senders, vec![slot_id], e);
+            report_error(
+                &senders,
+                vec![slot_id],
+                running_plugin.store.data().generation,
+                e,
+            );
         },
     }
 }

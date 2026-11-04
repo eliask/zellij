@@ -13829,6 +13829,7 @@ fn plugin_env_without_read_pane_contents() -> super::plugin_map::PluginEnv {
         [PermissionType::ReadApplicationState].into_iter().collect();
     super::plugin_map::PluginEnv {
         plugin_id: 1,
+        generation: 0,
         client_id: 1,
         plugin: zellij_utils::input::plugins::PluginConfig {
             path: PathBuf::from("/tmp/third-party.wasm"),

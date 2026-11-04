@@ -6,8 +6,8 @@ use crate::plugins::pipes::{
 };
 use crate::plugins::plugin_loader::PluginLoader;
 use crate::plugins::plugin_map::{
-    AtomicEvent, PluginEnv, PluginMap, PluginMetadata, RemovedPluginAssets, RunningPlugin,
-    SharedSlot, Subscriptions,
+    next_plugin_generation, AtomicEvent, PluginEnv, PluginMap, PluginMetadata, RemovedPluginAssets,
+    RunningPlugin, SharedSlot, Subscriptions,
 };
 use crate::plugins::prompt_requests::{PromptAction, PromptCaller, PromptRequests};
 use crate::plugins::settings_entries::{PluginIdentity, SettingsEntries};
@@ -155,6 +155,8 @@ pub struct LoadingContext {
     pub keybinds: SharedKeybinds,
     pub plugin_dir: PathBuf,
     pub size: Size,
+    // identifies the instance this context creates, see `Quarantine`
+    pub generation: u64,
 }
 
 impl LoadingContext {
@@ -204,6 +206,7 @@ impl LoadingContext {
             tab_index,
             plugin_dir: wasm_bridge.plugin_dir.clone(),
             size,
+            generation: next_plugin_generation(),
         }
     }
     pub fn update_plugin_path(&mut self, new_path: PathBuf) {
@@ -242,6 +245,47 @@ fn shared_event_context(
         _ => client_id,
     };
     EventContext { slot_id, client_id }
+}
+
+/// Plugins stopped after a fatal callback error.
+///
+/// Fatal reports are applied asynchronously, so a report can outlive the instance that sent it.
+/// Each load gets a generation number from `next_plugin_generation`, and starting a new
+/// generation for a plugin id (a reload) discards reports from older ones.
+#[derive(Debug, Default)]
+pub(crate) struct Quarantine {
+    quarantined: HashSet<PluginId>,
+    // the oldest generation still allowed to report for each plugin id
+    oldest_current_generation: HashMap<PluginId, u64>,
+}
+
+impl Quarantine {
+    pub fn contains(&self, plugin_id: &PluginId) -> bool {
+        self.quarantined.contains(plugin_id)
+    }
+    pub fn ids(&self) -> &HashSet<PluginId> {
+        &self.quarantined
+    }
+    /// A new instance is replacing the plugin: release it and ignore the old instance's reports.
+    pub fn begin_generation(&mut self, plugin_id: PluginId, generation: u64) {
+        self.quarantined.remove(&plugin_id);
+        self.oldest_current_generation.insert(plugin_id, generation);
+    }
+    /// Returns true if the plugin was newly quarantined; reports from superseded instances and
+    /// repeated reports return false.
+    pub fn report_fatal(&mut self, plugin_id: PluginId, generation: u64) -> bool {
+        let is_stale = self
+            .oldest_current_generation
+            .get(&plugin_id)
+            .map(|oldest| generation < *oldest)
+            .unwrap_or(false);
+        !is_stale && self.quarantined.insert(plugin_id)
+    }
+    /// The plugin id is gone for good.
+    pub fn forget(&mut self, plugin_id: PluginId) {
+        self.quarantined.remove(&plugin_id);
+        self.oldest_current_generation.remove(&plugin_id);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -292,6 +336,7 @@ pub struct WasmBridge {
     // payload>
     loading_plugins: HashSet<(PluginId, RunPlugin)>, // tracks loading plugins without handles
     plugins_to_unload_once_loaded: HashSet<PluginId>,
+    quarantine: Quarantine,
     pending_plugin_reloads: HashSet<RunPlugin>,
     path_to_default_shell: PathBuf,
     watcher: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
@@ -370,6 +415,7 @@ impl WasmBridge {
             cached_worker_messages: HashMap::new(),
             loading_plugins: HashSet::new(),
             plugins_to_unload_once_loaded: HashSet::new(),
+            quarantine: Quarantine::default(),
             pending_plugin_reloads: HashSet::new(),
             zellij_cwd,
             session_env_vars,
@@ -658,6 +704,7 @@ impl WasmBridge {
     }
     pub fn unload_plugin(&mut self, pid: PluginId) -> Result<()> {
         info!("Bye from plugin {}", &pid);
+        self.quarantine.forget(pid);
         let _ = self
             .senders
             .send_to_screen(ScreenInstruction::ClearLiveViewsOfPlugin(pid));
@@ -719,7 +766,7 @@ impl WasmBridge {
                             Err(e) => {
                                 log::error!("{:?}", e);
                                 let stringified_error = format!("{:?}", e).replace("\n", "\n\r");
-                                handle_plugin_crash(plugin_id, stringified_error, senders.clone());
+                                show_plugin_crash(plugin_id, stringified_error, senders.clone());
                             },
                         }
                         let cache_dir = rp.store.data().plugin_own_data_dir.clone();
@@ -765,6 +812,24 @@ impl WasmBridge {
             .send_to_background_jobs(BackgroundJob::ReportPluginList(plugin_list));
 
         Ok(())
+    }
+    pub fn quarantine_plugin(&mut self, pid: PluginId, generation: u64) {
+        // A report can arrive after the plugin was unloaded; recording it would leave an entry
+        // for a dead id that nothing ever clears.
+        if self.plugin_map.lock().unwrap().metadata(pid).is_none() {
+            return;
+        }
+        if !self.quarantine.report_fatal(pid, generation) {
+            return;
+        }
+        log::error!("Quarantining plugin {} after a fatal callback error", pid);
+        self.plugin_ids_waiting_for_permission_request.remove(&pid);
+        self.cached_events_for_pending_plugins.remove(&pid);
+        self.cached_resizes_for_pending_plugins.remove(&pid);
+        self.cached_worker_messages.remove(&pid);
+        let pipes_to_release = self.pending_pipes.unload_plugin(&pid);
+        self.send_pipe_releases(pipes_to_release);
+        self.forget_pipe_popups_of_plugin(pid);
     }
     fn prepare_plugin_reload(&mut self, plugin_id: PluginId) {
         let _ = self
@@ -828,6 +893,9 @@ impl WasmBridge {
             tab_index,
             size,
         );
+        // reports from the instance being replaced must not quarantine its successor
+        self.quarantine
+            .begin_generation(plugin_id, loading_context.generation);
 
         plugin_executor.execute_for_plugin(
             plugin_id,
@@ -1012,6 +1080,9 @@ impl WasmBridge {
             .lock()
             .unwrap()
             .set_size(pid, new_rows, new_columns);
+        if self.quarantine.contains(&pid) {
+            return Ok(());
+        }
         if let Some(instance_id) = self.shared_slot_owner.get(&pid).copied() {
             let _s = shutdown_sender.clone();
             self.plugin_executor.execute_for_plugin(
@@ -1138,6 +1209,7 @@ impl WasmBridge {
                 !&self
                     .cached_events_for_pending_plugins
                     .contains_key(&plugin_id)
+                    && !self.quarantine.contains(plugin_id)
             })
             .collect();
 
@@ -1212,6 +1284,7 @@ impl WasmBridge {
 
                                         handle_plugin_crash(
                                             plugin_id,
+                                            running_plugin.store.data().generation,
                                             stringified_error,
                                             senders.clone(),
                                         );
@@ -1226,9 +1299,12 @@ impl WasmBridge {
 
         // loop once more to update the cached events for the pending plugins (probably currently
         // being loaded, we'll send them these events when they load)
+        let quarantined_plugins = self.quarantine.ids().clone();
         for (pid, cid, event) in updates.drain(..) {
             for (plugin_id, cached_events) in self.cached_events_for_pending_plugins.iter_mut() {
-                if pid.is_none() || pid.as_ref() == Some(plugin_id) {
+                if !quarantined_plugins.contains(plugin_id)
+                    && (pid.is_none() || pid.as_ref() == Some(plugin_id))
+                {
                     cached_events.push(EventOrPipeMessage::Event(event.clone(), cid));
                 }
             }
@@ -1433,6 +1509,7 @@ impl WasmBridge {
                 !&self
                     .cached_events_for_pending_plugins
                     .contains_key(&plugin_id)
+                    && !self.quarantine.contains(plugin_id)
             })
             .collect();
 
@@ -1484,6 +1561,7 @@ impl WasmBridge {
 
                                     handle_plugin_crash(
                                         plugin_id,
+                                        running_plugin.store.data().generation,
                                         stringified_error,
                                         senders.clone(),
                                     );
@@ -1969,6 +2047,9 @@ impl WasmBridge {
         plugin_id: PluginId,
         shutdown_sender: Sender<()>,
     ) -> Result<()> {
+        if self.quarantine.contains(&plugin_id) {
+            return Ok(());
+        }
         let err_context = || format!("Failed to apply cached events to plugin");
         if let Some(events_or_pipe_messages) =
             self.cached_events_for_pending_plugins.remove(&plugin_id)
@@ -2073,6 +2154,7 @@ impl WasmBridge {
 
                                                 handle_plugin_crash(
                                                     plugin_id,
+                                                    running_plugin.store.data().generation,
                                                     stringified_error,
                                                     senders.clone(),
                                                 );
@@ -3034,7 +3116,10 @@ impl WasmBridge {
         };
         let slot_ids: Vec<PluginId> = info.slots.iter().copied().collect();
         let mut loading_context = info.loading_context.clone();
+        loading_context.generation = next_plugin_generation();
         for slot_id in &slot_ids {
+            self.quarantine
+                .begin_generation(*slot_id, loading_context.generation);
             let _ = self
                 .senders
                 .send_to_screen(ScreenInstruction::ClearLiveViewsOfPlugin(*slot_id));
@@ -3717,7 +3802,8 @@ pub fn apply_event_to_plugin(
     Ok(())
 }
 
-pub fn handle_plugin_crash(plugin_id: PluginId, message: String, senders: ThreadSenders) {
+/// Show a plugin's fatal error in its pane and drop its settings entry.
+pub fn show_plugin_crash(plugin_id: PluginId, message: String, senders: ThreadSenders) {
     let mut loading_indication = LoadingIndication::new("Panic!".to_owned());
     loading_indication.indicate_loading_error(message);
     let _ = senders.send_to_screen(ScreenInstruction::UpdatePluginLoadingStage(
@@ -3725,6 +3811,18 @@ pub fn handle_plugin_crash(plugin_id: PluginId, message: String, senders: Thread
         loading_indication,
     ));
     let _ = senders.send_to_plugin(PluginInstruction::UnregisterSettingsEntry(plugin_id));
+}
+
+/// Report a fatal error from the plugin instance of the given generation and quarantine the
+/// plugin unless a newer instance has replaced that one.
+pub fn handle_plugin_crash(
+    plugin_id: PluginId,
+    generation: u64,
+    message: String,
+    senders: ThreadSenders,
+) {
+    show_plugin_crash(plugin_id, message, senders.clone());
+    let _ = senders.send_to_plugin(PluginInstruction::Quarantine(plugin_id, generation));
 }
 
 pub fn apply_before_close_event_to_plugin(
@@ -3795,6 +3893,10 @@ pub(crate) fn is_hover(event: &Event) -> bool {
 #[cfg(test)]
 #[path = "unit/hover_merge_tests.rs"]
 mod hover_merge_tests;
+
+#[cfg(test)]
+#[path = "unit/quarantine_tests.rs"]
+mod quarantine_tests;
 
 #[cfg(test)]
 #[path = "unit/startup_tests.rs"]

@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -337,8 +337,17 @@ impl PluginMap {
 
 pub type Subscriptions = HashSet<EventType>;
 
+static NEXT_PLUGIN_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Numbers each plugin load; later loads get larger numbers. Instances carry theirs so that
+/// errors they report can be told apart from those of the instance that replaced them.
+pub fn next_plugin_generation() -> u64 {
+    NEXT_PLUGIN_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct PluginEnv {
     pub plugin_id: PluginId,
+    pub generation: u64,
     pub plugin: PluginConfig,
     pub permissions: Arc<Mutex<Option<HashSet<PermissionType>>>>,
     pub senders: ThreadSenders,

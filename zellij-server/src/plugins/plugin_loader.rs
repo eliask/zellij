@@ -63,6 +63,7 @@ fn create_plugin_fs_entries(plugin_own_data_dir: &PathBuf, plugin_own_cache_dir:
 pub struct PluginLoader<'a> {
     skip_cache: bool,
     plugin_id: PluginId,
+    generation: u64,
     client_id: ClientId,
     plugin_cwd: PathBuf,
     plugin_own_data_dir: PathBuf,
@@ -104,6 +105,7 @@ impl<'a> PluginLoader<'a> {
         );
         Self {
             plugin_id: loading_context.plugin_id,
+            generation: loading_context.generation,
             client_id: loading_context.client_id,
             plugin_cwd: loading_context.plugin_cwd,
             plugin_own_data_dir: loading_context.plugin_own_data_dir,
@@ -300,6 +302,7 @@ impl<'a> PluginLoader<'a> {
         let plugin_path = self.plugin_config.path.clone();
         let plugin_env = PluginEnv {
             plugin_id: self.plugin_id,
+            generation: self.generation,
             client_id: self.client_id,
             plugin: self.plugin_config.clone(), // TODO: change field name in PluginEnv to plugin_config
             permissions: Arc::new(Mutex::new(None)),
@@ -414,6 +417,7 @@ impl<'a> PluginLoader<'a> {
         let plugin_config = self.plugin_config.clone();
         let plugin_env = PluginEnv {
             plugin_id: self.plugin_id,
+            generation: self.generation,
             client_id: self.client_id,
             plugin: plugin_config,
             permissions: Arc::new(Mutex::new(None)),

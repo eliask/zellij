@@ -6639,7 +6639,7 @@ fn report_panic(env: &PluginEnv, msg: &str) {
             .send_to_plugin(PluginInstruction::UnregisterSettingsEntry(env.plugin_id));
     }
     for pane_id in crash_pane_ids(env) {
-        handle_plugin_crash(pane_id, msg.to_owned(), env.senders.clone());
+        handle_plugin_crash(pane_id, env.generation, msg.to_owned(), env.senders.clone());
     }
 }
 
