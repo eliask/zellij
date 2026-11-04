@@ -293,6 +293,7 @@ impl<'a> PluginLoader<'a> {
             &ZELLIJ_TMP_DIR,
             &self.plugin_config.location.to_string(),
             self.plugin_id,
+            self.plugin_config.is_builtin(),
             stdin_pipe.clone(),
             stdout_pipe.clone(),
         )?;
@@ -406,6 +407,7 @@ impl<'a> PluginLoader<'a> {
             &ZELLIJ_TMP_DIR,
             &self.plugin_config.location.to_string(),
             self.plugin_id,
+            self.plugin_config.is_builtin(),
             stdin_pipe.clone(),
             stdout_pipe.clone(),
         )?;
@@ -466,6 +468,7 @@ impl<'a> PluginLoader<'a> {
         tmp_dir: &PathBuf,
         plugin_url: &String,
         plugin_id: PluginId,
+        is_builtin: bool,
         stdin_pipe: Arc<Mutex<VecDeque<u8>>>,
         stdout_pipe: Arc<Mutex<VecDeque<u8>>>,
     ) -> Result<WasiCtx> {
@@ -486,7 +489,9 @@ impl<'a> PluginLoader<'a> {
         });
 
         let mut builder = WasiCtxBuilder::new();
-        builder.inherit_env()?;
+        if is_builtin {
+            builder.inherit_env()?;
+        }
 
         // Mount directories using the builder
         for (guest_path, host_path) in dirs {
