@@ -1276,32 +1276,53 @@ pub fn write_session_state_to_disk(
     let (current_session_layout, layout_files_to_write) = current_session_layout;
     let new_metadata = current_session_info.to_string();
     if file_content_changed(&metadata_cache_file_name, new_metadata.as_bytes()) {
-        let _wrote_metadata_file =
-            std::fs::create_dir_all(session_info_folder_for_session(&session_id).as_path())
-                .and_then(|_| std::fs::File::create(&metadata_cache_file_name))
-                .and_then(|mut f| write!(f, "{}", new_metadata));
+        if let Err(error) =
+            write_file_atomically(&metadata_cache_file_name, new_metadata.as_bytes())
+        {
+            log::error!("Failed to write session metadata file: {:?}", error);
+        }
     }
 
     if !current_session_layout.is_empty() {
         let layout_cache_file_name = session_layout_cache_file_name(&session_id);
         if file_content_changed(&layout_cache_file_name, current_session_layout.as_bytes()) {
-            let _wrote_layout_file =
-                std::fs::create_dir_all(session_info_folder_for_session(&session_id).as_path())
-                    .and_then(|_| std::fs::File::create(&layout_cache_file_name))
-                    .and_then(|mut f| write!(f, "{}", current_session_layout));
+            if let Err(error) =
+                write_file_atomically(&layout_cache_file_name, current_session_layout.as_bytes())
+            {
+                log::error!("Failed to write session layout file: {:?}", error);
+            }
         }
         let session_info_folder = session_info_folder_for_session(&session_id);
         for (external_file_name, external_file_contents) in layout_files_to_write {
             let external_file_path = session_info_folder.join(&external_file_name);
             if file_content_changed(&external_file_path, external_file_contents.as_bytes()) {
-                std::fs::File::create(&external_file_path)
-                    .and_then(|mut f| write!(f, "{}", external_file_contents))
-                    .unwrap_or_else(|e| {
-                        log::error!("Failed to write layout metadata file: {:?}", e);
-                    });
+                if let Err(error) =
+                    write_file_atomically(&external_file_path, external_file_contents.as_bytes())
+                {
+                    log::error!("Failed to write layout metadata file: {:?}", error);
+                }
             }
         }
     }
+}
+
+fn write_file_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file path has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let mut temporary_file = tempfile::Builder::new()
+        .prefix(".zellij-session-")
+        .tempfile_in(parent)?;
+    temporary_file.write_all(contents)?;
+    temporary_file.as_file().sync_all()?;
+    temporary_file
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
 }
 
 pub fn scan_session_list(
@@ -1476,6 +1497,46 @@ mod tests {
         generations.invalidate(&[pane_id]);
 
         assert!(generations.take_current(&pending).is_empty());
+    }
+
+    #[test]
+    fn atomic_file_write_replaces_contents_without_leaving_a_temporary_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session-state");
+        std::fs::write(&path, b"old").unwrap();
+
+        write_file_atomically(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let entries = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(entries, 1);
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_never_expose_mixed_contents() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session-state");
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let handles = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let contents = vec![b'a' + index; 4096];
+                    barrier.wait();
+                    write_file_atomically(&path, &contents).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents.len(), 4096);
+        assert!(contents.windows(2).all(|window| window[0] == window[1]));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
