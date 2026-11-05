@@ -158,26 +158,14 @@ impl PluginLoader {
     }
     pub fn start_plugin(&mut self) -> Result<()> {
         self.record_plugin_metadata();
-        self.ensure_plugin_digest()?;
-        let module = if self.skip_cache {
-            self.interpret_module()?
-        } else {
-            self.load_module_from_memory()
-                .or_else(|_e| self.interpret_module())?
-        };
+        let module = self.load_module()?;
         let (store, instance) = self.create_plugin_environment(module)?;
         self.load_plugin_instance(store, &instance, false)?;
         self.clone_instance_for_other_clients()?;
         Ok(())
     }
     pub fn start_shared_plugin(&mut self) -> Result<Arc<Mutex<RunningPlugin>>> {
-        self.ensure_plugin_digest()?;
-        let module = if self.skip_cache {
-            self.interpret_module()?
-        } else {
-            self.load_module_from_memory()
-                .or_else(|_e| self.interpret_module())?
-        };
+        let module = self.load_module()?;
         let (mut store, instance) = self.create_plugin_environment(module)?;
         store.data_mut().shared = Some(SharedEnv::default());
         self.load_plugin_instance(store, &instance, true)
@@ -195,18 +183,32 @@ impl PluginLoader {
             },
         );
     }
-    fn ensure_plugin_digest(&mut self) -> Result<()> {
-        if self.plugin_digest.is_empty() {
-            let wasm_bytes = self.plugin_config.resolve_wasm_bytes(&self.plugin_dir)?;
-            self.plugin_digest = plugin_digest_from_bytes(&wasm_bytes);
+    /// Read the plugin's current bytes once and fingerprint them, so the digest in PluginEnv
+    /// and in the module cache always describes the bytes that were actually used. A cached
+    /// module is served only if it was compiled from these exact bytes.
+    ///
+    /// The instances this loader creates for the other connected clients are part of the same
+    /// load: they reuse the digest of the first one instead of reading and hashing the file
+    /// again, which would also delay them behind the first instance.
+    fn load_module(&mut self) -> Result<Module> {
+        if !self.plugin_digest.is_empty() {
+            if let Some(module) = self.load_module_from_memory() {
+                return Ok(module);
+            }
         }
-        Ok(())
-    }
-    fn interpret_module(&mut self) -> Result<Module> {
-        self.loading_indication.override_previous_error();
         let wasm_bytes = self.plugin_config.resolve_wasm_bytes(&self.plugin_dir)?;
+        self.plugin_digest = plugin_digest_from_bytes(&wasm_bytes);
+        if !self.skip_cache {
+            if let Some(module) = self.load_module_from_memory() {
+                return Ok(module);
+            }
+        }
+        self.interpret_module(&wasm_bytes)
+    }
+    fn interpret_module(&mut self, wasm_bytes: &[u8]) -> Result<Module> {
+        self.loading_indication.override_previous_error();
         let timer = std::time::Instant::now();
-        let module = Module::new(&self.engine, &wasm_bytes)?;
+        let module = Module::new(&self.engine, wasm_bytes)?;
         log::info!(
             "Loaded plugin '{}' in {:?}",
             self.plugin_config.path.display(),
@@ -214,15 +216,18 @@ impl PluginLoader {
         );
         Ok(module)
     }
-    fn load_module_from_memory(&mut self) -> Result<Module> {
-        let module = self
+    fn load_module_from_memory(&mut self) -> Option<Module> {
+        // The cached module is only valid for the bytes it was compiled from; serving it
+        // without checking ran stale code after the file changed on disk.
+        let cached = self
             .plugin_cache
             .lock()
             .unwrap()
-            .remove(&self.plugin_config.path) // TODO: do we still bring it back later?
-            // maybe we can forgo this dance?
-            .ok_or(anyhow!("Plugin is not stored in memory"))?;
-        Ok(module)
+            .remove(&self.plugin_config.path);
+        match cached {
+            Some((digest, module)) if digest == self.plugin_digest => Some(module),
+            _ => None,
+        }
     }
     fn load_plugin_instance(
         &mut self,
@@ -414,7 +419,7 @@ impl PluginLoader {
         self.plugin_cache
             .lock()
             .unwrap()
-            .insert(plugin_path.clone(), module);
+            .insert(plugin_path.clone(), (self.plugin_digest.clone(), module));
         Ok((store, instance))
     }
     pub fn clone_instance_for_other_clients(&mut self) -> Result<()> {
@@ -452,6 +457,7 @@ impl PluginLoader {
             .unwrap()
             .get(&self.plugin_config.path)
             .with_context(err_context)?
+            .1
             .clone();
         let (store, instance) = self.create_plugin_instance_env(&module)?;
         Ok((store, instance))

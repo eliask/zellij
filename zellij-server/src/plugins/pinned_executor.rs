@@ -452,9 +452,10 @@ mod tests {
         let plugin_map = Arc::new(Mutex::new(PluginMap::default()));
         let connected_clients = Arc::new(Mutex::new(vec![]));
 
-        let plugin_cache = Arc::new(Mutex::new(
-            std::collections::HashMap::<PathBuf, Module>::new(),
-        ));
+        let plugin_cache = Arc::new(Mutex::new(std::collections::HashMap::<
+            PathBuf,
+            (String, Module),
+        >::new()));
 
         let engine = Engine::default();
 

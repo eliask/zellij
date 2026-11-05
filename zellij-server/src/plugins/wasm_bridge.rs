@@ -215,7 +215,11 @@ impl LoadingContext {
     }
 }
 
-pub type PluginCache = Arc<Mutex<HashMap<PathBuf, Module>>>;
+/// Compiled modules keyed by path and bound to the content digest
+/// seen at compile time. A cached entry is served only when the file's
+/// current digest matches — editing the wasm on disk invalidates the
+/// cache entry instead of silently running a stale module.
+pub type PluginCache = Arc<Mutex<HashMap<PathBuf, (String, Module)>>>;
 
 const SLOT_ADDED_WAIT_MS: u64 = 200;
 
@@ -388,8 +392,7 @@ impl WasmBridge {
     ) -> Self {
         let plugin_map = Arc::new(Mutex::new(PluginMap::default()));
         let connected_clients: Arc<Mutex<Vec<ClientId>>> = Arc::new(Mutex::new(vec![]));
-        let plugin_cache: Arc<Mutex<HashMap<PathBuf, Module>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let plugin_cache: PluginCache = Arc::new(Mutex::new(HashMap::new()));
         let watcher = None;
         let downloader = Downloader::new(ZELLIJ_CACHE_DIR.to_path_buf());
         let max_threads = num_cpus::get().max(4).min(16);
