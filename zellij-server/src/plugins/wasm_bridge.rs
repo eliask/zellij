@@ -310,6 +310,15 @@ impl HoverGenerations {
             .map(|latest| *latest != generation)
             .unwrap_or(false)
     }
+    /// Drop all generation state for a retired plugin — the map is
+    /// otherwise retained for the session's lifetime.
+    pub fn evict_plugin(&mut self, plugin_id: PluginId) {
+        self.latest.retain(|(pid, _), _| *pid != plugin_id);
+    }
+    /// Drop all generation state for a disconnected client.
+    pub fn evict_client(&mut self, client_id: ClientId) {
+        self.latest.retain(|(_, cid), _| *cid != client_id);
+    }
 }
 
 pub(crate) fn subscription_event_type(
@@ -707,6 +716,7 @@ impl WasmBridge {
     pub fn unload_plugin(&mut self, pid: PluginId) -> Result<()> {
         info!("Bye from plugin {}", &pid);
         self.quarantine.forget(pid);
+        self.latest_hovers.lock().unwrap().evict_plugin(pid);
         let _ = self
             .senders
             .send_to_screen(ScreenInstruction::ClearLiveViewsOfPlugin(pid));
@@ -1656,6 +1666,7 @@ impl WasmBridge {
         Ok(())
     }
     pub fn remove_client(&mut self, client_id: ClientId) {
+        self.latest_hovers.lock().unwrap().evict_client(client_id);
         self.connected_clients
             .lock()
             .unwrap()
