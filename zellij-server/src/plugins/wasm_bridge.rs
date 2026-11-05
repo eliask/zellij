@@ -380,7 +380,7 @@ pub struct WasmBridge {
     shared_instances: HashMap<PluginId, SharedInstanceInfo>,
     shared_keys: HashMap<SharedKey, PluginId>,
     shared_slot_owner: HashMap<PluginId, PluginId>,
-    shared_module_kinds: HashMap<String, bool>,
+
     settings_entries: SettingsEntries,
 }
 
@@ -456,7 +456,7 @@ impl WasmBridge {
             shared_instances: HashMap::new(),
             shared_keys: HashMap::new(),
             shared_slot_owner: HashMap::new(),
-            shared_module_kinds: HashMap::new(),
+
             settings_entries: SettingsEntries::default(),
         }
     }
@@ -2893,26 +2893,21 @@ impl WasmBridge {
             .map(|(_, subscriptions)| subscriptions.lock().unwrap().contains(&event_type))
             .unwrap_or(false)
     }
-    fn module_is_shared(&mut self, plugin_config: &PluginConfig, skip_cache: bool) -> bool {
+    fn module_is_shared(&mut self, plugin_config: &PluginConfig, _skip_cache: bool) -> bool {
         if matches!(plugin_config.location, RunPluginLocation::Remote(_)) {
             return false;
         }
-        let cache_key = format!(
-            "{}|{}",
-            plugin_config.location,
-            plugin_config.path.display()
-        );
-        if !skip_cache {
-            if let Some(is_shared) = self.shared_module_kinds.get(&cache_key) {
-                return *is_shared;
-            }
-        }
-        let is_shared = plugin_config
+        // Always classify from the current bytes: a path-keyed answer
+        // goes stale when the file is edited (same staleness class as
+        // the module cache fixed by digest binding), and the shared/
+        // non-shared decision picks the asset map the instance lands
+        // in — a wrong answer is not recoverable later in the load.
+        // Every caller already resolves the bytes for the load itself,
+        // so the extra read costs one small file read per decision.
+        plugin_config
             .resolve_wasm_bytes(&self.plugin_dir)
             .map(|bytes| wasm_module_exports_function(&bytes, SHARED_MARKER_EXPORT))
-            .unwrap_or(false);
-        self.shared_module_kinds.insert(cache_key, is_shared);
-        is_shared
+            .unwrap_or(false)
     }
     fn shared_key_of(run_plugin: &RunPlugin) -> SharedKey {
         (
