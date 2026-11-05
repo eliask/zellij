@@ -7982,17 +7982,26 @@ impl Row {
                 part.is_canonical = true;
             }
         }
+        // Relocate markers in a single forward pass. width() scans a
+        // part's cells, so the old per-marker inner loop rescanning
+        // parts from the start cost O(markers * total cells) — the
+        // quadratic reflow path the audit flagged. Markers arrive in
+        // column order (sorted defensively to keep that true), so each
+        // advances the shared part cursor at most to the end.
+        let part_widths: Vec<usize> = parts.iter().map(|part| part.width()).collect();
+        markers.sort_by_key(|marker| marker.column);
+        let mut target_part = 0;
+        let mut column_offset = 0;
         for mut marker in markers {
-            let mut column_offset = 0;
-            for part_index in 0..parts.len() {
-                let part_width = parts[part_index].width();
-                if marker.column <= column_offset + part_width || part_index + 1 == parts.len() {
-                    marker.column = marker.column.saturating_sub(column_offset).min(part_width);
-                    parts[part_index].osc133_markers.push(marker);
-                    break;
-                }
-                column_offset += part_width;
+            while target_part + 1 < parts.len()
+                && marker.column > column_offset + part_widths[target_part]
+            {
+                column_offset += part_widths[target_part];
+                target_part += 1;
             }
+            let part_width = part_widths[target_part];
+            marker.column = marker.column.saturating_sub(column_offset).min(part_width);
+            parts[target_part].osc133_markers.push(marker);
         }
         parts
     }
