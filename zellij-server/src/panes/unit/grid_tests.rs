@@ -11920,6 +11920,69 @@ fn serialize_budget_only_scans_the_requested_rows() {
     assert!(!serialized.contains("02000x"));
 }
 
+fn scrollback_cells_recount(grid: &Grid) -> usize {
+    grid.lines_above
+        .iter()
+        .map(|row| row.stored_cell_count())
+        .sum()
+}
+
+#[test]
+fn scrollback_cells_follow_a_recount_through_cell_eviction_clears_and_the_alternate_screen() {
+    // Rows 2,000 cells wide: the retained-cell ceiling is hit long before
+    // the row cap, so eviction here is by cells and not by row count.
+    let scroll_buffer_size = *SCROLL_BUFFER_SIZE.get_or_init(|| 10_000);
+    let cell_budget = scroll_buffer_size * super::MAX_SCROLLBACK_ROW_CELLS;
+    let columns = 2_000;
+    let fed_rows = cell_budget / columns + 300;
+    assert!(fed_rows < scroll_buffer_size);
+    let mut grid = create_grid_with_size_and_raw(5, columns, b"");
+    let wide_line = vec![b'x'; columns];
+    feed_bytes(&mut grid, &repeated_lines(&wide_line, fed_rows));
+
+    assert!(
+        grid.lines_above.len() < fed_rows - 5,
+        "rows must have been evicted by the cell ceiling ({} kept of {fed_rows})",
+        grid.lines_above.len()
+    );
+    assert!(grid.lines_above.len() < scroll_buffer_size);
+    // Eviction runs before the new row is added, so the ceiling can be
+    // exceeded by at most that one row.
+    assert!(grid.scrollback_cells <= cell_budget + columns);
+    assert!(
+        grid.scrollback_cells + columns > cell_budget,
+        "eviction must stop as soon as the ceiling holds"
+    );
+    assert_eq!(grid.scrollback_cells, scrollback_cells_recount(&grid));
+
+    // The counter stays exact while eviction continues.
+    feed_bytes(&mut grid, &repeated_lines(&wide_line, 100));
+    assert!(grid.scrollback_cells <= cell_budget + columns);
+    assert_eq!(grid.scrollback_cells, scrollback_cells_recount(&grid));
+
+    // Entering the alternate screen sets the scrollback aside; leaving
+    // it restores exactly what was set aside.
+    let cells_before_alternate_screen = grid.scrollback_cells;
+    feed_bytes(&mut grid, b"\x1b[?1049h");
+    assert_eq!(grid.scrollback_cells, scrollback_cells_recount(&grid));
+    feed_bytes(&mut grid, &repeated_lines(b"alternate", 30));
+    assert_eq!(grid.scrollback_cells, scrollback_cells_recount(&grid));
+    feed_bytes(&mut grid, b"\x1b[?1049l");
+    assert_eq!(grid.scrollback_cells, cells_before_alternate_screen);
+    assert_eq!(grid.scrollback_cells, scrollback_cells_recount(&grid));
+
+    // Clearing the scrollback and a full reset both zero it.
+    feed_bytes(&mut grid, b"\x1b[3J");
+    assert!(grid.lines_above.is_empty());
+    assert_eq!(grid.scrollback_cells, 0);
+    feed_bytes(&mut grid, &repeated_lines(&wide_line, 40));
+    assert_eq!(grid.scrollback_cells, scrollback_cells_recount(&grid));
+    assert!(grid.scrollback_cells > 0);
+    feed_bytes(&mut grid, b"\x1bc");
+    assert!(grid.lines_above.is_empty());
+    assert_eq!(grid.scrollback_cells, 0);
+}
+
 #[test]
 fn repeated_osc133_markers_on_one_row_are_bounded() {
     // `ESC ] 133 ; D ; 0 BEL` prints nothing and does not move the
@@ -12017,4 +12080,59 @@ fn evicting_a_row_whose_character_is_wider_than_the_pane_stays_exact() {
             grid.lines_above.len()
         );
     }
+}
+
+#[test]
+fn a_multi_row_cell_eviction_telescopes_the_display_row_deltas() {
+    // A logical line of three 900-cell rows is stored, the pane widens to
+    // 2,000 columns (stored rows are not reflowed, so the line now spans
+    // two display rows) and a single push evicts the first two stored
+    // rows by the retained-cell ceiling. The line shrinks from two
+    // display rows to one; the deltas used to be taken against the final
+    // state for both rows and summed to zero.
+    let scroll_buffer_size = *SCROLL_BUFFER_SIZE.get_or_init(|| 10_000);
+    let cell_budget = scroll_buffer_size * super::MAX_SCROLLBACK_ROW_CELLS;
+    let mut grid = create_grid_with_size_and_raw(1, 900, b"");
+    let mut run = vec![b'a'; 2_700];
+    run.extend_from_slice(b"\r\n");
+    feed_bytes(&mut grid, &run);
+    feed_bytes(&mut grid, b"z\r\n");
+    grid.change_size(1, 2_000);
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        scrollback_recount(&mut grid)
+    );
+    // Fill to just under the ceiling, then overshoot it by 1,500 cells.
+    let line_of = |length: usize| {
+        let mut line = vec![b'b'; length];
+        line.extend_from_slice(b"\r\n");
+        line
+    };
+    while grid.scrollback_cells + 2_000 <= cell_budget {
+        feed_bytes(&mut grid, &line_of(2_000));
+    }
+    let mut remaining = cell_budget - grid.scrollback_cells;
+    assert!(remaining < 2_000);
+    if remaining > 500 {
+        feed_bytes(&mut grid, &line_of(remaining - 100));
+        remaining = cell_budget - grid.scrollback_cells;
+    }
+    feed_bytes(&mut grid, &line_of(remaining + 1_500));
+    assert_eq!(grid.scrollback_cells, cell_budget + 1_500);
+    assert!(grid.lines_above.front().unwrap().is_canonical);
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        scrollback_recount(&mut grid),
+        "exact before the evicting push"
+    );
+    feed_bytes(&mut grid, b"z\r\n");
+    assert!(
+        !grid.lines_above.front().unwrap().is_canonical,
+        "two of the line's three stored rows must have been evicted at once"
+    );
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        scrollback_recount(&mut grid),
+        "a multi-row eviction must account the height change of the shrinking line"
+    );
 }

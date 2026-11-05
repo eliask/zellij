@@ -739,6 +739,32 @@ fn evicted_row_display_row_delta(
     without_evicted.height() as isize - with_evicted.height() as isize
 }
 
+/// Total display-row change from evicting `evicted` (in front-to-back
+/// order) from the front of `lines_above` in one `bounded_push`. Each
+/// row's delta must be taken against the state right after that row
+/// alone was removed — the rows evicted after it are still part of its
+/// run — otherwise the deltas of a multi-row eviction do not telescope
+/// and the running total drifts. The later rows are therefore put back
+/// at the front while earlier ones are measured (last to first), then
+/// taken off again.
+fn evicted_rows_display_row_delta(
+    lines_above: &mut VecDeque<Row>,
+    evicted: Vec<Row>,
+    width: usize,
+) -> isize {
+    let mut delta = 0;
+    let mut restored = 0;
+    for mut evicted_row in evicted.into_iter().rev() {
+        delta += evicted_row_display_row_delta(lines_above, &mut evicted_row, width);
+        lines_above.push_front(evicted_row);
+        restored += 1;
+    }
+    for _ in 0..restored {
+        lines_above.pop_front();
+    }
+    delta
+}
+
 /// Once both walks are in the same open state the remaining characters
 /// advance them identically, so the height difference is already fixed.
 /// An empty open row is excluded because the empty-line minimum height
@@ -794,6 +820,7 @@ fn transfer_rows_from_lines_above_to_viewport(
     kitty_grid: &mut KittyGrid,
     count: usize,
     max_viewport_width: usize,
+    scrollback_cells: &mut usize,
 ) -> (isize, bool) {
     let mut next_lines: Vec<Row> = vec![];
     let mut lines_added_to_viewport: isize = 0;
@@ -810,6 +837,8 @@ fn transfer_rows_from_lines_above_to_viewport(
             if scrollback_tail_is_wrapped_at(lines_above, viewport, max_viewport_width) {
                 match lines_above.pop_back() {
                     Some(mut next_line) => {
+                        *scrollback_cells =
+                            scrollback_cells.saturating_sub(next_line.stored_cell_count());
                         next_line.expand_trailing_blanks();
                         viewport.push_front(next_line);
                         lines_added_to_viewport += 1;
@@ -820,6 +849,12 @@ fn transfer_rows_from_lines_above_to_viewport(
                 }
             }
             let mut canonical_run = get_lines_above_bottom_canonical_row_and_wraps(lines_above);
+            *scrollback_cells = scrollback_cells.saturating_sub(
+                canonical_run
+                    .iter()
+                    .map(|row| row.stored_cell_count())
+                    .sum::<usize>(),
+            );
             if canonical_run.is_empty() {
                 break;
             }
@@ -851,11 +886,15 @@ fn transfer_rows_from_lines_above_to_viewport(
         lines_added_to_viewport += 1;
     }
     for excess_row in next_lines {
-        if let Some(mut evicted_row) = bounded_push(lines_above, sixel_grid, kitty_grid, excess_row)
-        {
-            display_row_delta +=
-                evicted_row_display_row_delta(lines_above, &mut evicted_row, max_viewport_width);
-        }
+        let evicted_rows = bounded_push(
+            lines_above,
+            sixel_grid,
+            kitty_grid,
+            excess_row,
+            scrollback_cells,
+        );
+        display_row_delta +=
+            evicted_rows_display_row_delta(lines_above, evicted_rows, max_viewport_width);
         display_row_delta += 1;
     }
     (display_row_delta, reflowed)
@@ -868,15 +907,19 @@ fn transfer_rows_from_viewport_to_lines_above(
     kitty_grid: &mut KittyGrid,
     count: usize,
     width: usize,
+    scrollback_cells: &mut usize,
 ) -> isize {
     let mut display_row_delta: isize = 0;
     let drained_lines = std::cmp::min(count, viewport.len());
     for next_line in viewport.drain(..drained_lines) {
-        if let Some(mut evicted_row) = bounded_push(lines_above, sixel_grid, kitty_grid, next_line)
-        {
-            display_row_delta +=
-                evicted_row_display_row_delta(lines_above, &mut evicted_row, width);
-        }
+        let evicted_rows = bounded_push(
+            lines_above,
+            sixel_grid,
+            kitty_grid,
+            next_line,
+            scrollback_cells,
+        );
+        display_row_delta += evicted_rows_display_row_delta(lines_above, evicted_rows, width);
         display_row_delta += 1;
     }
     display_row_delta
@@ -1026,12 +1069,22 @@ fn columns_with_capacity(capacity: usize) -> Vec<TerminalCharacter> {
     }
 }
 
+/// Rows entering scrollback are already wrapped, so `columns.len() +
+/// trailing_blanks` is invariant across compress/expand and measures
+/// retained scrollback honestly where the row count alone cannot: a
+/// pathological pane width would otherwise multiply every retained row.
+/// The budget equals the row cap times this width — panes up to 1024
+/// columns keep their full scrollback; wider panes shed rows to stay
+/// under the same retained-cell ceiling.
+const MAX_SCROLLBACK_ROW_CELLS: usize = 1024;
+
 fn bounded_push(
     vec: &mut VecDeque<Row>,
     sixel_grid: &mut SixelGrid,
     kitty_grid: &mut KittyGrid,
     mut value: Row,
-) -> Option<Row> {
+    scrollback_cells: &mut usize,
+) -> Vec<Row> {
     value.compress_trailing_blanks();
     if value.columns.capacity() > value.columns.len() {
         let mut exact = Vec::with_capacity(value.columns.len());
@@ -1039,10 +1092,16 @@ fn bounded_push(
         recycle_columns(std::mem::replace(&mut value.columns, exact));
     }
     let scroll_buffer_size = *SCROLL_BUFFER_SIZE.get().unwrap();
-    let mut evicted_row = None;
-    if vec.len() >= scroll_buffer_size {
+    let cell_budget = scroll_buffer_size.saturating_mul(MAX_SCROLLBACK_ROW_CELLS);
+    let mut evicted_rows = Vec::new();
+    // Evict until both bounds hold: the row-count cap (one evict per
+    // push preserves it) and the retained-cell ceiling (may need
+    // several, e.g. after the pane widened). The newest row is never
+    // evicted by the cell rule even if it alone exceeds the budget.
+    while vec.len() >= scroll_buffer_size || (*scrollback_cells > cell_budget && vec.len() > 1) {
         let line = vec.pop_front();
         if let Some(line) = line {
+            *scrollback_cells = scrollback_cells.saturating_sub(line.stored_cell_count());
             sixel_grid.offset_grid_top();
             kitty_grid.offset_grid_top();
             if line.is_canonical {
@@ -1056,15 +1115,18 @@ fn bounded_push(
                     };
                 kitty_grid.drop_first_canonical_anchor_line(first_canonical_row);
             }
-            evicted_row = Some(line);
+            evicted_rows.push(line);
+        } else {
+            break;
         }
     }
     if vec.len() == vec.capacity() && vec.len() < scroll_buffer_size {
         let doubled = vec.capacity().max(8);
         vec.reserve_exact(doubled.min(scroll_buffer_size - vec.len()));
     }
+    *scrollback_cells += value.stored_cell_count();
     vec.push_back(value);
-    evicted_row
+    evicted_rows
 }
 
 pub fn create_horizontal_tabstops(columns: usize) -> BTreeSet<usize> {
@@ -1440,6 +1502,7 @@ pub struct Grid {
     pub link_handler: Rc<RefCell<LinkHandler>>,
     pub ring_bell: bool,
     scrollback_display_rows: usize,
+    scrollback_cells: usize,
     scrollback_epoch: u64,
     pub mouse_mode: MouseMode,
     pub mouse_tracking: MouseTracking,
@@ -1836,6 +1899,7 @@ impl Grid {
             link_handler,
             ring_bell: false,
             scrollback_display_rows: 0,
+            scrollback_cells: 0,
             mouse_mode: MouseMode::default(),
             mouse_tracking: MouseTracking::default(),
             focus_event_tracking: false,
@@ -2238,6 +2302,7 @@ impl Grid {
                 &mut self.kitty_grid,
                 1,
                 self.width,
+                &mut self.scrollback_cells,
             );
             self.apply_scrollback_display_row_delta(display_row_delta);
             self.kitty_refresh_after_scroll_step(reflowed);
@@ -2275,18 +2340,16 @@ impl Grid {
                 line_to_push_up.canonical()
             };
 
-            let evicted_row = bounded_push(
+            let evicted_rows = bounded_push(
                 &mut self.lines_above,
                 &mut self.sixel_grid,
                 &mut self.kitty_grid,
                 line_to_push_up,
+                &mut self.scrollback_cells,
             );
-            let mut display_row_delta = 1;
-            if let Some(mut evicted_row) = evicted_row {
-                let width = self.width;
-                display_row_delta +=
-                    evicted_row_display_row_delta(&mut self.lines_above, &mut evicted_row, width);
-            }
+            let width = self.width;
+            let display_row_delta =
+                1 + evicted_rows_display_row_delta(&mut self.lines_above, evicted_rows, width);
             self.apply_scrollback_display_row_delta(display_row_delta);
 
             let reflowed = transfer_rows_from_lines_below_to_viewport(
@@ -2552,6 +2615,7 @@ impl Grid {
                         &mut self.kitty_grid,
                         row_count_to_transfer,
                         new_columns,
+                        &mut self.scrollback_cells,
                     );
                     let rows_pulled = self.viewport.len() - current_viewport_row_count;
                     new_cursor_y += rows_pulled;
@@ -2580,6 +2644,7 @@ impl Grid {
                         &mut self.kitty_grid,
                         row_count_to_transfer,
                         new_columns,
+                        &mut self.scrollback_cells,
                     );
                 },
                 Ordering::Equal => {},
@@ -3543,6 +3608,7 @@ impl Grid {
         self.invalidate_scroll_offset();
         self.lines_above = VecDeque::new();
         self.scrollback_display_rows = 0;
+        self.scrollback_cells = 0;
     }
 
     fn pad_current_line_until(&mut self, position: usize, pad_character: TerminalCharacter) {
@@ -3771,6 +3837,7 @@ impl Grid {
         }
         self.invalidate_scroll_offset();
         self.lines_above = VecDeque::new();
+        self.scrollback_cells = 0;
         self.lines_below = VecDeque::new();
         self.is_scrolled = false;
         self.viewport = VecDeque::from(vec![Row::with_capacity(self.width).canonical()]);
@@ -4843,6 +4910,7 @@ impl Grid {
             &mut self.kitty_grid,
             count,
             width,
+            &mut self.scrollback_cells,
         );
         self.apply_scrollback_display_row_delta(display_row_delta);
         self.kitty_reanchor_all_from_pixels();
@@ -5467,6 +5535,7 @@ impl Grid {
     pub fn delete_viewport_and_scroll(&mut self) {
         self.invalidate_scroll_offset();
         self.lines_above = VecDeque::new();
+        self.scrollback_cells = 0;
         self.viewport.clear();
         self.lines_below = VecDeque::new();
         self.scrollback_display_rows = 0;
@@ -6546,6 +6615,11 @@ impl Handler for Grid {
                                     &mut self.kitty_grid,
                                     &mut self.supports_kitty_keyboard_protocol,
                                 );
+                                self.scrollback_cells = self
+                                    .lines_above
+                                    .iter()
+                                    .map(|row| row.stored_cell_count())
+                                    .sum();
                             }
                             self.alternate_screen_state = None;
                             self.shell_reports.push(
@@ -6642,6 +6716,7 @@ impl Handler for Grid {
                             // enter alternate buffer
                             let current_lines_above =
                                 std::mem::replace(&mut self.lines_above, VecDeque::new());
+                            self.scrollback_cells = 0;
                             let current_viewport = std::mem::replace(
                                 &mut self.viewport,
                                 VecDeque::from(vec![Row::new().canonical()]),
@@ -7473,6 +7548,12 @@ impl Row {
     /// copies even when the row holds no characters at all.
     fn snapshot_cost(&self) -> usize {
         self.width() + self.osc133_markers.as_slice().len()
+    }
+    /// Retained-cell cost of this row: `columns + trailing_blanks` is
+    /// invariant under compress/expand, so it measures the row's stored
+    /// footprint regardless of its current compression state.
+    pub fn stored_cell_count(&self) -> usize {
+        self.columns.len() + self.trailing_blanks as usize
     }
     pub fn compress_trailing_blanks(&mut self) {
         let mut kept = self.columns.len();
