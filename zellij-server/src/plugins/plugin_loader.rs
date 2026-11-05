@@ -2,7 +2,7 @@ use crate::plugins::plugin_map::{
     PluginEnv, PluginMap, PluginMetadata, RunningPlugin, SharedEnv, VecDequeInputStream,
     WriteOutputStream,
 };
-use crate::plugins::plugin_worker::{plugin_worker, RunningWorker};
+use crate::plugins::plugin_worker::{plugin_worker, MessageToWorker, RunningWorker};
 use crate::plugins::wasm_bridge::{LoadingContext, PluginCache};
 use crate::plugins::zellij_exports::{wasi_write_object, zellij_exports};
 use crate::plugins::PluginId;
@@ -291,26 +291,56 @@ impl PluginLoader {
             }
         }
 
-        crate::plugins::shared::refuel_for_callback(&mut plugin.lock().unwrap().store);
-        start_function
-            .call(&mut plugin.lock().unwrap().store, ())
-            .with_context(err_context)?;
+        // The instance is already published in plugin_map at this point
+        // so it can resolve itself during _start/load. Any failure below
+        // must roll the provisional entry (and its workers) back out —
+        // a half-initialized instance must not keep receiving events.
+        let init_result: Result<()> = (|| {
+            crate::plugins::shared::refuel_for_callback(&mut plugin.lock().unwrap().store);
+            start_function
+                .call(&mut plugin.lock().unwrap().store, ())
+                .with_context(err_context)?;
 
-        let protobuf_plugin_configuration: ProtobufPluginConfiguration = self
-            .plugin_config
-            .initial_userspace_configuration
-            .clone()
-            .try_into()
-            .map_err(|e| anyhow!("Failed to serialize user configuration: {:?}", e))?;
-        let protobuf_bytes = protobuf_plugin_configuration.encode_to_vec();
-        wasi_write_object(plugin.lock().unwrap().store.data(), &protobuf_bytes)
-            .with_context(err_context)?;
-        crate::plugins::shared::refuel_for_callback(&mut plugin.lock().unwrap().store);
-        load_function
-            .call(&mut plugin.lock().unwrap().store, ())
-            .with_context(err_context)?;
+            let protobuf_plugin_configuration: ProtobufPluginConfiguration = self
+                .plugin_config
+                .initial_userspace_configuration
+                .clone()
+                .try_into()
+                .map_err(|e| anyhow!("Failed to serialize user configuration: {:?}", e))?;
+            let protobuf_bytes = protobuf_plugin_configuration.encode_to_vec();
+            wasi_write_object(plugin.lock().unwrap().store.data(), &protobuf_bytes)
+                .with_context(err_context)?;
+            crate::plugins::shared::refuel_for_callback(&mut plugin.lock().unwrap().store);
+            load_function
+                .call(&mut plugin.lock().unwrap().store, ())
+                .with_context(err_context)?;
+            Ok(())
+        })();
+        if let Err(e) = init_result {
+            self.retire_provisional_instance(shared);
+            return Err(e);
+        }
 
         Ok(plugin)
+    }
+
+    /// Remove a provisional plugin instance and retire its workers after
+    /// a failed _start/load so no runnable entry, worker or pending
+    /// pipe survives the failed initialization.
+    fn retire_provisional_instance(&mut self, shared: bool) {
+        let removed = {
+            let mut plugin_map = self.plugin_map.lock().unwrap();
+            if shared {
+                plugin_map.remove_shared(self.plugin_id)
+            } else {
+                plugin_map.remove_plugin_instance(self.plugin_id, self.client_id)
+            }
+        };
+        if let Some((_running_plugin, _subscriptions, workers)) = removed {
+            for (_worker_name, worker_sender) in workers {
+                drop(worker_sender.send(MessageToWorker::Exit));
+            }
+        }
     }
     pub fn create_plugin_environment(
         &self,

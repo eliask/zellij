@@ -56,6 +56,16 @@ pub struct PluginMap {
 }
 
 impl PluginMap {
+    /// Remove a single (plugin, client) instance, returning its assets
+    /// so the caller can retire workers. Used to roll back a provisional
+    /// registration after a failed _start/load.
+    pub fn remove_plugin_instance(
+        &mut self,
+        plugin_id: PluginId,
+        client_id: ClientId,
+    ) -> Option<PluginAssets> {
+        self.plugin_assets.remove(&(plugin_id, client_id))
+    }
     pub fn remove_plugins(&mut self, pid: PluginId) -> RemovedPluginAssets {
         self.plugin_metadata.remove(&pid);
         let mut removed = HashMap::new();

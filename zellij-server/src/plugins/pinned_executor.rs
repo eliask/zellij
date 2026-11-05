@@ -309,6 +309,10 @@ impl PinnedExecutor {
     /// batching them into a single job keeps every cleanup ahead of the one
     /// retirement.
     pub fn execute_plugin_unload_many(self: &Arc<Self>, plugin_id: u32, cleanups: Vec<PluginWork>) {
+        if cleanups.is_empty() && !self.is_registered(plugin_id) {
+            // nothing to run and nothing to retire
+            return;
+        }
         let executor = self.clone();
         self.execute_for_plugin(
             plugin_id,
@@ -328,6 +332,13 @@ impl PinnedExecutor {
                 executor.unregister_plugin(plugin_id);
             },
         );
+    }
+
+    pub fn is_registered(&self, plugin_id: u32) -> bool {
+        self.plugin_assignments
+            .lock()
+            .unwrap()
+            .contains_key(&plugin_id)
     }
 
     /// Unregister a plugin and potentially shrink the pool
@@ -924,6 +935,28 @@ mod tests {
         executor.execute_for_plugin(1, make_signaling_job(tx3));
         rx3.recv_timeout(Duration::from_secs(5))
             .expect("Re-registered plugin must remain schedulable");
+    }
+
+    #[test]
+    fn test_unload_without_cleanups_still_retires_the_assignment() {
+        // A plugin whose initialization failed has no instance left to clean up
+        // but still holds an assignment.
+        let executor = create_test_executor(2);
+        executor.register_plugin(1);
+        executor.execute_plugin_unload_many(1, vec![]);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while executor.is_registered(1) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Assignment was not retired"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Unloading an id that is not registered has nothing to run or retire
+        executor.execute_plugin_unload_many(1, vec![]);
+        assert!(!executor.is_registered(1));
     }
 
     #[test]

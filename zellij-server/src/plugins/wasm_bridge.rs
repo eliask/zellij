@@ -711,11 +711,11 @@ impl WasmBridge {
             self.unload_shared_slot(pid);
             return Ok(());
         }
-        if self
+        let still_loading = self
             .loading_plugins
             .iter()
-            .any(|(loading_plugin_id, _)| *loading_plugin_id == pid)
-        {
+            .any(|(loading_plugin_id, _)| *loading_plugin_id == pid);
+        if still_loading {
             self.loading_plugins
                 .retain(|(loading_plugin_id, _)| *loading_plugin_id != pid);
             self.plugins_to_unload_once_loaded.insert(pid);
@@ -798,7 +798,10 @@ impl WasmBridge {
                 },
             ));
         }
-        if !cleanups.is_empty() {
+        // A plugin whose initialization failed has no instance left to clean up, but it still
+        // holds its executor assignment; retire that too. One that is still loading is unloaded
+        // again once it has loaded, and retiring it now would drop that second unload.
+        if !cleanups.is_empty() || !still_loading {
             self.plugin_executor
                 .execute_plugin_unload_many(pid, cleanups);
         }
