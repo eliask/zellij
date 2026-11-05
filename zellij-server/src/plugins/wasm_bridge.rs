@@ -735,12 +735,15 @@ impl WasmBridge {
         let mut cleanups: Vec<PluginWork> = Vec::with_capacity(plugins_to_cleanup.len());
         for ((plugin_id, client_id), (running_plugin, subscriptions, workers)) in plugins_to_cleanup
         {
-            // Clear key intercepts if needed (on main thread is OK)
-            if running_plugin.lock().unwrap().intercepting_key_presses() {
-                let _ = self
-                    .senders
-                    .send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(client_id));
-            }
+            // Release this plugin's key intercept for the client without asking the
+            // RunningPlugin whether it has one: its execution mutex is held for the whole of a
+            // guest callback, and the management thread must not wait on that to unload. The
+            // screen only drops an intercept this plugin owns.
+            let _ = self
+                .senders
+                .send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(
+                    plugin_id, client_id,
+                ));
             // Clear any regex highlights this plugin registered across all panes
             let _ = self
                 .senders
@@ -1683,11 +1686,12 @@ impl WasmBridge {
             return;
         }
         for ((plugin_id, client_id), (running_plugin, subscriptions, workers)) in instances {
-            if running_plugin.lock().unwrap().intercepting_key_presses() {
-                let _ = self
-                    .senders
-                    .send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(client_id));
-            }
+            // as in unload_plugin: no lock on the guest's execution mutex here
+            let _ = self
+                .senders
+                .send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(
+                    plugin_id, client_id,
+                ));
             let _ = self.senders.send_to_screen(
                 ScreenInstruction::UpdateBackgroundPluginSubscriptions(
                     plugin_id,

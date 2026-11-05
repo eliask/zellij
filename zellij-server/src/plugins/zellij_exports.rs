@@ -6557,9 +6557,10 @@ fn clear_key_presses_intercepts(env: &mut PluginEnv) {
     env.intercepting_key_presses = false;
     let _ = env
         .senders
-        .send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(acting_client(
-            env,
-        )));
+        .send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(
+            env.plugin_id,
+            acting_client(env),
+        ));
 }
 
 fn replace_pane_with_existing_pane(

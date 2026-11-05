@@ -680,7 +680,10 @@ fn tear_down_instance(
             .map(|shared| shared.clients.iter().copied().collect())
             .unwrap_or_default();
         for client_id in clients {
-            let _ = senders.send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(client_id));
+            let _ = senders.send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(
+                instance_id,
+                client_id,
+            ));
         }
     }
     let data_dir = running_plugin.store.data().plugin_own_data_dir.clone();
