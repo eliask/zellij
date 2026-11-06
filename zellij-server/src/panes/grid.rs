@@ -1609,6 +1609,11 @@ impl Grid {
     fn restore_cursor_position(&mut self) {
         if let Some(saved_cursor_position) = &self.saved_cursor_position {
             self.cursor = saved_cursor_position.clone();
+            // the saved position outlives screen switches and may be outside the current
+            // screen (eg. it was saved on the main screen and restored on the alternate one)
+            self.cursor.x = std::cmp::min(self.cursor.x, self.width);
+            self.cursor.y = std::cmp::min(self.cursor.y, self.height.saturating_sub(1));
+            self.pad_lines_until(self.cursor.y, EMPTY_TERMINAL_CHARACTER);
         }
     }
     fn configure_charset(&mut self, charset: StandardCharset, index: CharsetIndex) {
@@ -3023,8 +3028,11 @@ impl Grid {
         self.output_buffer.update_line(self.cursor.y);
     }
     pub fn replace_characters_in_line_before_cursor(&mut self, replace_with: TerminalCharacter) {
-        let row = self.viewport.get_mut(self.cursor.y).unwrap();
-        row.replace_and_pad_beginning(self.cursor.x, replace_with);
+        // the viewport is populated lazily, so the cursor's row may not exist yet
+        self.pad_lines_until(self.cursor.y, EMPTY_TERMINAL_CHARACTER);
+        if let Some(row) = self.viewport.get_mut(self.cursor.y) {
+            row.replace_and_pad_beginning(self.cursor.x, replace_with);
+        }
         self.output_buffer.update_line(self.cursor.y);
     }
     pub fn clear_all_after_cursor(&mut self, replace_with: TerminalCharacter) {

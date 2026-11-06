@@ -11599,3 +11599,14 @@ fn a_url_with_a_suggestion_after_the_cursor_waits_until_the_line_is_final() {
         vec!["http://www.example.org".to_owned()]
     );
 }
+
+#[test]
+fn erasing_to_line_start_after_restoring_a_cursor_into_the_alternate_screen_does_not_panic() {
+    // the saved cursor survives the switch to the alternate screen, whose viewport is
+    // only one row tall until something is drawn on it
+    let mut grid = create_grid_with_size_and_raw(20, 40, b"\x1b[10;1H\x1b7\x1b[?1049h\x1b8\x1b[1K");
+    assert!(grid.cursor.y < grid.height);
+    assert!(grid.viewport.len() > grid.cursor.y);
+    feed_bytes(&mut grid, b"\x1b[1J\x1b[2K\x1b[1Kx");
+    assert!(grid.viewport.len() <= grid.height);
+}
