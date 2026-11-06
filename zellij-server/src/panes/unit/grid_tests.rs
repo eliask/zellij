@@ -69,8 +69,33 @@ fn a_wide_character_in_a_one_column_row_does_not_create_an_empty_leading_row() {
 
     let rows = Row::rewrap_rows(vec![row_from_str("你")], 1);
 
-    assert_eq!(rows.len(), 1);
-    assert_eq!(row_to_string(&rows[0]), "你");
+    // the character does not fit the row, so it is replaced by a blank for each of its two
+    // columns rather than kept in a wider row
+    assert_eq!(rows.len(), 2);
+    assert_eq!(row_to_string(&rows[0]), " ");
+    assert_eq!(row_to_string(&rows[1]), " ");
+    assert!(rows.iter().all(|row| row.width() <= 1));
+}
+
+#[test]
+fn blanking_a_wide_character_keeps_the_columns_of_the_osc133_markers() {
+    use crate::panes::grid::{Osc133MarkerKind, Row};
+
+    // the marker is at column 3: after the two columns of the wide character and the "X"
+    let mut row = row_from_str("你Xy");
+    row.add_osc133_marker(3, Osc133MarkerKind::Prompt);
+
+    let rows = Row::rewrap_rows(vec![row], 1);
+
+    assert_eq!(rows.len(), 4);
+    let marked: Vec<(usize, usize)> = rows
+        .iter()
+        .enumerate()
+        .flat_map(|(index, row)| row.osc133_markers.iter().map(move |m| (index, m.column)))
+        .collect();
+    // the marker stays right after the "X"
+    assert_eq!(row_to_string(&rows[2]), "X");
+    assert_eq!(marked, vec![(2, 1)]);
 }
 
 #[test]
@@ -3935,6 +3960,7 @@ fn table_ui_component() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "table-ui-component";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -3967,6 +3993,7 @@ fn table_ui_component_with_coordinates() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "table-ui-component-with-coordinates";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -3999,6 +4026,7 @@ fn ribbon_ui_component() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "ribbon-ui-component";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -4031,6 +4059,7 @@ fn ribbon_ui_component_with_coordinates() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "ribbon-ui-component-with-coordinates";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -4063,6 +4092,7 @@ fn nested_list_ui_component() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "nested-list-ui-component";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -4095,6 +4125,7 @@ fn nested_list_ui_component_with_coordinates() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "nested-list-ui-component-with-coordinates";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -4127,6 +4158,7 @@ fn text_ui_component() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "text-ui-component";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -4159,6 +4191,7 @@ fn text_ui_component_with_coordinates() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "text-ui-component-with-coordinates";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -6859,6 +6892,7 @@ fn serialize_text_bytes(text: &str) -> String {
 fn render_ui_component(component_name: &str, serialized_params: &str) -> Grid {
     let mut vte_parser = vt_parser::Parser::new();
     let mut grid = new_grid_for_nested_frames();
+    grid.enable_ui_components();
     let dcs = format!("\u{1b}Pz{};{}\u{1b}\\", component_name, serialized_params);
     vte_parser.feed(&mut grid, dcs.as_bytes());
     grid
@@ -9392,6 +9426,7 @@ fn an_oversized_xtgettcap_query_is_discarded_whole() {
 #[test]
 fn unterminated_dcs_payloads_are_bounded() {
     let mut grid = create_grid_with_content("");
+    grid.enable_ui_components();
     let mut vte_parser = vt_parser::Parser::new();
     let chunk = vec![b'a'; 64 * 1024];
     vte_parser.feed(&mut grid, b"\x1bPz");
@@ -11342,6 +11377,7 @@ fn empty_grid(rows: usize, cols: usize, grapheme_mode: bool) -> Grid {
         false,
     );
     grid.set_grapheme_mode_by_default(grapheme_mode);
+    grid.enable_ui_components();
     grid
 }
 
@@ -12177,4 +12213,564 @@ fn a_multi_row_cell_eviction_telescopes_the_display_row_deltas() {
         scrollback_recount(&mut grid),
         "a multi-row eviction must account the height change of the shrinking line"
     );
+}
+
+#[test]
+fn erasing_to_line_start_after_restoring_a_cursor_into_the_alternate_screen_does_not_panic() {
+    // the saved cursor survives the switch to the alternate screen, whose viewport is
+    // only one row tall until something is drawn on it
+    let mut grid = create_grid_with_size_and_raw(20, 40, b"\x1b[10;1H\x1b7\x1b[?1049h\x1b8\x1b[1K");
+    assert!(grid.cursor.y < grid.height);
+    assert!(grid.viewport.len() > grid.cursor.y);
+    feed_bytes(&mut grid, b"\x1b[1J\x1b[2K\x1b[1Kx");
+    assert!(grid.viewport.len() <= grid.height);
+}
+
+#[test]
+fn an_invalid_scroll_region_is_ignored() {
+    // top below bottom, top past the screen and a one line region are all invalid
+    for sequence in [
+        &b"\x1b[60000;50r"[..],
+        b"\x1b[5;3r",
+        b"\x1b[4;4r",
+        b"\x1b[25;30r",
+    ] {
+        let mut grid = create_grid_with_size_and_raw(10, 40, b"\x1b[2;8r\x1b[5;9H");
+        let cursor = (grid.cursor.x, grid.cursor.y);
+        feed_bytes(&mut grid, sequence);
+        assert_eq!(grid.scroll_region, (1, 7), "{:?}", sequence);
+        assert_eq!((grid.cursor.x, grid.cursor.y), cursor, "{:?}", sequence);
+    }
+}
+
+#[test]
+fn a_scroll_region_bottom_past_the_screen_is_clamped() {
+    let grid = create_grid_with_size_and_raw(10, 40, b"\x1b[3;60000r");
+    assert_eq!(grid.scroll_region, (2, 9));
+}
+
+#[test]
+fn scroll_region_operations_never_grow_the_viewport_beyond_the_screen() {
+    for region in [&b""[..], b"\x1b[60000;50r", b"\x1b[3;7r", b"\x1b[3;60000r"] {
+        for operation in [
+            &b"\x1b[65535S"[..],
+            b"\x1b[65535T",
+            b"\x1b[65535L",
+            b"\x1b[65535M",
+            b"\x1b[1;1H\x1b[65535L",
+            b"\x1b[5;1H\x1b[65535M",
+            b"\x1b[5;1H\x1b[65535L\x1b[65535S",
+        ] {
+            // a grid that has not drawn anything has a short viewport
+            let mut grid = create_grid_with_size_and_raw(10, 40, b"");
+            feed_bytes(&mut grid, region);
+            feed_bytes(&mut grid, operation);
+            assert!(
+                grid.viewport.len() <= grid.height,
+                "{:?} then {:?} left {} rows",
+                region,
+                operation,
+                grid.viewport.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn scrolling_by_a_huge_count_adds_at_most_a_screenful_to_the_scrollback() {
+    for sequence in [
+        &b"\x1b[65535S"[..],
+        b"\x1b[65535T",
+        b"\x1b[65535M",
+        b"\x1b[65535L",
+        b"\x1b[3;8r\x1b[65535S",
+        b"\x1b[3;8r\x1b[3;1H\x1b[65535M",
+    ] {
+        let mut grid = create_grid_with_size_and_raw(10, 40, b"one\r\ntwo\r\nthree");
+        feed_bytes(&mut grid, sequence);
+        assert!(
+            grid.lines_above.len() <= grid.height,
+            "{:?} put {} lines in the scrollback",
+            sequence,
+            grid.lines_above.len()
+        );
+        assert!(grid.viewport.len() <= grid.height);
+    }
+}
+
+#[test]
+fn counts_larger_than_the_screen_still_have_their_full_effect() {
+    // SU: the whole screen scrolls into the scrollback and a blank one remains
+    let mut grid = create_grid_with_size_and_raw(5, 10, b"one\r\ntwo\r\nthree");
+    feed_bytes(&mut grid, b"\x1b[65535S");
+    assert_eq!(grid.lines_above.len(), 5);
+    assert_eq!(scrollback_texts(&grid)[..3], ["one", "two", "three"]);
+    assert!(viewport_texts(&grid)
+        .iter()
+        .all(|row| row.trim().is_empty()));
+    // IL / DL stop at the end of the region
+    let mut grid = create_grid_with_size_and_raw(5, 10, b"1\r\n2\r\n3\r\n4\r\n5\x1b[2;1H");
+    feed_bytes(&mut grid, b"\x1b[65535L");
+    assert_eq!(
+        viewport_texts(&grid)
+            .iter()
+            .map(|row| row.trim().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["1", "", "", "", ""]
+    );
+    let mut grid = create_grid_with_size_and_raw(5, 10, b"1\r\n2\r\n3\r\n4\r\n5\x1b[2;1H");
+    feed_bytes(&mut grid, b"\x1b[65535M");
+    assert_eq!(
+        viewport_texts(&grid)
+            .iter()
+            .map(|row| row.trim().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["1", "", "", "", ""]
+    );
+    // ICH / DCH / ECH
+    let row_after = |sequence: &[u8]| {
+        let mut grid = create_grid_with_size_and_raw(5, 10, b"abcdefghij\x1b[1;3H");
+        feed_bytes(&mut grid, sequence);
+        row_text(&grid.viewport[0]).trim_end().to_owned()
+    };
+    assert_eq!(row_after(b"\x1b[3@"), "ab   cdefg");
+    assert_eq!(row_after(b"\x1b[65535@"), "ab");
+    assert_eq!(row_after(b"\x1b[2P"), "abefghij");
+    assert_eq!(row_after(b"\x1b[65535P"), "ab");
+    assert_eq!(row_after(b"\x1b[3X"), "ab   fghij");
+    assert_eq!(row_after(b"\x1b[65535X"), "ab");
+    // CHT / CBT
+    let mut grid = create_grid_with_size_and_raw(5, 40, b"");
+    feed_bytes(&mut grid, b"\x1b[65535I");
+    assert_eq!(grid.cursor.x, 39);
+    feed_bytes(&mut grid, b"\x1b[65535Z");
+    assert_eq!(grid.cursor.x, 0);
+}
+
+#[test]
+fn repeating_a_character_wraps_like_typing_it() {
+    let typed = |count: usize, setup: &[u8]| {
+        let mut content = setup.to_vec();
+        content.extend(std::iter::repeat(b'a').take(count));
+        let grid = create_grid_with_size_and_raw(5, 10, &content);
+        (viewport_texts(&grid), grid.cursor.x, grid.cursor.y)
+    };
+    let repeated = |count: usize, setup: &[u8]| {
+        let mut content = setup.to_vec();
+        content.extend_from_slice(format!("a\x1b[{}b", count - 1).as_bytes());
+        let grid = create_grid_with_size_and_raw(5, 10, &content);
+        (viewport_texts(&grid), grid.cursor.x, grid.cursor.y)
+    };
+    for setup in [&b""[..], b"xyz\x1b[2;4H", b"\x1b[5;7H"] {
+        for count in [
+            2, 9, 10, 11, 25, 49, 59, 60, 61, 69, 70, 71, 72, 75, 81, 100, 1003, 65536,
+        ] {
+            assert_eq!(
+                typed(count, setup),
+                repeated(count, setup),
+                "count {} after {:?}",
+                count,
+                setup
+            );
+        }
+    }
+    // without line wrapping the repeat stops at the edge
+    let grid = create_grid_with_size_and_raw(5, 10, b"\x1b[?7la\x1b[65535b");
+    assert_eq!(viewport_texts(&grid)[0], "aaaaaaaaaa");
+    assert!(viewport_texts(&grid)[1..]
+        .iter()
+        .all(|row| row.trim().is_empty()));
+}
+
+#[test]
+fn huge_repeat_counts_cost_no_more_than_the_screen_allows() {
+    let mut grid = create_grid_with_size_and_raw(24, 80, b"abc");
+    let started = std::time::Instant::now();
+    for _ in 0..300 {
+        feed_bytes(
+            &mut grid,
+            b"\x1b[1;1H\x1b[65535@\x1b[65535P\x1b[65535X\x1b[65535I\x1b[65535Z",
+        );
+    }
+    for _ in 0..20 {
+        feed_bytes(&mut grid, b"a\x1b[65535b");
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_newline_below_the_scroll_region_on_the_last_line_does_not_add_a_row() {
+    let mut grid = create_grid_with_size_and_raw(10, 40, b"\x1b[1;3r\x1b[10;1H");
+    for _ in 0..5 {
+        feed_bytes(&mut grid, b"\n");
+        assert!(grid.viewport.len() <= grid.height);
+    }
+    assert_eq!(grid.cursor.y, 9);
+}
+
+const HOSTILE_UI_COMPONENTS: &[&[u8]] = &[
+    b"\x1bPztable;0;0;1\x1b\\",
+    b"\x1bPztext;0/0/70000/1;z\x1b\\",
+    b"\x1bPzdialog;0/0/1000000000/1000000000\x1b\\",
+];
+
+#[test]
+fn ui_component_sequences_are_ignored_in_a_terminal_pane() {
+    // an ordinary grid is what a terminal pane has: the sequence is an unknown DCS
+    let mut grid = new_grid_for_nested_frames();
+    feed_bytes(
+        &mut grid,
+        format!(
+            "\x1bPztext;{}\x1b\\after",
+            serialize_text_bytes("component")
+        )
+        .as_bytes(),
+    );
+    let screen = viewport_texts(&grid).join("\n");
+    assert!(!screen.contains("component"), "{:?}", screen);
+    assert!(screen.contains("after"), "{:?}", screen);
+    assert!(grid.ui_component_bytes.is_none());
+    for hostile in HOSTILE_UI_COMPONENTS {
+        feed_bytes(&mut grid, hostile);
+    }
+    assert!(grid.viewport.len() <= grid.height);
+    // while a grid that shows a plugin renders it
+    let grid = render_ui_component("text", &serialize_text_bytes("component"));
+    assert!(viewport_texts(&grid).join("\n").contains("component"));
+}
+
+#[test]
+fn no_row_is_wider_than_the_pane_after_it_shrinks_below_a_wide_character() {
+    // U+FF13 is two columns wide
+    let content = "\u{ff13}\r\n\u{ff13}ab\r\n\u{ff13}\r\n\u{ff13}\u{ff13}\u{ff13}\r\n\u{ff13}";
+    let mut grid = create_grid_with_size_and_raw(3, 10, content.as_bytes());
+    grid.change_size(1, 1);
+    let too_wide = |grid: &Grid| {
+        // (the lines above and below the screen are only reflowed as they come into it)
+        grid.viewport
+            .iter()
+            .map(|row| row.width())
+            .filter(|width| *width > 1)
+            .count()
+    };
+    assert_eq!(too_wide(&grid), 0);
+    // reflowing the lines kept above and below the screen into it must not bring any back
+    for _ in 0..20 {
+        grid.scroll_up_one_line();
+        assert_eq!(too_wide(&grid), 0);
+    }
+    for _ in 0..20 {
+        grid.scroll_down_one_line();
+        assert_eq!(too_wide(&grid), 0);
+    }
+    grid.change_size(3, 10);
+    assert!(grid.viewport.iter().all(|row| row.width() <= 10));
+}
+
+#[test]
+fn a_scroll_region_below_the_screen_cannot_make_scrolling_grow_the_viewport() {
+    let mut content = Vec::new();
+    for line in 0..24 {
+        content.extend_from_slice(format!("line {}\r\n", line).as_bytes());
+    }
+    for region in ["42;96", "100;200", "30;24", "25;30", "24;24", "1;1"] {
+        for operation in ["S", "T", "L", "M", "\n"] {
+            let mut grid = create_grid_with_size_and_raw(24, 80, &content);
+            let operation_bytes = if operation == "\n" {
+                operation.to_owned()
+            } else {
+                format!("\x1b[{}", operation)
+            };
+            feed_bytes(
+                &mut grid,
+                format!("\x1b[{}r{}", region, operation_bytes).as_bytes(),
+            );
+            assert_eq!(
+                grid.viewport.len(),
+                24,
+                "region {} then {:?}",
+                region,
+                operation
+            );
+        }
+    }
+}
+
+fn plugin_grid(rows: usize, cols: usize) -> Grid {
+    let mut grid = create_grid_with_size_and_raw(rows, cols, b"");
+    grid.enable_ui_components();
+    grid
+}
+
+fn ui_component_stress_payloads() -> Vec<String> {
+    let max = usize::MAX.to_string();
+    let coordinates = [
+        String::new(),
+        "0/0/0/0".to_owned(),
+        "0/0/1/1".to_owned(),
+        "0/0/2/2".to_owned(),
+        "0/0/3/1".to_owned(),
+        "5/5/7/3".to_owned(),
+        "0/0/70000/1".to_owned(),
+        "0/0/65536/65536".to_owned(),
+        "1/1/1000000000/1000000000".to_owned(),
+        "99999/99999/99999/99999".to_owned(),
+        "0/0//".to_owned(),
+        "0/0/30/".to_owned(),
+        "0/0//30".to_owned(),
+        format!("0/0/{}/{}", max, max),
+        format!("{}/{}/1/1", max, max),
+        format!("{}/0/{}/1", max, max),
+    ];
+    let long_indentation = "|".repeat(70_000);
+    let long_text = "104,".repeat(70_000);
+    let medium_text = "104,".repeat(300);
+    let simple_bodies: Vec<(&str, Vec<String>)> = vec![
+        (
+            "table",
+            vec![
+                "0;0;1".to_owned(),
+                "0;0;104,105;106".to_owned(),
+                "1;1;104".to_owned(),
+                "2;3;104;105;106;107;108".to_owned(),
+                format!("{};1;104;105", max),
+                format!("1;1;{};104;105;106;107", long_text),
+            ],
+        ),
+        (
+            "text",
+            vec![
+                "104,105".to_owned(),
+                "zd104,105".to_owned(),
+                "z".to_owned(),
+                String::new(),
+                format!("z{}", medium_text),
+            ],
+        ),
+        (
+            "ribbon",
+            vec![
+                "104,105".to_owned(),
+                "x104,105".to_owned(),
+                format!("x{}", medium_text),
+            ],
+        ),
+        (
+            "nested_list",
+            vec![
+                "104".to_owned(),
+                "||104;|104;x104,105".to_owned(),
+                format!("{}104;104,105,106", long_indentation),
+                format!("104;{}", long_text),
+            ],
+        ),
+    ];
+    let states = [
+        String::new(),
+        "f,d,h,o,e,on,r,b,ind,bar,c,nm,ph,err,ab,la,hu,hd,he,bv,lmin,lmax".to_owned(),
+        format!(
+            "nb={m},sel={m},hb={m},bx={m},fr={m},hl={m},above={m},below={m},tot={m},off={m},cur={m},hov={m},lw={m}",
+            m = max
+        ),
+        "nb=3,sel=1,hb=2,bx=1,fr=1,hl=1,above=5,below=7,tot=100,off=50,cur=2,hov=1,lw=3,f,ind,bar,b,c"
+            .to_owned(),
+        "tot=1000000,off=999999,bar,f,above=1,below=1".to_owned(),
+        "lw=1000000000,bx=1000000000,fr=1000000000,nb=1000000000".to_owned(),
+    ];
+    let widget_fields = [
+        String::new(),
+        "104,105".to_owned(),
+        "104,105;106,107;108".to_owned(),
+        "104,105;;;;".to_owned(),
+        "-;m104,105:106/1,2/3;d104;104,105,106,107".to_owned(),
+        format!("{};{};{}", medium_text, medium_text, medium_text),
+        "$$$0$72,105;72,105;72,105".to_owned(),
+    ];
+    let widgets = [
+        "button",
+        "dialog",
+        "dropdown",
+        "menu",
+        "scroll_indicator",
+        "side_menu",
+        "stepper",
+        "text_input",
+        "toggle",
+    ];
+    let mut payloads = vec![];
+    for coordinate in &coordinates {
+        for (name, bodies) in &simple_bodies {
+            for body in bodies {
+                if coordinate.is_empty() {
+                    payloads.push(format!("{};{}", name, body));
+                } else if *name == "table" {
+                    // the table's two counts follow its coordinates
+                    payloads.push(format!("{};{};{}", name, coordinate, body));
+                } else {
+                    payloads.push(format!("{};{};{}", name, coordinate, body));
+                }
+            }
+        }
+        if coordinate.is_empty() {
+            continue; // widgets must have coordinates
+        }
+        for name in widgets {
+            for state in &states {
+                for fields in &widget_fields {
+                    payloads.push(format!("{};{};{};{}", name, coordinate, state, fields));
+                }
+            }
+        }
+    }
+    payloads
+}
+
+#[test]
+fn hostile_ui_component_parameters_neither_panic_nor_overgrow() {
+    let payloads = ui_component_stress_payloads();
+    let mut failures = vec![];
+    for (rows, cols) in [(1, 1), (3, 5), (24, 80)] {
+        for payload in &payloads {
+            let started = std::time::Instant::now();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut grid = plugin_grid(rows, cols);
+                feed_bytes(&mut grid, format!("\x1bPz{}\x1b\\", payload).as_bytes());
+                (grid.viewport.len(), grid.lines_above.len())
+            }));
+            let summary = payload.chars().take(70).collect::<String>();
+            match outcome {
+                Err(_) => failures.push(format!("{}x{} panicked: {}", rows, cols, summary)),
+                Ok((viewport_rows, _)) if viewport_rows > rows => failures.push(format!(
+                    "{}x{} grew the viewport to {}: {}",
+                    rows, cols, viewport_rows, summary
+                )),
+                Ok(_) if started.elapsed() > std::time::Duration::from_secs(3) => {
+                    failures.push(format!(
+                        "{}x{} took {:?}: {}",
+                        rows,
+                        cols,
+                        started.elapsed(),
+                        summary
+                    ))
+                },
+                Ok(_) => {},
+            }
+        }
+    }
+    failures.dedup();
+    assert!(
+        failures.is_empty(),
+        "{} failures, first ones:\n{}",
+        failures.len(),
+        failures
+            .iter()
+            .take(40)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+fn render_in_a_plugin_grid(payload: &str) -> Grid {
+    let mut grid = plugin_grid(10, 40);
+    feed_bytes(&mut grid, format!("\x1bPz{}\x1b\\", payload).as_bytes());
+    assert!(grid.viewport.len() <= 10, "{}", payload);
+    assert!(
+        grid.viewport.iter().all(|row| row.width() <= 40),
+        "{}",
+        payload
+    );
+    grid
+}
+
+#[test]
+fn a_table_without_columns_is_rejected() {
+    // used to divide by zero
+    for payload in ["table;0;0;1", "table;0/0/10/10;0;0;1"] {
+        let grid = render_in_a_plugin_grid(payload);
+        assert!(viewport_texts(&grid).iter().all(|row| row.is_empty()));
+    }
+}
+
+#[test]
+fn a_component_wider_than_a_u16_cannot_panic_in_format() {
+    // used to panic in format!("{:width$}")
+    render_in_a_plugin_grid("text;0/0/70000/1;z");
+    render_in_a_plugin_grid(&format!(
+        "nested_list;{}104;104,105,106",
+        "|".repeat(70_000)
+    ));
+    render_in_a_plugin_grid(&format!("nested_list;{};104,105", "104,".repeat(70_000)));
+}
+
+fn render_quickly_in_a_plugin_grid(payload: &str) -> Grid {
+    let started = std::time::Instant::now();
+    let grid = render_in_a_plugin_grid(payload);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "took {:?}",
+        started.elapsed()
+    );
+    grid
+}
+
+#[test]
+fn a_huge_indentation_is_parsed_quickly() {
+    // the pipes used to be removed one at a time, which moves the rest of the string each time
+    let payload = format!("nested_list;{}104,105", "|".repeat(1_500_000));
+    render_quickly_in_a_plugin_grid(&payload);
+}
+
+#[test]
+fn components_without_a_size_are_not_padded_past_the_pane() {
+    // the size of these comes from their widest item or their number of items: with a wide item
+    // and a lot of others it is their product that gets written (gigabytes for an input of
+    // some hundred kilobytes)
+    let wide_item = "98,".repeat(20_000);
+    let many_items = vec!["97"; 30_000].join(";");
+    for payload in [
+        format!("nested_list;{};{}", wide_item, many_items),
+        format!("nested_list;0/0//;{};{}", wide_item, many_items),
+        format!("table;1;1;{};{}", wide_item, many_items),
+        format!("table;0/0//;1;1;{};{}", wide_item, many_items),
+        format!("table;0/0//;1;1;{};{}", many_items, wide_item),
+        format!("side_menu;0/0//;;{};{}", wide_item, many_items),
+        format!("menu;0/0//;;{};{}", wide_item, many_items),
+        format!("dialog;0/0//;;{};{}", wide_item, many_items),
+        format!("dialog;0/0//;;{}", ";".repeat(300_000)),
+    ] {
+        render_quickly_in_a_plugin_grid(&payload);
+    }
+}
+
+#[test]
+fn a_dialog_is_not_drawn_where_the_pane_has_no_room_for_it() {
+    // the smallest dialog is 8 columns by 4 rows
+    for (rows, columns) in [(3, 40), (10, 7), (1, 1)] {
+        let mut grid = plugin_grid(rows, columns);
+        feed_bytes(&mut grid, b"\x1bPzdialog;0/0//;;104\x1b\\");
+        assert!(viewport_texts(&grid).iter().all(|row| row.is_empty()));
+    }
+    // while it is drawn where there is room, whatever its size (40 columns by 5 rows by default)
+    let grid = render_in_a_plugin_grid("dialog;0/0//;;104");
+    assert!(viewport_texts(&grid)[0].starts_with('╭'));
+}
+
+#[test]
+fn components_are_limited_to_the_pane() {
+    // these used to allocate and loop for a billion rows
+    for payload in [
+        "dialog;0/0/1000000000/1000000000;;",
+        "dialog;1/1/1000000000/1000000000;;104",
+        "menu;0/0/1000000000/1000000000;b,lw=1000000000;104",
+    ] {
+        render_in_a_plugin_grid(payload);
+    }
+    // while a component that fits the pane is not moved
+    let grid = render_in_a_plugin_grid("text;3/2/20/1;104,105");
+    assert!(viewport_texts(&grid)[2].starts_with("   hi"));
 }
