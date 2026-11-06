@@ -17,7 +17,7 @@ use zellij_utils::{
     errors::prelude::*,
     input::command::{RunCommand, TerminalAction},
     ipc::{
-        ClientToServerMsg, ExitReason, IpcReceiverWithContext, IpcSenderWithContext,
+        ClientToServerMsg, ExitReason, IpcReceiverWithContext, IpcSenderWithContext, IpcStream,
         ServerToClientMsg,
     },
     shared::default_palette,
@@ -31,9 +31,11 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::RecvTimeoutError,
         Arc, Mutex,
     },
+    time::Duration,
 };
 
 pub use async_trait::async_trait;
@@ -458,10 +460,24 @@ impl ClientBufferReceiver {
     }
 }
 
-#[derive(Clone)]
+/// How long the writer of a removed client gets to flush what is already
+/// queued for it, such as the exit notice the server sends right before
+/// removing the client. If it is still stuck in a socket write after
+/// that, its queue is dropped and the socket shut down.
+const REMOVED_CLIENT_FLUSH_GRACE: Duration = Duration::from_secs(2);
+/// How long, after the socket was shut down, the writer gets to notice and
+/// exit before the removal gives up waiting for it.
+const REMOVED_CLIENT_WRITER_EXIT_GRACE: Duration = Duration::from_secs(5);
+
 struct ClientSender {
     client_id: ClientId,
     client_buffer_sender: ClientBuffer,
+    // Dropped by the writer thread when it exits.
+    writer_done: std::sync::mpsc::Receiver<()>,
+    // Set to make the writer drop whatever is still queued.
+    abandon_queue: Arc<AtomicBool>,
+    // Another handle to the client's socket, to unblock a stuck write.
+    shutdown_handle: Option<Box<dyn IpcStream>>,
 }
 
 impl ClientSender {
@@ -478,17 +494,34 @@ impl ClientSender {
         // (by OOM-killers or some other mechanism) just because a single client doesn't respond.
         let (client_buffer_sender, client_buffer_receiver) =
             client_buffer(CLIENT_BUFFER_LIMIT, CLIENT_BUFFER_BYTE_LIMIT);
+        let (writer_done_sender, writer_done) = std::sync::mpsc::channel::<()>();
+        let abandon_queue = Arc::new(AtomicBool::new(false));
+        let shutdown_handle = sender.try_clone_stream().ok();
+        let writer_abandon_queue = abandon_queue.clone();
         std::thread::spawn(move || {
+            let _writer_done_sender = writer_done_sender;
             let err_context = || format!("failed to send message to client {client_id}");
             let mut stream_failed = false;
             while let Some(msg) = client_buffer_receiver.recv() {
+                if writer_abandon_queue.load(Ordering::Acquire) {
+                    // The client was removed while this writer was stuck;
+                    // drop the queue instead of sending it to a socket
+                    // that nobody is reading.
+                    break;
+                }
                 if let Err(error) = sender.send_server_msg(msg).with_context(err_context) {
-                    log::error!("{:?}; stopping client writer", error);
+                    if writer_abandon_queue.load(Ordering::Acquire) {
+                        log::warn!(
+                            "abandoned the queue of removed client {client_id} that was not reading"
+                        );
+                    } else {
+                        log::error!("{:?}; stopping client writer", error);
+                    }
                     stream_failed = true;
                     break;
                 }
             }
-            if !stream_failed {
+            if !stream_failed && !writer_abandon_queue.load(Ordering::Acquire) {
                 let _ = sender.send_server_msg(ServerToClientMsg::Exit {
                     exit_reason: ExitReason::Disconnect,
                 });
@@ -497,7 +530,58 @@ impl ClientSender {
         ClientSender {
             client_id,
             client_buffer_sender,
+            writer_done,
+            abandon_queue,
+            shutdown_handle,
         }
+    }
+    /// Called when the client is removed. The writer keeps flushing what is
+    /// already queued, so that a final message sent just before the removal
+    /// still goes out. If it has not finished within `grace` it is stuck
+    /// writing to a client that is not reading: have it drop its queue and
+    /// shut the socket down to fail the write it is blocked in. The
+    /// returned handle finishes once the writer is done, or once it is
+    /// given up on, and yields whether the writer actually exited.
+    ///
+    /// Platform note: shutting the socket down is what unblocks a stuck
+    /// write, and `IpcStream::shutdown_stream` does that on Unix only. On
+    /// Windows it is a no-op, so a writer blocked in a write to a named pipe
+    /// whose peer is not reading is released only when the peer reads or
+    /// the pipe closes; `abandon_queue` is checked between writes, which a
+    /// blocked write never reaches. The retained memory is still bounded by
+    /// the client queue caps, and the handle then yields `false`.
+    fn remove(self, grace: Duration) -> std::thread::JoinHandle<bool> {
+        let ClientSender {
+            client_id,
+            client_buffer_sender,
+            writer_done,
+            abandon_queue,
+            shutdown_handle,
+        } = self;
+        // With the sending half gone, the writer ends once the queue is empty.
+        drop(client_buffer_sender);
+        std::thread::spawn(move || {
+            // Nothing is ever sent: this returns once the writer drops its half.
+            match writer_done.recv_timeout(grace) {
+                Err(RecvTimeoutError::Timeout) => {},
+                _ => return true,
+            }
+            log::warn!("client {client_id} was removed while not reading; dropping its queue");
+            abandon_queue.store(true, Ordering::Release);
+            if let Some(Err(error)) = shutdown_handle.map(|handle| handle.shutdown_stream()) {
+                log::error!("failed to shut down the socket of client {client_id}: {error}");
+            }
+            match writer_done.recv_timeout(REMOVED_CLIENT_WRITER_EXIT_GRACE) {
+                Err(RecvTimeoutError::Timeout) => {
+                    log::warn!(
+                        "the writer of removed client {client_id} is still blocked in a write; \
+                         it exits when the client reads or closes its end"
+                    );
+                    false
+                },
+                _ => true,
+            }
+        })
     }
     pub fn send_or_buffer(&self, msg: ServerToClientMsg) -> Result<()> {
         let err_context = || {
@@ -631,6 +715,23 @@ pub trait ServerOsApi: Send + Sync {
     fn apply_cached_resizes(&mut self) {}
 }
 
+impl ServerOsInputOutput {
+    fn replace_client_sender(&self, client_id: ClientId, sender: ClientSender) -> Result<()> {
+        let previous = self
+            .client_senders
+            .lock()
+            .to_anyhow()
+            .with_context(|| format!("failed to create new client {client_id}"))?
+            .insert(client_id, sender);
+        if let Some(previous) = previous {
+            // A new connection under the same id must not leave the old
+            // writer behind.
+            previous.remove(REMOVED_CLIENT_FLUSH_GRACE);
+        }
+        Ok(())
+    }
+}
+
 impl ServerOsApi for ServerOsInputOutput {
     fn set_terminal_size_using_terminal_id(
         &self,
@@ -720,12 +821,7 @@ impl ServerOsApi for ServerOsInputOutput {
         receiver: &IpcReceiverWithContext<ClientToServerMsg>,
     ) -> Result<()> {
         let sender = ClientSender::new(client_id, receiver.get_sender());
-        self.client_senders
-            .lock()
-            .to_anyhow()
-            .with_context(|| format!("failed to create new client {client_id}"))?
-            .insert(client_id, sender);
-        Ok(())
+        self.replace_client_sender(client_id, sender)
     }
 
     fn register_client_with_reply(
@@ -734,12 +830,7 @@ impl ServerOsApi for ServerOsInputOutput {
         reply_stream: LocalSocketStream,
     ) -> Result<()> {
         let sender = ClientSender::new(client_id, IpcSenderWithContext::new(reply_stream));
-        self.client_senders
-            .lock()
-            .to_anyhow()
-            .with_context(|| format!("failed to create new client {client_id}"))?
-            .insert(client_id, sender);
-        Ok(())
+        self.replace_client_sender(client_id, sender)
     }
 
     fn remove_client(&mut self, client_id: ClientId) -> Result<()> {
@@ -748,8 +839,8 @@ impl ServerOsApi for ServerOsInputOutput {
             .lock()
             .to_anyhow()
             .with_context(|| format!("failed to remove client {client_id}"))?;
-        if client_senders.contains_key(&client_id) {
-            client_senders.remove(&client_id);
+        if let Some(sender) = client_senders.remove(&client_id) {
+            sender.remove(REMOVED_CLIENT_FLUSH_GRACE);
         }
         Ok(())
     }

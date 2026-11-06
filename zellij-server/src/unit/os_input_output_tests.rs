@@ -456,6 +456,172 @@ fn the_pane_environment_is_added_to_and_removed_from_the_child_environment() {
     assert!(std::env::var("ZELLIJ_PANE_ENV_TEST").is_err());
 }
 
+// --- Client writer ---
+
+#[cfg(unix)]
+mod client_writer {
+    use super::*;
+    use interprocess::os::unix::uds_local_socket::Stream as UdsStream;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    fn local_socket(stream: UnixStream) -> LocalSocketStream {
+        LocalSocketStream::UdSocket(UdsStream::from(stream))
+    }
+
+    /// A server side sender and the raw socket of the client at the other end.
+    fn connected_pair() -> (IpcSenderWithContext<ServerToClientMsg>, UnixStream) {
+        let (server_end, client_end) = UnixStream::pair().unwrap();
+        (
+            IpcSenderWithContext::new(local_socket(server_end)),
+            client_end,
+        )
+    }
+
+    fn big_message() -> ServerToClientMsg {
+        ServerToClientMsg::RenderFrame {
+            frame: vec![7u8; 64 * 1024],
+        }
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Without reading anything: once the server shut its end down, writing
+    /// to it fails. Merely abandoning the queue would not show here before
+    /// the client reads, since the writer is stuck holding the socket.
+    fn assert_socket_was_shut_down_by_server(client_end: &mut UnixStream) {
+        use std::io::{ErrorKind, Write};
+        client_end.set_nonblocking(true).unwrap();
+        wait_until("the server to shut the socket down", || {
+            matches!(
+                client_end.write(&[0u8]),
+                Err(error) if matches!(
+                    error.kind(),
+                    ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                )
+            )
+        });
+        client_end.set_nonblocking(false).unwrap();
+    }
+
+    /// Reads until the end of the stream, returning how many bytes arrived.
+    fn read_to_end_of_stream(client_end: &mut UnixStream, timeout: Duration) -> usize {
+        client_end.set_read_timeout(Some(timeout)).unwrap();
+        let mut received = 0;
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            match client_end.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => received += read,
+                // A reset also ends the stream.
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Err(error) => panic!("the client never reached the end of its stream: {error}"),
+            }
+        }
+        received
+    }
+
+    #[test]
+    fn removing_a_client_that_is_not_reading_stops_its_writer_and_drops_its_queue() {
+        let (sender, mut client_end) = connected_pair();
+        let client_sender = ClientSender::new(1, sender);
+        // Far more than the socket buffers hold, so the writer ends up
+        // blocked in a write while the rest of the messages sit in its queue.
+        let queued_messages = 300;
+        for _ in 0..queued_messages {
+            client_sender.send_or_buffer(big_message()).unwrap();
+        }
+
+        let removal = client_sender.remove(Duration::from_millis(200));
+
+        // The client has not read a byte. The writer is blocked in a write
+        // to it and can only get out because the socket is shut down.
+        assert!(
+            removal.join().unwrap(),
+            "the writer of a removed client that is not reading never exited"
+        );
+        assert_socket_was_shut_down_by_server(&mut client_end);
+        // The socket was shut down, so the client reaches the end of the
+        // stream. What it can read is only what fitted in the socket
+        // buffers, not the whole queue.
+        let received = read_to_end_of_stream(&mut client_end, Duration::from_secs(5));
+        assert!(
+            received < queued_messages * 64 * 1024 / 2,
+            "the queue of the removed client was still written to it ({received} bytes)"
+        );
+    }
+
+    #[test]
+    fn exit_notice_sent_just_before_removing_a_client_is_delivered() {
+        let (sender, client_end) = connected_pair();
+        let client_sender = ClientSender::new(1, sender);
+        client_sender
+            .send_or_buffer(ServerToClientMsg::Render {
+                content: "last frame".to_owned(),
+            })
+            .unwrap();
+        client_sender
+            .send_or_buffer(ServerToClientMsg::Exit {
+                exit_reason: ExitReason::Normal,
+            })
+            .unwrap();
+        // The client has not read anything yet when the server removes it.
+        let removal = client_sender.remove(Duration::from_secs(5));
+
+        let mut receiver =
+            IpcReceiverWithContext::<ServerToClientMsg>::new(local_socket(client_end));
+        let mut received = Vec::new();
+        while let Some((msg, _)) = receiver.recv_server_msg() {
+            received.push(msg);
+        }
+        removal.join().unwrap();
+
+        assert!(
+            matches!(
+                received.as_slice(),
+                [
+                    ServerToClientMsg::Render { .. },
+                    ServerToClientMsg::Exit {
+                        exit_reason: ExitReason::Normal
+                    },
+                    ..
+                ]
+            ),
+            "the frame and the exit notice queued before the removal must reach the client, got {} messages",
+            received.len()
+        );
+    }
+
+    #[test]
+    fn remove_client_stops_the_writer_of_a_client_that_is_not_reading() {
+        let mut server = make_server();
+        let (server_end, mut client_end) = UnixStream::pair().unwrap();
+        server
+            .register_client_with_reply(1, local_socket(server_end))
+            .unwrap();
+        let queued_messages = 300;
+        for _ in 0..queued_messages {
+            server.send_to_client(1, big_message()).unwrap();
+        }
+
+        server.remove_client(1).unwrap();
+
+        // The client still does not read. Once the grace period for
+        // flushing is over the queue is dropped and the socket shut down.
+        std::thread::sleep(REMOVED_CLIENT_FLUSH_GRACE + Duration::from_secs(1));
+        assert_socket_was_shut_down_by_server(&mut client_end);
+        let received = read_to_end_of_stream(&mut client_end, Duration::from_secs(5));
+        assert!(received < queued_messages * 64 * 1024 / 2);
+    }
+}
+
 // --- Client byte budget accounting ---
 
 mod payload_accounting {
