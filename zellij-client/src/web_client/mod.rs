@@ -194,6 +194,8 @@ pub fn start_web_client(
     ));
 }
 
+const UNATTACHED_CLIENT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Upper bound for the body of any http request to the web server.
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
 
@@ -247,6 +249,25 @@ pub async fn serve_web_client(
                 web_server_port,
             )
             .await;
+        }
+    });
+
+    // client ids that were handed out but never used would otherwise sit in the
+    // table until the next request for a new one comes in
+    tokio::spawn({
+        let connection_table = connection_table.clone();
+        async move {
+            let mut interval = tokio::time::interval(UNATTACHED_CLIENT_SWEEP_INTERVAL);
+            loop {
+                interval.tick().await;
+                let expired = connection_table
+                    .lock()
+                    .unwrap()
+                    .remove_expired_unattached_clients(std::time::Instant::now());
+                if expired > 0 {
+                    log::debug!("Forgot {} web client ids that never connected", expired);
+                }
+            }
         }
     });
 

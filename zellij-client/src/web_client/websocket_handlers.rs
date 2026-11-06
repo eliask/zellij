@@ -4,6 +4,7 @@ use crate::web_client::client_channel::{
     KEEPALIVE_CHANNEL_MAX_BYTES, KEEPALIVE_CHANNEL_MAX_MESSAGES, OUTPUT_CHANNEL_MAX_BYTES,
     OUTPUT_CHANNEL_MAX_MESSAGES,
 };
+use crate::web_client::connection_manager::TerminalAttachOutcome;
 use crate::web_client::control_message::{
     TerminalMetricsPayload, WebClientToWebServerControlMessage,
     WebClientToWebServerControlMessagePayload,
@@ -39,6 +40,44 @@ use zellij_utils::{
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long a connection that we decided to close (a client that does not
+/// keep up, one that was kicked, a control websocket superseded by a newer
+/// one) is given to complete the close handshake. A peer that ignores the
+/// Close frame, and keeps sending pongs so that it looks alive, is cut off
+/// when this runs out.
+#[cfg(not(test))]
+const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Tracks a connection that was told (through its cancellation token) to wind
+/// down and now has `CLOSE_HANDSHAKE_TIMEOUT` to do so.
+struct CloseGrace {
+    deadline: Option<Instant>,
+}
+
+impl CloseGrace {
+    fn new() -> Self {
+        CloseGrace { deadline: None }
+    }
+
+    fn started(&self) -> bool {
+        self.deadline.is_some()
+    }
+
+    fn start(&mut self) {
+        self.deadline = Some(Instant::now() + CLOSE_HANDSHAKE_TIMEOUT);
+    }
+
+    /// Completes once the grace period is over; never before it was started.
+    async fn expired(&self) {
+        match self.deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    }
+}
 
 /// The largest message (and frame) a client may send us over a websocket.
 /// Keystrokes, mouse events and control messages are tiny; the biggest thing a
@@ -144,6 +183,8 @@ enum TerminalSocketEvent {
     FinalizeIdle,
     Heartbeat(HeartbeatTick),
     SessionRecheck,
+    Cancelled,
+    CloseHandshakeTimedOut,
 }
 
 pub async fn ws_handler_control(
@@ -209,14 +250,33 @@ async fn handle_ws_control(
     send_control_messages_to_client(control_channel_rx, control_socket_tx);
     let heartbeat_tx = control_channel_tx.clone();
 
-    state
+    // Cancelled when the client is dropped (say, for not keeping up) or when a
+    // newer control websocket takes over this client id.
+    let cancellation_token = CancellationToken::new();
+    let registered = state
         .connection_table
         .lock()
         .unwrap()
-        .add_client_control_tx(&web_client_id, control_channel_tx);
+        .add_client_control_tx(
+            &web_client_id,
+            control_channel_tx,
+            cancellation_token.clone(),
+        );
+    if !registered {
+        log::warn!(
+            "Control WebSocket for unknown web_client_id {}, closing it",
+            web_client_id
+        );
+        let _ = heartbeat_tx.try_send(Message::Close(Some(CloseFrame {
+            code: close_code::POLICY,
+            reason: "Unknown client".into(),
+        })));
+        return;
+    }
 
     let mut heartbeat = Heartbeat::new(PING_INTERVAL, PONG_TIMEOUT);
     let mut session_watch = SessionWatch::new(session_token_hash.0);
+    let mut close_grace = CloseGrace::new();
 
     let send_message_to_server = |deserialized_msg: WebClientToWebServerControlMessage| {
         let (client_os_api, is_structured) = {
@@ -279,6 +339,21 @@ async fn handle_ws_control(
                 }
                 continue;
             },
+            _ = cancellation_token.cancelled(), if !close_grace.started() => {
+                let _ = heartbeat_tx.try_send(Message::Close(Some(CloseFrame {
+                    code: close_code::NORMAL,
+                    reason: "Connection closed".into(),
+                })));
+                close_grace.start();
+                continue;
+            },
+            _ = close_grace.expired() => {
+                log::info!(
+                    "Control WebSocket for web_client_id {} did not complete the close handshake, dropping it",
+                    web_client_id
+                );
+                break;
+            },
             _ = session_watch.tick() => {
                 if !session_watch.is_still_valid().await {
                     log::info!(
@@ -333,7 +408,7 @@ async fn handle_ws_control(
 }
 
 async fn handle_ws_terminal(
-    socket: WebSocket,
+    mut socket: WebSocket,
     session_name: Option<AxumPath<String>>,
     params: TerminalParams,
     state: AppState,
@@ -370,26 +445,48 @@ async fn handle_ws_terminal(
         return;
     }
 
-    let os_input = {
-        let mut connection_table = state.connection_table.lock().unwrap();
-        connection_table.declare_client_structured(&web_client_id, is_structured_client);
-        connection_table.get_client_os_api(&web_client_id).cloned()
-    };
-    let Some(os_input) = os_input else {
-        log::error!("Unknown web_client_id: {}", web_client_id);
-        return;
-    };
-
-    let (client_terminal_channel_tx, mut client_terminal_channel_rx) = socket.split();
     let (stdout_channel_tx, stdout_channel_rx) =
         client_channel(OUTPUT_CHANNEL_MAX_MESSAGES, OUTPUT_CHANNEL_MAX_BYTES);
     let (terminal_frame_tx, terminal_frame_rx) =
         client_channel(KEEPALIVE_CHANNEL_MAX_MESSAGES, KEEPALIVE_CHANNEL_MAX_BYTES);
-    state
-        .connection_table
-        .lock()
-        .unwrap()
-        .add_client_terminal_tx(&web_client_id, stdout_channel_tx);
+    // One terminal websocket (and one session connection with the thread
+    // listening to it) per client id: claim the id before starting anything.
+    let attached = state.connection_table.lock().unwrap().attach_terminal(
+        &web_client_id,
+        is_structured_client,
+        stdout_channel_tx,
+    );
+    let os_input = match attached {
+        TerminalAttachOutcome::Attached(os_input) => os_input,
+        TerminalAttachOutcome::UnknownClient => {
+            log::error!("Unknown web_client_id: {}", web_client_id);
+            return;
+        },
+        TerminalAttachOutcome::AlreadyAttached => {
+            // The session connection of an id is bound to its first terminal
+            // websocket, and ends together with it, so a second one cannot
+            // take over. Refuse it, and drop the first (which may well be a
+            // half-dead connection the client is replacing) rather than wait
+            // for it to time out: the client starts over with a new id.
+            log::warn!(
+                "Terminal WebSocket for web_client_id {} that already has one, dropping both",
+                web_client_id
+            );
+            state
+                .connection_table
+                .lock()
+                .unwrap()
+                .remove_client(&web_client_id);
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: close_code::POLICY,
+                    reason: "Client already connected".into(),
+                })))
+                .await;
+            return;
+        },
+    };
+    let (client_terminal_channel_tx, mut client_terminal_channel_rx) = socket.split();
 
     let (attachment_complete_tx, attachment_complete_rx) = tokio::sync::oneshot::channel();
 
@@ -429,7 +526,7 @@ async fn handle_ws_terminal(
         .unwrap()
         .add_client_terminal_channel_cancellation_token(
             &web_client_id,
-            terminal_channel_cancellation_token,
+            terminal_channel_cancellation_token.clone(),
         );
 
     let explicitly_disable_kitty_keyboard_protocol = state
@@ -450,6 +547,7 @@ async fn handle_ws_terminal(
     let finalize_idle = std::time::Duration::from_millis(50);
     let mut heartbeat = Heartbeat::new(PING_INTERVAL, PONG_TIMEOUT);
     let mut session_watch = SessionWatch::new(session_token_hash.0.clone());
+    let mut close_grace = CloseGrace::new();
     loop {
         // When termwiz is holding ambiguous-but-complete events from
         // the previous frame, race the next frame against an idle
@@ -465,6 +563,13 @@ async fn handle_ws_terminal(
             },
             tick = heartbeat.tick() => TerminalSocketEvent::Heartbeat(tick),
             _ = session_watch.tick() => TerminalSocketEvent::SessionRecheck,
+            // the client was dropped (it did not keep up, it was kicked, ...):
+            // its writer is sending the Close frame, give the peer a moment to
+            // answer and then stop reading from it whatever it does
+            _ = terminal_channel_cancellation_token.cancelled(), if !close_grace.started() => {
+                TerminalSocketEvent::Cancelled
+            },
+            _ = close_grace.expired() => TerminalSocketEvent::CloseHandshakeTimedOut,
         };
         let msg = match event {
             TerminalSocketEvent::Frame(m) => m,
@@ -483,6 +588,17 @@ async fn handle_ws_terminal(
                     .lock()
                     .unwrap()
                     .remove_client(&web_client_id);
+                break;
+            },
+            TerminalSocketEvent::Cancelled => {
+                close_grace.start();
+                continue;
+            },
+            TerminalSocketEvent::CloseHandshakeTimedOut => {
+                log::info!(
+                    "Terminal WebSocket for web_client_id {} did not complete the close handshake, dropping it",
+                    web_client_id
+                );
                 break;
             },
             TerminalSocketEvent::SessionRecheck => {
