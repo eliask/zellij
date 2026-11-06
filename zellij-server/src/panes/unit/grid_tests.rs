@@ -11920,3 +11920,278 @@ fn a_scroll_region_below_the_screen_cannot_make_scrolling_grow_the_viewport() {
         }
     }
 }
+
+fn plugin_grid(rows: usize, cols: usize) -> Grid {
+    let mut grid = create_grid_with_size_and_raw(rows, cols, b"");
+    grid.enable_ui_components();
+    grid
+}
+
+fn ui_component_stress_payloads() -> Vec<String> {
+    let max = usize::MAX.to_string();
+    let coordinates = [
+        String::new(),
+        "0/0/0/0".to_owned(),
+        "0/0/1/1".to_owned(),
+        "0/0/2/2".to_owned(),
+        "0/0/3/1".to_owned(),
+        "5/5/7/3".to_owned(),
+        "0/0/70000/1".to_owned(),
+        "0/0/65536/65536".to_owned(),
+        "1/1/1000000000/1000000000".to_owned(),
+        "99999/99999/99999/99999".to_owned(),
+        "0/0//".to_owned(),
+        "0/0/30/".to_owned(),
+        "0/0//30".to_owned(),
+        format!("0/0/{}/{}", max, max),
+        format!("{}/{}/1/1", max, max),
+        format!("{}/0/{}/1", max, max),
+    ];
+    let long_indentation = "|".repeat(70_000);
+    let long_text = "104,".repeat(70_000);
+    let medium_text = "104,".repeat(300);
+    let simple_bodies: Vec<(&str, Vec<String>)> = vec![
+        (
+            "table",
+            vec![
+                "0;0;1".to_owned(),
+                "0;0;104,105;106".to_owned(),
+                "1;1;104".to_owned(),
+                "2;3;104;105;106;107;108".to_owned(),
+                format!("{};1;104;105", max),
+                format!("1;1;{};104;105;106;107", long_text),
+            ],
+        ),
+        (
+            "text",
+            vec![
+                "104,105".to_owned(),
+                "zd104,105".to_owned(),
+                "z".to_owned(),
+                String::new(),
+                format!("z{}", medium_text),
+            ],
+        ),
+        (
+            "ribbon",
+            vec![
+                "104,105".to_owned(),
+                "x104,105".to_owned(),
+                format!("x{}", medium_text),
+            ],
+        ),
+        (
+            "nested_list",
+            vec![
+                "104".to_owned(),
+                "||104;|104;x104,105".to_owned(),
+                format!("{}104;104,105,106", long_indentation),
+                format!("104;{}", long_text),
+            ],
+        ),
+    ];
+    let states = [
+        String::new(),
+        "f,d,h,o,e,on,r,b,ind,bar,c,nm,ph,err,ab,la,hu,hd,he,bv,lmin,lmax".to_owned(),
+        format!(
+            "nb={m},sel={m},hb={m},bx={m},fr={m},hl={m},above={m},below={m},tot={m},off={m},cur={m},hov={m},lw={m}",
+            m = max
+        ),
+        "nb=3,sel=1,hb=2,bx=1,fr=1,hl=1,above=5,below=7,tot=100,off=50,cur=2,hov=1,lw=3,f,ind,bar,b,c"
+            .to_owned(),
+        "tot=1000000,off=999999,bar,f,above=1,below=1".to_owned(),
+        "lw=1000000000,bx=1000000000,fr=1000000000,nb=1000000000".to_owned(),
+    ];
+    let widget_fields = [
+        String::new(),
+        "104,105".to_owned(),
+        "104,105;106,107;108".to_owned(),
+        "104,105;;;;".to_owned(),
+        "-;m104,105:106/1,2/3;d104;104,105,106,107".to_owned(),
+        format!("{};{};{}", medium_text, medium_text, medium_text),
+        "$$$0$72,105;72,105;72,105".to_owned(),
+    ];
+    let widgets = [
+        "button",
+        "dialog",
+        "dropdown",
+        "menu",
+        "scroll_indicator",
+        "side_menu",
+        "stepper",
+        "text_input",
+        "toggle",
+    ];
+    let mut payloads = vec![];
+    for coordinate in &coordinates {
+        for (name, bodies) in &simple_bodies {
+            for body in bodies {
+                if coordinate.is_empty() {
+                    payloads.push(format!("{};{}", name, body));
+                } else if *name == "table" {
+                    // the table's two counts follow its coordinates
+                    payloads.push(format!("{};{};{}", name, coordinate, body));
+                } else {
+                    payloads.push(format!("{};{};{}", name, coordinate, body));
+                }
+            }
+        }
+        if coordinate.is_empty() {
+            continue; // widgets must have coordinates
+        }
+        for name in widgets {
+            for state in &states {
+                for fields in &widget_fields {
+                    payloads.push(format!("{};{};{};{}", name, coordinate, state, fields));
+                }
+            }
+        }
+    }
+    payloads
+}
+
+#[test]
+fn hostile_ui_component_parameters_neither_panic_nor_overgrow() {
+    let payloads = ui_component_stress_payloads();
+    let mut failures = vec![];
+    for (rows, cols) in [(1, 1), (3, 5), (24, 80)] {
+        for payload in &payloads {
+            let started = std::time::Instant::now();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut grid = plugin_grid(rows, cols);
+                feed_bytes(&mut grid, format!("\x1bPz{}\x1b\\", payload).as_bytes());
+                (grid.viewport.len(), grid.lines_above.len())
+            }));
+            let summary = payload.chars().take(70).collect::<String>();
+            match outcome {
+                Err(_) => failures.push(format!("{}x{} panicked: {}", rows, cols, summary)),
+                Ok((viewport_rows, _)) if viewport_rows > rows => failures.push(format!(
+                    "{}x{} grew the viewport to {}: {}",
+                    rows, cols, viewport_rows, summary
+                )),
+                Ok(_) if started.elapsed() > std::time::Duration::from_secs(3) => {
+                    failures.push(format!(
+                        "{}x{} took {:?}: {}",
+                        rows,
+                        cols,
+                        started.elapsed(),
+                        summary
+                    ))
+                },
+                Ok(_) => {},
+            }
+        }
+    }
+    failures.dedup();
+    assert!(
+        failures.is_empty(),
+        "{} failures, first ones:\n{}",
+        failures.len(),
+        failures
+            .iter()
+            .take(40)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+fn render_in_a_plugin_grid(payload: &str) -> Grid {
+    let mut grid = plugin_grid(10, 40);
+    feed_bytes(&mut grid, format!("\x1bPz{}\x1b\\", payload).as_bytes());
+    assert!(grid.viewport.len() <= 10, "{}", payload);
+    assert!(
+        grid.viewport.iter().all(|row| row.width() <= 40),
+        "{}",
+        payload
+    );
+    grid
+}
+
+#[test]
+fn a_table_without_columns_is_rejected() {
+    // used to divide by zero
+    for payload in ["table;0;0;1", "table;0/0/10/10;0;0;1"] {
+        let grid = render_in_a_plugin_grid(payload);
+        assert!(viewport_texts(&grid).iter().all(|row| row.is_empty()));
+    }
+}
+
+#[test]
+fn a_component_wider_than_a_u16_cannot_panic_in_format() {
+    // used to panic in format!("{:width$}")
+    render_in_a_plugin_grid("text;0/0/70000/1;z");
+    render_in_a_plugin_grid(&format!(
+        "nested_list;{}104;104,105,106",
+        "|".repeat(70_000)
+    ));
+    render_in_a_plugin_grid(&format!("nested_list;{};104,105", "104,".repeat(70_000)));
+}
+
+fn render_quickly_in_a_plugin_grid(payload: &str) -> Grid {
+    let started = std::time::Instant::now();
+    let grid = render_in_a_plugin_grid(payload);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "took {:?}",
+        started.elapsed()
+    );
+    grid
+}
+
+#[test]
+fn a_huge_indentation_is_parsed_quickly() {
+    // the pipes used to be removed one at a time, which moves the rest of the string each time
+    let payload = format!("nested_list;{}104,105", "|".repeat(1_500_000));
+    render_quickly_in_a_plugin_grid(&payload);
+}
+
+#[test]
+fn components_without_a_size_are_not_padded_past_the_pane() {
+    // the size of these comes from their widest item or their number of items: with a wide item
+    // and a lot of others it is their product that gets written (gigabytes for an input of
+    // some hundred kilobytes)
+    let wide_item = "98,".repeat(20_000);
+    let many_items = vec!["97"; 30_000].join(";");
+    for payload in [
+        format!("nested_list;{};{}", wide_item, many_items),
+        format!("nested_list;0/0//;{};{}", wide_item, many_items),
+        format!("table;1;1;{};{}", wide_item, many_items),
+        format!("table;0/0//;1;1;{};{}", wide_item, many_items),
+        format!("table;0/0//;1;1;{};{}", many_items, wide_item),
+        format!("side_menu;0/0//;;{};{}", wide_item, many_items),
+        format!("menu;0/0//;;{};{}", wide_item, many_items),
+        format!("dialog;0/0//;;{};{}", wide_item, many_items),
+        format!("dialog;0/0//;;{}", ";".repeat(300_000)),
+    ] {
+        render_quickly_in_a_plugin_grid(&payload);
+    }
+}
+
+#[test]
+fn a_dialog_is_not_drawn_where_the_pane_has_no_room_for_it() {
+    // the smallest dialog is 8 columns by 4 rows
+    for (rows, columns) in [(3, 40), (10, 7), (1, 1)] {
+        let mut grid = plugin_grid(rows, columns);
+        feed_bytes(&mut grid, b"\x1bPzdialog;0/0//;;104\x1b\\");
+        assert!(viewport_texts(&grid).iter().all(|row| row.is_empty()));
+    }
+    // while it is drawn where there is room, whatever its size (40 columns by 5 rows by default)
+    let grid = render_in_a_plugin_grid("dialog;0/0//;;104");
+    assert!(viewport_texts(&grid)[0].starts_with('╭'));
+}
+
+#[test]
+fn components_are_limited_to_the_pane() {
+    // these used to allocate and loop for a billion rows
+    for payload in [
+        "dialog;0/0/1000000000/1000000000;;",
+        "dialog;1/1/1000000000/1000000000;;104",
+        "menu;0/0/1000000000/1000000000;b,lw=1000000000;104",
+    ] {
+        render_in_a_plugin_grid(payload);
+    }
+    // while a component that fits the pane is not moved
+    let grid = render_in_a_plugin_grid("text;3/2/20/1;104,105");
+    assert!(viewport_texts(&grid)[2].starts_with("   hi"));
+}
