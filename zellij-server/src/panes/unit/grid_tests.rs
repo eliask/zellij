@@ -11610,3 +11610,53 @@ fn erasing_to_line_start_after_restoring_a_cursor_into_the_alternate_screen_does
     feed_bytes(&mut grid, b"\x1b[1J\x1b[2K\x1b[1Kx");
     assert!(grid.viewport.len() <= grid.height);
 }
+
+#[test]
+fn an_invalid_scroll_region_is_ignored() {
+    // top below bottom, top past the screen and a one line region are all invalid
+    for sequence in [
+        &b"\x1b[60000;50r"[..],
+        b"\x1b[5;3r",
+        b"\x1b[4;4r",
+        b"\x1b[25;30r",
+    ] {
+        let mut grid = create_grid_with_size_and_raw(10, 40, b"\x1b[2;8r\x1b[5;9H");
+        let cursor = (grid.cursor.x, grid.cursor.y);
+        feed_bytes(&mut grid, sequence);
+        assert_eq!(grid.scroll_region, (1, 7), "{:?}", sequence);
+        assert_eq!((grid.cursor.x, grid.cursor.y), cursor, "{:?}", sequence);
+    }
+}
+
+#[test]
+fn a_scroll_region_bottom_past_the_screen_is_clamped() {
+    let grid = create_grid_with_size_and_raw(10, 40, b"\x1b[3;60000r");
+    assert_eq!(grid.scroll_region, (2, 9));
+}
+
+#[test]
+fn scroll_region_operations_never_grow_the_viewport_beyond_the_screen() {
+    for region in [&b""[..], b"\x1b[60000;50r", b"\x1b[3;7r", b"\x1b[3;60000r"] {
+        for operation in [
+            &b"\x1b[65535S"[..],
+            b"\x1b[65535T",
+            b"\x1b[65535L",
+            b"\x1b[65535M",
+            b"\x1b[1;1H\x1b[65535L",
+            b"\x1b[5;1H\x1b[65535M",
+            b"\x1b[5;1H\x1b[65535L\x1b[65535S",
+        ] {
+            // a grid that has not drawn anything has a short viewport
+            let mut grid = create_grid_with_size_and_raw(10, 40, b"");
+            feed_bytes(&mut grid, region);
+            feed_bytes(&mut grid, operation);
+            assert!(
+                grid.viewport.len() <= grid.height,
+                "{:?} then {:?} left {} rows",
+                region,
+                operation,
+                grid.viewport.len()
+            );
+        }
+    }
+}

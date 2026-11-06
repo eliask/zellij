@@ -3208,12 +3208,26 @@ impl Grid {
     pub fn show_cursor(&mut self) {
         self.cursor_is_hidden = false;
     }
-    pub fn set_scroll_region(&mut self, top_line_index: usize, bottom_line_index: Option<usize>) {
-        let bottom_line_index = bottom_line_index.unwrap_or(self.height.saturating_sub(1));
+    pub fn set_scroll_region(
+        &mut self,
+        top_line_index: usize,
+        bottom_line_index: Option<usize>,
+    ) -> bool {
+        // like xterm, a bottom margin past the screen is clamped to its last line and a region
+        // that is not at least two lines tall is ignored entirely (including the cursor move)
+        let last_line_index = self.height.saturating_sub(1);
+        let bottom_line_index = std::cmp::min(
+            bottom_line_index.unwrap_or(last_line_index),
+            last_line_index,
+        );
+        if top_line_index >= bottom_line_index {
+            return false;
+        }
         self.scroll_region = (top_line_index, bottom_line_index);
         let mut pad_character = EMPTY_TERMINAL_CHARACTER;
         pad_character.styles = self.cursor.pending_styles.clone();
         self.move_cursor_to(0, 0, pad_character); // DECSTBM moves the cursor to column 1 line 1 of the page
+        true
     }
     pub fn set_scroll_region_to_viewport_size(&mut self) {
         self.scroll_region = (0, self.height.saturating_sub(1));
@@ -6329,11 +6343,9 @@ impl Handler for Grid {
                     .next()
                     .map(|param| param[0] as usize)
                     .filter(|&param| param != 0)
-                    .map(|bottom| {
-                        std::cmp::min(self.height.saturating_sub(1), bottom.saturating_sub(1))
-                    });
-                self.set_scroll_region(top, bottom);
-                if self.erasure_mode {
+                    .map(|bottom| bottom.saturating_sub(1));
+                // an invalid region is ignored and leaves the cursor where it was
+                if self.set_scroll_region(top, bottom) && self.erasure_mode {
                     self.move_cursor_to_line(top, EMPTY_TERMINAL_CHARACTER);
                     self.move_cursor_to_beginning_of_line();
                 }
