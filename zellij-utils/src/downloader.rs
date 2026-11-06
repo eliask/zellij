@@ -1,6 +1,6 @@
-use isahc::http::StatusCode;
+use isahc::http::{header::LOCATION, StatusCode};
 use isahc::prelude::*;
-use isahc::{config::RedirectPolicy, HttpClient, Request};
+use isahc::{config::RedirectPolicy, AsyncBody, HttpClient, Request, Response};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -15,7 +15,14 @@ use url::Url;
 
 const STREAM_BUFFER_SIZE_BYTES: usize = 65535;
 const MAX_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
+/// One deadline covers the whole exchange: connecting, every redirect hop,
+/// response headers and the body. A server that accepts the connection but
+/// never answers is bounded by the same limit as a slow body.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Redirects are followed manually so that every hop is re-validated
+/// against the https-only policy; this bounds how many hops we accept.
+const MAX_REDIRECTS: usize = 10;
 
 #[derive(Error, Debug)]
 pub enum DownloaderError {
@@ -43,6 +50,10 @@ pub enum DownloaderError {
     InsecureUrl(String),
     #[error("Invalid download URL: {0}")]
     InvalidUrl(String),
+    #[error("Server returned a redirect without a usable Location")]
+    InvalidRedirect,
+    #[error("Too many redirects")]
+    TooManyRedirects,
 }
 
 #[derive(Debug, Clone)]
@@ -53,18 +64,27 @@ pub struct Downloader {
     // the HashMap are Arc/Mutexes (Mutexi?) to represent that individual downloads should not
     // happen concurrently
     download_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    deadline: Duration,
+}
+
+/// Automatic redirect following is disabled: the client would otherwise
+/// follow an https URL to plain http (or through a plain-http hop whose
+/// Location an on-path attacker controls) without re-checking the policy.
+fn build_client() -> Option<HttpClient> {
+    HttpClient::builder()
+        .redirect_policy(RedirectPolicy::None)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .ok()
 }
 
 impl Default for Downloader {
     fn default() -> Self {
         Self {
-            client: HttpClient::builder()
-                // TODO: timeout?
-                .redirect_policy(RedirectPolicy::Follow)
-                .build()
-                .ok(),
+            client: build_client(),
             location: PathBuf::from(""),
             download_locks: Default::default(),
+            deadline: DOWNLOAD_TIMEOUT,
         }
     }
 }
@@ -72,13 +92,10 @@ impl Default for Downloader {
 impl Downloader {
     pub fn new(location: PathBuf) -> Self {
         Self {
-            client: HttpClient::builder()
-                // TODO: timeout?
-                .redirect_policy(RedirectPolicy::Follow)
-                .build()
-                .ok(),
+            client: build_client(),
             location,
             download_locks: Default::default(),
+            deadline: DOWNLOAD_TIMEOUT,
         }
     }
 
@@ -110,12 +127,44 @@ impl Downloader {
             return Ok(());
         }
         let file_part_path = self.location.join(format!("{}.part", file_name));
+        match tokio::time::timeout(
+            self.deadline,
+            Self::fetch_to_part_file(client, url, &file_part_path),
+        )
+        .await
+        {
+            Ok(Ok(())) => {},
+            Ok(Err(error)) => {
+                if matches!(error, DownloaderError::TooLarge) {
+                    let _ = tokio::fs::remove_file(&file_part_path).await;
+                }
+                return Err(error);
+            },
+            // A timed-out partial file is kept so that a later attempt can
+            // resume it; its prefix is validated against Content-Range then.
+            Err(_) => return Err(DownloaderError::TimedOut),
+        }
+
+        log::debug!("Download complete: {:?}", file_part_path);
+
+        tokio::fs::rename(file_part_path, file_path)
+            .await
+            .map_err(|e| DownloaderError::Io(e))?;
+
+        Ok(())
+    }
+
+    async fn fetch_to_part_file(
+        client: &HttpClient,
+        url: Url,
+        file_part_path: &PathBuf,
+    ) -> Result<(), DownloaderError> {
         let (mut target, mut file_part_size) = {
             if file_part_path.exists() {
                 let file_part = tokio::fs::OpenOptions::new()
                     .append(true)
                     .write(true)
-                    .open(&file_part_path)
+                    .open(file_part_path)
                     .await
                     .map_err(|e| DownloaderError::Io(e))?;
 
@@ -129,106 +178,89 @@ impl Downloader {
 
                 (file_part, file_part_size)
             } else {
-                let file_part = tokio::fs::File::create(&file_part_path)
+                let file_part = tokio::fs::File::create(file_part_path)
                     .await
                     .map_err(|e| DownloaderError::Io(e))?;
 
                 (file_part, 0)
             }
         };
-        let mut res = send_ranged(client, url.as_str(), file_part_size).await?;
+        let mut res =
+            send_following_redirects(client, &url, (file_part_size > 0).then_some(file_part_size))
+                .await?;
         if file_part_size > 0 && res.status() == StatusCode::RANGE_NOT_SATISFIABLE {
-            // The partial file may already be complete, or longer than the
-            // current artifact. It cannot be verified, so start over rather
-            // than failing every later attempt.
-            target = tokio::fs::File::create(&file_part_path)
+            // The partial file may be complete, stale or longer than the
+            // current artifact. None of that can be verified, so restart
+            // from an empty file rather than failing every later attempt.
+            log::debug!("Resume range not satisfiable; restarting download");
+            target = tokio::fs::File::create(file_part_path)
                 .await
                 .map_err(DownloaderError::Io)?;
             file_part_size = 0;
-            res = send_ranged(client, url.as_str(), 0).await?;
+            res = send_following_redirects(client, &url, None).await?;
         } else if file_part_size > 0
             && res.status() == StatusCode::PARTIAL_CONTENT
             && content_range_start(&res) != Some(file_part_size)
         {
             // The server answered with a different range than requested, so
             // its bytes do not continue the partial file.
-            target = tokio::fs::File::create(&file_part_path)
+            target = tokio::fs::File::create(file_part_path)
                 .await
                 .map_err(DownloaderError::Io)?;
             file_part_size = 0;
-            res = send_ranged(client, url.as_str(), 0).await?;
+            res = send_following_redirects(client, &url, None).await?;
         }
         ensure_success_status(res.status())?;
         if file_part_size > 0 && res.status() != StatusCode::PARTIAL_CONTENT {
             // The server ignored the range and is sending the whole artifact:
             // appending it to the partial file would cache a corrupt plugin.
-            target = tokio::fs::File::create(&file_part_path)
+            target = tokio::fs::File::create(file_part_path)
                 .await
                 .map_err(DownloaderError::Io)?;
+            file_part_size = 0;
         }
         let body = res.body_mut();
         let mut stream = ReaderStream::with_capacity(body.compat(), STREAM_BUFFER_SIZE_BYTES);
         let mut downloaded_bytes =
             usize::try_from(file_part_size).map_err(|_| DownloaderError::TooLarge)?;
-        let download_result = tokio::time::timeout(DOWNLOAD_TIMEOUT, async {
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(DownloaderError::Io)?;
-                downloaded_bytes = checked_download_total(downloaded_bytes, chunk.len())?;
-                target
-                    .write_all(&chunk)
-                    .await
-                    .map_err(DownloaderError::Io)?;
-            }
-            Ok::<(), DownloaderError>(())
-        })
-        .await;
-        match download_result {
-            Ok(Ok(())) => {},
-            Ok(Err(error)) => {
-                if matches!(error, DownloaderError::TooLarge) {
-                    let _ = tokio::fs::remove_file(&file_part_path).await;
-                }
-                return Err(error);
-            },
-            Err(_) => return Err(DownloaderError::TimedOut),
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(DownloaderError::Io)?;
+            downloaded_bytes = checked_download_total(downloaded_bytes, chunk.len())?;
+            target
+                .write_all(&chunk)
+                .await
+                .map_err(DownloaderError::Io)?;
         }
         // Writes to a tokio file complete in the background; flush so a
         // failed final write is reported instead of renaming a short file
         // into the cache.
         target.flush().await.map_err(DownloaderError::Io)?;
-
-        log::debug!("Download complete: {:?}", file_part_path);
-
-        tokio::fs::rename(file_part_path, file_path)
-            .await
-            .map_err(|e| DownloaderError::Io(e))?;
-
         Ok(())
     }
     pub async fn download_without_cache(url: &str) -> Result<String, DownloaderError> {
+        Self::download_without_cache_within(url, DOWNLOAD_TIMEOUT).await
+    }
+
+    async fn download_without_cache_within(
+        url: &str,
+        deadline: Duration,
+    ) -> Result<String, DownloaderError> {
         let url = ensure_allowed_download_url(url)?;
-        let request = Request::get(url.as_str())
-            .header("Content-Type", "application/octet-stream")
-            .body(())?;
-        let client = HttpClient::builder()
-            // TODO: timeout?
-            .redirect_policy(RedirectPolicy::Follow)
-            .build()?;
+        let client = build_client().ok_or(DownloaderError::ClientUnavailable)?;
 
-        let mut res = client.send_async(request).await?;
-        ensure_success_status(res.status())?;
-
-        let mut downloaded_bytes: Vec<u8> = vec![];
-        let body = res.body_mut();
-        let mut stream = ReaderStream::with_capacity(body.compat(), STREAM_BUFFER_SIZE_BYTES);
-        let mut total_bytes = 0usize;
-        tokio::time::timeout(DOWNLOAD_TIMEOUT, async {
+        let downloaded_bytes = tokio::time::timeout(deadline, async {
+            let mut res = send_following_redirects(&client, &url, None).await?;
+            ensure_success_status(res.status())?;
+            let mut downloaded_bytes: Vec<u8> = vec![];
+            let body = res.body_mut();
+            let mut stream = ReaderStream::with_capacity(body.compat(), STREAM_BUFFER_SIZE_BYTES);
+            let mut total_bytes = 0usize;
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(DownloaderError::Io)?;
                 total_bytes = checked_download_total(total_bytes, chunk.len())?;
                 downloaded_bytes.extend_from_slice(&chunk);
             }
-            Ok::<(), DownloaderError>(())
+            Ok::<Vec<u8>, DownloaderError>(downloaded_bytes)
         })
         .await
         .map_err(|_| DownloaderError::TimedOut)??;
@@ -300,16 +332,40 @@ impl Downloader {
     }
 }
 
-async fn send_ranged(
+/// Send a GET, following up to `MAX_REDIRECTS` redirects. Every hop is
+/// resolved against the current URL and re-validated with
+/// `ensure_allowed_download_url` before it is requested.
+async fn send_following_redirects(
     client: &HttpClient,
-    url: &str,
-    start: u64,
-) -> Result<isahc::Response<isahc::AsyncBody>, DownloaderError> {
-    let mut request = Request::get(url).header("Content-Type", "application/octet-stream");
-    if start > 0 {
-        request = request.header("Range", format!("bytes={}-", start));
+    url: &Url,
+    range_start: Option<u64>,
+) -> Result<Response<AsyncBody>, DownloaderError> {
+    let mut current = url.clone();
+    for _ in 0..=MAX_REDIRECTS {
+        let mut request =
+            Request::get(current.as_str()).header("Content-Type", "application/octet-stream");
+        if let Some(start) = range_start {
+            request = request.header("Range", format!("bytes={}-", start));
+        }
+        let res = client.send_async(request.body(())?).await?;
+        if !res.status().is_redirection() {
+            return Ok(res);
+        }
+        let location = res
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok());
+        current = redirect_target(&current, location)?;
     }
-    Ok(client.send_async(request.body(())?).await?)
+    Err(DownloaderError::TooManyRedirects)
+}
+
+fn redirect_target(current: &Url, location: Option<&str>) -> Result<Url, DownloaderError> {
+    let location = location.ok_or(DownloaderError::InvalidRedirect)?;
+    let next = current
+        .join(location)
+        .map_err(|_| DownloaderError::InvalidRedirect)?;
+    ensure_allowed_download_url(next.as_str())
 }
 
 /// The first byte offset of a `Content-Range: bytes START-END/TOTAL` header.
@@ -433,6 +489,7 @@ mod tests {
             client: None,
             location: location.path().to_path_buf(),
             download_locks: Default::default(),
+            deadline: DOWNLOAD_TIMEOUT,
         };
 
         assert!(matches!(
@@ -443,31 +500,236 @@ mod tests {
         ));
     }
 
-    /// Serve one canned response per connection on loopback: the response
-    /// for a request carrying a Range header, or the one without.
-    async fn ranged_server(with_range: &'static str, without_range: &'static str) -> String {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    /// Minimal scripted HTTP/1.1 server on loopback. `respond` maps the
+    /// raw request head to a full raw response (or `None` to hold the
+    /// connection open without answering). Returns the base URL and the
+    /// request heads seen so far.
+    async fn scripted_server(
+        respond: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let respond = Arc::new(respond);
+        let seen_in_server = seen.clone();
         tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
-                let mut head = Vec::new();
-                let mut buf = [0u8; 1024];
-                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match socket.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => head.extend_from_slice(&buf[..n]),
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let respond = respond.clone();
+                let seen = seen_in_server.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
                     }
-                }
-                let ranged = String::from_utf8_lossy(&head)
-                    .to_ascii_lowercase()
-                    .contains("\r\nrange:");
-                let response = if ranged { with_range } else { without_range };
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
+                    let head = String::from_utf8_lossy(&head).into_owned();
+                    seen.lock().unwrap().push(head.clone());
+                    match respond(&head) {
+                        Some(response) => {
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                        },
+                        None => {
+                            // Hold the connection open, never answering.
+                            tokio::time::sleep(Duration::from_secs(3600)).await;
+                        },
+                    }
+                });
             }
         });
-        base
+        (base, seen)
+    }
+
+    fn ok_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn redirect_response(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            location
+        )
+    }
+
+    #[test]
+    fn redirect_targets_are_resolved_and_revalidated() {
+        let current = Url::parse("https://example.com/releases/plugin.wasm").unwrap();
+        assert_eq!(
+            redirect_target(&current, Some("/cdn/plugin.wasm"))
+                .unwrap()
+                .as_str(),
+            "https://example.com/cdn/plugin.wasm"
+        );
+        assert_eq!(
+            redirect_target(&current, Some("https://cdn.example.net/p.wasm"))
+                .unwrap()
+                .as_str(),
+            "https://cdn.example.net/p.wasm"
+        );
+        assert!(matches!(
+            redirect_target(&current, Some("http://example.com/plugin.wasm")),
+            Err(DownloaderError::InsecureUrl(_))
+        ));
+        assert!(matches!(
+            redirect_target(&current, None),
+            Err(DownloaderError::InvalidRedirect)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_insecure_http_is_refused_before_it_is_followed() {
+        let (base, seen) =
+            scripted_server(|_| Some(redirect_response("http://example.com/evil.wasm"))).await;
+        let result = Downloader::download_without_cache(&format!("{}/plugin.wasm", base)).await;
+        assert!(
+            matches!(result, Err(DownloaderError::InsecureUrl(ref u)) if u.starts_with("http://example.com/")),
+            "unexpected result: {:?}",
+            result
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the insecure hop must not be requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_redirects_on_an_allowed_origin_are_followed() {
+        let (base, seen) = scripted_server(|head| {
+            if head.starts_with("GET /final ") {
+                Some(ok_response("plugin bytes"))
+            } else {
+                Some(redirect_response("/final"))
+            }
+        })
+        .await;
+        let body = Downloader::download_without_cache(&format!("{}/start", base))
+            .await
+            .expect("redirected download");
+        assert_eq!(body, "plugin bytes");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_redirected_resume_keeps_its_range() {
+        let (base, seen) = scripted_server(|head| {
+            let ranged = head.to_ascii_lowercase().contains("\r\nrange: bytes=4-");
+            if head.starts_with("GET /final ") && ranged {
+                Some(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-7/8\r\n\
+                     Content-Length: 4\r\nConnection: close\r\n\r\nEBIN"
+                        .to_owned(),
+                )
+            } else if head.starts_with("GET /plugin.wasm ") {
+                Some(redirect_response("/final"))
+            } else {
+                Some("HTTP/1.1 500 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned())
+            }
+        })
+        .await;
+        assert_eq!(download_over_partial(&base, b"WHOL").await, b"WHOLEBIN");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn redirect_chains_are_bounded() {
+        let (base, seen) = scripted_server(|_| Some(redirect_response("/again"))).await;
+        let result = Downloader::download_without_cache(&format!("{}/start", base)).await;
+        assert!(
+            matches!(result, Err(DownloaderError::TooManyRedirects)),
+            "unexpected result: {:?}",
+            result
+        );
+        assert_eq!(seen.lock().unwrap().len(), MAX_REDIRECTS + 1);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_sends_headers_hits_the_deadline() {
+        let (base, _seen) = scripted_server(|_| None).await;
+        let result = Downloader::download_without_cache_within(
+            &format!("{}/plugin.wasm", base),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(DownloaderError::TimedOut)),
+            "unexpected result: {:?}",
+            result
+        );
+
+        let location = tempdir().expect("Failed to create temp directory");
+        let downloader = Downloader {
+            client: build_client(),
+            location: location.path().to_path_buf(),
+            download_locks: Default::default(),
+            deadline: Duration::from_millis(300),
+        };
+        let result = downloader
+            .download(&format!("{}/plugin.wasm", base), Some("plugin.wasm"))
+            .await;
+        assert!(
+            matches!(result, Err(DownloaderError::TimedOut)),
+            "unexpected result: {:?}",
+            result
+        );
+        assert!(!location.path().join("plugin.wasm").exists());
+    }
+
+    #[tokio::test]
+    async fn an_unsatisfiable_resume_restarts_from_an_empty_file() {
+        let (base, seen) = scripted_server(|head| {
+            if head.to_ascii_lowercase().contains("\r\nrange:") {
+                Some(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */5\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned(),
+                )
+            } else {
+                Some(ok_response("fresh"))
+            }
+        })
+        .await;
+        let location = tempdir().expect("Failed to create temp directory");
+        std::fs::write(
+            location.path().join("plugin.wasm.part"),
+            b"stale-and-too-long",
+        )
+        .expect("seed partial file");
+        let downloader = Downloader::new(location.path().to_path_buf());
+        downloader
+            .download(&format!("{}/plugin.wasm", base), Some("plugin.wasm"))
+            .await
+            .expect("restarted download");
+        assert_eq!(
+            std::fs::read(location.path().join("plugin.wasm")).unwrap(),
+            b"fresh"
+        );
+        assert!(!location.path().join("plugin.wasm.part").exists());
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// Serve the same canned response to every request carrying a Range
+    /// header, and another to every request without one.
+    async fn ranged_server(with_range: &'static str, without_range: &'static str) -> String {
+        scripted_server(move |head| {
+            let ranged = head.to_ascii_lowercase().contains("\r\nrange:");
+            Some(if ranged { with_range } else { without_range }.to_owned())
+        })
+        .await
+        .0
     }
 
     async fn download_over_partial(base: &str, partial: &[u8]) -> Vec<u8> {
@@ -486,18 +748,6 @@ mod tests {
         let full = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nWHOLEBIN";
         let base = ranged_server(full, full).await;
         assert_eq!(download_over_partial(&base, b"WHOL").await, b"WHOLEBIN");
-    }
-
-    #[tokio::test]
-    async fn an_unsatisfiable_resume_restarts_from_an_empty_file() {
-        let unsatisfiable = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */8\r\n\
-                             Content-Length: 0\r\nConnection: close\r\n\r\n";
-        let full = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nWHOLEBIN";
-        let base = ranged_server(unsatisfiable, full).await;
-        assert_eq!(
-            download_over_partial(&base, b"WHOLEBIN-and-more").await,
-            b"WHOLEBIN"
-        );
     }
 
     #[tokio::test]
