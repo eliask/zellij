@@ -514,6 +514,9 @@ pub enum ScreenInstruction {
     ), // i32 -> optional exit
     // status
     HoldPane(PaneId, Option<i32>, RunCommand),
+    /// The PTY thread has closed this terminal: no pane will be created for
+    /// it, and events that still arrive for it are dropped.
+    TerminalClosed(u32),
     UpdatePaneName(Vec<u8>, ClientId, Option<NotificationEnd>),
     UndoRenamePane(ClientId, Option<NotificationEnd>),
     NewTab(
@@ -1379,6 +1382,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::ShowPluginCursor(..) => ScreenContext::ShowPluginCursor,
             ScreenInstruction::ClosePane(..) => ScreenContext::ClosePane,
             ScreenInstruction::HoldPane(..) => ScreenContext::HoldPane,
+            ScreenInstruction::TerminalClosed(..) => ScreenContext::TerminalClosed,
             ScreenInstruction::UpdatePaneName(..) => ScreenContext::UpdatePaneName,
             ScreenInstruction::UndoRenamePane(..) => ScreenContext::UndoRenamePane,
             ScreenInstruction::NewTab(..) => ScreenContext::NewTab,
@@ -2222,6 +2226,11 @@ pub(crate) struct Screen {
     last_mobile_state_sent: HashMap<ClientId, MobileStatePayload>,
     pane_output_activity: HashMap<PaneId, Instant>,
     pane_ids_never_created: BTreeSet<PaneId>,
+    /// Recently closed terminals without a pane, whose late output and
+    /// exit events must not be buffered for a pane that will never exist.
+    closed_terminal_ids: HashSet<u32>,
+    /// `closed_terminal_ids` in the order they were closed, oldest first.
+    closed_terminal_order: VecDeque<u32>,
     pane_not_created_reasons: HashMap<PaneId, PaneNotCreatedReason>,
     mobile_web_prefs: HashMap<ClientId, MobileWebPrefs>,
     client_host_focused: HashMap<ClientId, bool>,
@@ -2615,6 +2624,8 @@ impl Screen {
             last_mobile_state_sent: HashMap::new(),
             pane_output_activity: HashMap::new(),
             pane_ids_never_created: BTreeSet::new(),
+            closed_terminal_ids: HashSet::new(),
+            closed_terminal_order: VecDeque::new(),
             pane_not_created_reasons: HashMap::new(),
             mobile_web_prefs: HashMap::new(),
             client_host_focused: HashMap::new(),
@@ -9453,7 +9464,24 @@ impl Screen {
         }
     }
     fn pane_will_never_be_created(&self, pid: &PaneId) -> bool {
-        self.pane_ids_never_created.contains(pid)
+        self.pane_ids_never_created.contains(pid) || self.terminal_was_closed(pid)
+    }
+    fn remember_terminal_closed(&mut self, terminal_id: u32) {
+        if !self.closed_terminal_ids.insert(terminal_id) {
+            return;
+        }
+        self.closed_terminal_order.push_back(terminal_id);
+        while self.closed_terminal_order.len() > MAX_REMEMBERED_CLOSED_TERMINALS {
+            if let Some(oldest) = self.closed_terminal_order.pop_front() {
+                self.closed_terminal_ids.remove(&oldest);
+            }
+        }
+    }
+    fn terminal_was_closed(&self, pid: &PaneId) -> bool {
+        match pid {
+            PaneId::Terminal(terminal_id) => self.closed_terminal_ids.contains(terminal_id),
+            PaneId::Plugin(_) => false,
+        }
     }
     pub fn replace_pane_with_existing_pane(
         &mut self,
@@ -10872,6 +10900,10 @@ fn find_already_running_panes(
 }
 
 const MAX_REMEMBERED_PANES_NEVER_CREATED: usize = 1024;
+/// Late events for a closed terminal arrive within moments of the close
+/// (output already queued, the child's exit), so only recent closes need
+/// to be remembered; terminal ids are never reused.
+const MAX_REMEMBERED_CLOSED_TERMINALS: usize = 1024;
 
 fn mark_action_as_failed(completion: &mut Option<NotificationEnd>, error_message: &str) {
     if let Some(completion) = completion.as_mut() {
@@ -12660,6 +12692,11 @@ pub(crate) fn screen_thread_main(
                             if screen.pane_ids_never_created.remove(&id) {
                                 pending_events_waiting_for_pane.discard(id);
                                 closed_pane_was_never_created = true;
+                            } else if screen.terminal_was_closed(&id) {
+                                // The exit of a child whose terminal was
+                                // already closed (e.g. the user closed the
+                                // pane): it is fully cleaned up.
+                                continue;
                             } else if close_pane_source == ClosePaneSource::ChildExit {
                                 // Replayed once the pane exists, which also
                                 // cleans up its PTY. Cleaning up now would stop
@@ -12728,6 +12765,8 @@ pub(crate) fn screen_thread_main(
                 }
                 if !found && screen.pane_ids_never_created.remove(&id) {
                     pending_events_waiting_for_pane.discard(id);
+                } else if !found && screen.terminal_was_closed(&id) {
+                    // Held after its terminal was closed: nothing to hold.
                 } else if !found {
                     pending_events_waiting_for_pane.push_lifecycle(
                         id,
@@ -12735,6 +12774,13 @@ pub(crate) fn screen_thread_main(
                     );
                 }
                 screen.log_and_report_session_state()?;
+            },
+            ScreenInstruction::TerminalClosed(terminal_id) => {
+                let pid = PaneId::Terminal(terminal_id);
+                if !screen.has_pane_with_pid(&pid) {
+                    screen.remember_terminal_closed(terminal_id);
+                    pending_events_waiting_for_pane.discard(pid);
+                }
             },
             ScreenInstruction::UpdatePaneName(
                 c,

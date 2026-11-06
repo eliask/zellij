@@ -20486,6 +20486,12 @@ fn a_client_following_row_shifts_ends_up_with_the_same_screen_as_a_full_repaint(
 /// Send `close` for a pane that does not exist yet, then create the pane, and
 /// count the PTY cleanups the screen requested for it.
 fn close_then_create_pane_cleanups(close: ScreenInstruction, pid: u32) -> usize {
+    events_then_create_pane_cleanups(vec![close], pid)
+}
+
+/// Send `events` for a pane that does not exist yet, then create the pane,
+/// and count the PTY cleanups the screen requested for it.
+fn events_then_create_pane_cleanups(events: Vec<ScreenInstruction>, pid: u32) -> usize {
     let size = Size {
         cols: 121,
         rows: 20,
@@ -20499,7 +20505,9 @@ fn close_then_create_pane_cleanups(close: ScreenInstruction, pid: u32) -> usize 
         pty_receiver
     );
     let screen_thread = mock_screen.run(None, vec![]);
-    let _ = mock_screen.to_screen.send(close);
+    for event in events {
+        let _ = mock_screen.to_screen.send(event);
+    }
     let _ = mock_screen.to_screen.send(ScreenInstruction::NewPane(
         PaneId::Terminal(pid),
         None,
@@ -20658,4 +20666,44 @@ pub fn a_child_exit_before_its_layout_is_applied_closes_the_pane_once_created() 
         })
         .count();
     assert_eq!(cleanups, 1);
+}
+
+#[test]
+pub fn a_child_exit_after_its_terminal_was_closed_is_dropped() {
+    // Closing a pane kills its child, whose exit then arrives for a pane
+    // that no longer exists. It must be dropped, not buffered for a pane
+    // that will never be created.
+    let cleanups = events_then_create_pane_cleanups(
+        vec![
+            ScreenInstruction::TerminalClosed(7),
+            ScreenInstruction::ClosePane(
+                PaneId::Terminal(7),
+                None,
+                None,
+                Some(0),
+                ClosePaneSource::ChildExit,
+            ),
+        ],
+        7,
+    );
+    assert_eq!(cleanups, 0);
+}
+
+#[test]
+fn closed_terminals_are_forgotten_in_close_order() {
+    // A long-lived first pane closed after many newer ones must still be
+    // remembered: eviction follows close order, not terminal id order.
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, _messages) = create_new_screen_with_message_capture(size);
+    for terminal_id in 1..=super::MAX_REMEMBERED_CLOSED_TERMINALS as u32 {
+        screen.remember_terminal_closed(terminal_id);
+    }
+    screen.remember_terminal_closed(0);
+    assert!(screen.terminal_was_closed(&PaneId::Terminal(0)));
+    assert!(!screen.terminal_was_closed(&PaneId::Terminal(1)));
+    assert!(screen.terminal_was_closed(&PaneId::Terminal(2)));
+    assert_eq!(
+        screen.closed_terminal_ids.len(),
+        super::MAX_REMEMBERED_CLOSED_TERMINALS
+    );
 }
