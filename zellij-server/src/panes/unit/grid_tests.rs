@@ -3935,6 +3935,7 @@ fn table_ui_component() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "table-ui-component";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -3967,6 +3968,7 @@ fn table_ui_component_with_coordinates() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "table-ui-component-with-coordinates";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -3999,6 +4001,7 @@ fn ribbon_ui_component() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "ribbon-ui-component";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -4031,6 +4034,7 @@ fn ribbon_ui_component_with_coordinates() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "ribbon-ui-component-with-coordinates";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -4063,6 +4067,7 @@ fn nested_list_ui_component() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "nested-list-ui-component";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -4095,6 +4100,7 @@ fn nested_list_ui_component_with_coordinates() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "nested-list-ui-component-with-coordinates";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -4127,6 +4133,7 @@ fn text_ui_component() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "text-ui-component";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -4159,6 +4166,7 @@ fn text_ui_component_with_coordinates() {
         osc8_hyperlinks,
         explicitly_disable_kitty_keyboard_protocol,
     );
+    grid.enable_ui_components();
     let fixture_name = "text-ui-component-with-coordinates";
     let content = read_fixture(fixture_name);
     vte_parser.feed(&mut grid, &content);
@@ -6859,6 +6867,7 @@ fn serialize_text_bytes(text: &str) -> String {
 fn render_ui_component(component_name: &str, serialized_params: &str) -> Grid {
     let mut vte_parser = vt_parser::Parser::new();
     let mut grid = new_grid_for_nested_frames();
+    grid.enable_ui_components();
     let dcs = format!("\u{1b}Pz{};{}\u{1b}\\", component_name, serialized_params);
     vte_parser.feed(&mut grid, dcs.as_bytes());
     grid
@@ -9388,6 +9397,7 @@ fn an_oversized_xtgettcap_query_is_discarded_whole() {
 #[test]
 fn unterminated_dcs_payloads_are_bounded() {
     let mut grid = create_grid_with_content("");
+    grid.enable_ui_components();
     let mut vte_parser = vt_parser::Parser::new();
     let chunk = vec![b'a'; 64 * 1024];
     vte_parser.feed(&mut grid, b"\x1bPz");
@@ -11214,6 +11224,7 @@ fn empty_grid(rows: usize, cols: usize, grapheme_mode: bool) -> Grid {
         false,
     );
     grid.set_grapheme_mode_by_default(grapheme_mode);
+    grid.enable_ui_components();
     grid
 }
 
@@ -11795,4 +11806,35 @@ fn a_newline_below_the_scroll_region_on_the_last_line_does_not_add_a_row() {
         assert!(grid.viewport.len() <= grid.height);
     }
     assert_eq!(grid.cursor.y, 9);
+}
+
+const HOSTILE_UI_COMPONENTS: &[&[u8]] = &[
+    b"\x1bPztable;0;0;1\x1b\\",
+    b"\x1bPztext;0/0/70000/1;z\x1b\\",
+    b"\x1bPzdialog;0/0/1000000000/1000000000\x1b\\",
+];
+
+#[test]
+fn ui_component_sequences_are_ignored_in_a_terminal_pane() {
+    // an ordinary grid is what a terminal pane has: the sequence is an unknown DCS
+    let mut grid = new_grid_for_nested_frames();
+    feed_bytes(
+        &mut grid,
+        format!(
+            "\x1bPztext;{}\x1b\\after",
+            serialize_text_bytes("component")
+        )
+        .as_bytes(),
+    );
+    let screen = viewport_texts(&grid).join("\n");
+    assert!(!screen.contains("component"), "{:?}", screen);
+    assert!(screen.contains("after"), "{:?}", screen);
+    assert!(grid.ui_component_bytes.is_none());
+    for hostile in HOSTILE_UI_COMPONENTS {
+        feed_bytes(&mut grid, hostile);
+    }
+    assert!(grid.viewport.len() <= grid.height);
+    // while a grid that shows a plugin renders it
+    let grid = render_ui_component("text", &serialize_text_bytes("component"));
+    assert!(viewport_texts(&grid).join("\n").contains("component"));
 }

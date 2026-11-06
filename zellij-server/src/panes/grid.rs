@@ -1058,6 +1058,9 @@ pub struct Grid {
     pub pending_forwarded_queries: Vec<crate::host_query::HostQuery>,
     pub pending_nested_session_messages: Vec<NestedSessionMessage>,
     ui_component_bytes: Option<Vec<u8>>,
+    // whether `DCS z` (UI components, see crate::ui::components) is honoured: only the output of
+    // plugins is, anything a terminal program prints is untrusted
+    ui_components_enabled: bool,
     nested_frame_bytes: Option<Vec<u8>>,
     xtgettcap_bytes: Option<Vec<u8>>,
     style: Style,
@@ -1449,6 +1452,7 @@ impl Grid {
             pending_forwarded_queries: Vec::new(),
             pending_nested_session_messages: Vec::new(),
             ui_component_bytes: None,
+            ui_components_enabled: false,
             nested_frame_bytes: None,
             xtgettcap_bytes: None,
             style,
@@ -3212,6 +3216,11 @@ impl Grid {
         } else {
             self.cursor.x -= count;
         }
+    }
+    /// Accept Zellij's UI-component DCS sequences (`DCS z`) in this grid's output. Only for
+    /// grids showing a plugin's output; for any other grid they are ignored like unknown DCS.
+    pub fn enable_ui_components(&mut self) {
+        self.ui_components_enabled = true;
     }
     pub fn hide_cursor(&mut self) {
         self.cursor_is_hidden = true;
@@ -5543,7 +5552,7 @@ impl Handler for Grid {
                     params.iter().collect(),
                 );
             }
-        } else if c == 'z' {
+        } else if c == 'z' && self.ui_components_enabled {
             // UI-component (Zellij internal)
             self.ui_component_bytes = Some(vec![]);
         } else if c == 'n'
