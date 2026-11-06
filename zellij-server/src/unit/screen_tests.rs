@@ -16673,7 +16673,11 @@ pub fn a_pane_that_was_not_created_for_an_unknown_reason_is_closed() {
     new_tab(&mut screen, 1, 0);
     let (completion, mut completion_receiver) = completion_and_receiver();
     let mut completion = Some(completion);
-    screen.finish_pane_creation(PaneId::Terminal(5), &mut completion, &mut HashMap::new());
+    screen.finish_pane_creation(
+        PaneId::Terminal(5),
+        &mut completion,
+        &mut Default::default(),
+    );
     drop(completion);
     assert_eq!(
         closed_pane_ids_from(&pty_receiver),
@@ -16701,7 +16705,7 @@ pub fn bookkeeping_for_panes_that_were_not_created_stays_bounded() {
             .pane_not_created_reasons_count(),
         1
     );
-    screen.finish_pane_creation(PaneId::Terminal(1), &mut None, &mut HashMap::new());
+    screen.finish_pane_creation(PaneId::Terminal(1), &mut None, &mut Default::default());
     assert_eq!(
         screen
             .tabs
@@ -20586,4 +20590,72 @@ pub fn an_external_close_for_a_headless_plugin_still_unloads_it() {
         .unwrap()
         .iter()
         .any(|instruction| matches!(instruction, PtyInstruction::ClosePane(PaneId::Plugin(9), _))));
+}
+
+#[test]
+pub fn a_child_exit_before_its_layout_is_applied_closes_the_pane_once_created() {
+    // A layout command can exit before ApplyLayout creates its pane. The
+    // exit must be replayed when the layout creates the pane, so the pane
+    // is closed and its PID is forgotten instead of lingering in the PTY
+    // thread (where a later close could signal a reused PID).
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut mock_screen = MockScreen::new(size);
+    let pty_receiver = mock_screen.pty_receiver.take().unwrap();
+    let received_pty_instructions = Arc::new(Mutex::new(vec![]));
+    let pty_thread = log_actions_in_thread!(
+        received_pty_instructions,
+        PtyInstruction::Exit,
+        pty_receiver
+    );
+    let screen_thread = mock_screen.run(None, vec![]);
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(9),
+        None,
+        None,
+        Some(0),
+        ClosePaneSource::ChildExit,
+    ));
+    let layout = TiledPaneLayout::default();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::NewTab(
+        None,
+        None,
+        Some(layout.clone()),
+        vec![],
+        None,
+        (Some(vec![]), Some(vec![])),
+        None,
+        false,
+        true,
+        (mock_screen.main_client_id, false),
+        None,
+    ));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ApplyLayout(
+        layout,
+        vec![],
+        vec![(9, None)],
+        vec![],
+        HashMap::new(),
+        1,
+        true,
+        (mock_screen.main_client_id, false),
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    mock_screen.teardown(vec![pty_thread, screen_thread]);
+    let cleanups = received_pty_instructions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|instruction| {
+            matches!(
+                instruction,
+                PtyInstruction::ClosePane(PaneId::Terminal(9), _)
+            )
+        })
+        .count();
+    assert_eq!(cleanups, 1);
 }

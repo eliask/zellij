@@ -44,6 +44,7 @@ mod attention;
 mod hidden_bars;
 mod live_view;
 mod mirror;
+mod pending_pane_events;
 mod popups;
 
 use log::{debug, warn};
@@ -9400,27 +9401,16 @@ impl Screen {
         &mut self,
         pid: PaneId,
         completion: &mut Option<NotificationEnd>,
-        pending_events_waiting_for_pane: &mut HashMap<PaneId, Vec<ScreenInstruction>>,
+        pending_events_waiting_for_pane: &mut pending_pane_events::PendingPaneEvents,
     ) {
         if self.has_pane_with_pid(&pid) {
             self.pane_not_created_reasons.remove(&pid);
             for tab in self.tabs.values_mut() {
                 tab.take_pane_not_created_reason(&pid);
             }
-            if let Some(pending_events) = pending_events_waiting_for_pane.remove(&pid) {
-                for event in pending_events {
-                    match event {
-                        ScreenInstruction::PtyBytes(terminal_id, vte_bytes) => {
-                            self.apply_pty_bytes(terminal_id, vte_bytes).non_fatal();
-                        },
-                        event => {
-                            self.bus.senders.send_to_screen(event).non_fatal();
-                        },
-                    }
-                }
-            }
+            self.replay_pending_pane_events(pid, pending_events_waiting_for_pane);
         } else {
-            pending_events_waiting_for_pane.remove(&pid);
+            pending_events_waiting_for_pane.discard(pid);
             let reason = self.take_pane_not_created_reason(&pid);
             reason.mark_completion(completion);
             if reason == PaneNotCreatedReason::Unknown {
@@ -9434,6 +9424,24 @@ impl Screen {
         self.pane_not_created_reasons.clear();
         for tab in self.tabs.values_mut() {
             tab.clear_pane_not_created_reasons();
+        }
+    }
+    /// Replay what arrived for a pane (output, exit, hold) before it existed.
+    /// Every path that creates panes must do this for the panes it created.
+    fn replay_pending_pane_events(
+        &mut self,
+        pid: PaneId,
+        pending_events_waiting_for_pane: &mut pending_pane_events::PendingPaneEvents,
+    ) {
+        for event in pending_events_waiting_for_pane.take(pid) {
+            match event {
+                ScreenInstruction::PtyBytes(terminal_id, vte_bytes) => {
+                    self.apply_pty_bytes(terminal_id, vte_bytes).non_fatal();
+                },
+                event => {
+                    self.bus.senders.send_to_screen(event).non_fatal();
+                },
+            }
         }
     }
     fn remember_pane_never_created(&mut self, pid: PaneId) {
@@ -11100,8 +11108,7 @@ pub(crate) fn screen_thread_main(
                                                                                // tab_index
     let mut pending_events_waiting_for_tab: Vec<ScreenInstruction> = vec![];
     let mut pending_events_waiting_for_client: Vec<ScreenInstruction> = vec![];
-    let mut pending_events_waiting_for_pane: HashMap<PaneId, Vec<ScreenInstruction>> =
-        HashMap::new();
+    let mut pending_events_waiting_for_pane = pending_pane_events::PendingPaneEvents::default();
     let mut plugin_loading_message_cache = HashMap::new();
     let mut keybind_intercepts = HashMap::new();
     loop {
@@ -11126,9 +11133,7 @@ pub(crate) fn screen_thread_main(
                 if let Some(vte_bytes) = screen.apply_pty_bytes(pid, vte_bytes)? {
                     if !screen.pane_will_never_be_created(&PaneId::Terminal(pid)) {
                         pending_events_waiting_for_pane
-                            .entry(PaneId::Terminal(pid))
-                            .or_default()
-                            .push(ScreenInstruction::PtyBytes(pid, vte_bytes));
+                            .push_output(PaneId::Terminal(pid), vte_bytes);
                     }
                 }
             },
@@ -12653,14 +12658,15 @@ pub(crate) fn screen_thread_main(
                         }
                         if !found {
                             if screen.pane_ids_never_created.remove(&id) {
-                                pending_events_waiting_for_pane.remove(&id);
+                                pending_events_waiting_for_pane.discard(id);
                                 closed_pane_was_never_created = true;
                             } else if close_pane_source == ClosePaneSource::ChildExit {
                                 // Replayed once the pane exists, which also
                                 // cleans up its PTY. Cleaning up now would stop
                                 // reading output the command printed before it
                                 // exited.
-                                pending_events_waiting_for_pane.entry(id).or_default().push(
+                                pending_events_waiting_for_pane.push_lifecycle(
+                                    id,
                                     ScreenInstruction::ClosePane(
                                         id,
                                         None,
@@ -12721,12 +12727,12 @@ pub(crate) fn screen_thread_main(
                     screen.attention_pane_exited(id, exit_status);
                 }
                 if !found && screen.pane_ids_never_created.remove(&id) {
-                    pending_events_waiting_for_pane.remove(&id);
+                    pending_events_waiting_for_pane.discard(id);
                 } else if !found {
-                    pending_events_waiting_for_pane
-                        .entry(id)
-                        .or_default()
-                        .push(ScreenInstruction::HoldPane(id, exit_status, run_command));
+                    pending_events_waiting_for_pane.push_lifecycle(
+                        id,
+                        ScreenInstruction::HoldPane(id, exit_status, run_command),
+                    );
                 }
                 screen.log_and_report_session_state()?;
             },
@@ -12947,6 +12953,11 @@ pub(crate) fn screen_thread_main(
                 } else {
                     mark_action_as_failed(&mut completion_tx, "Tab not found");
                 }
+                let new_terminal_ids: Vec<u32> = new_pane_pids
+                    .iter()
+                    .chain(new_floating_pane_pids.iter())
+                    .map(|(terminal_id, _)| *terminal_id)
+                    .collect();
                 screen.apply_layout(
                     layout,
                     floating_panes_layout,
@@ -12959,6 +12970,15 @@ pub(crate) fn screen_thread_main(
                     blocking_terminal,
                 )?;
                 screen.apply_hidden_bars_to_tab(tab_id);
+                // Commands started by the layout may have printed output or
+                // exited before their panes existed.
+                for terminal_id in new_terminal_ids {
+                    let pid = PaneId::Terminal(terminal_id);
+                    if screen.has_pane_with_pid(&pid) {
+                        screen
+                            .replay_pending_pane_events(pid, &mut pending_events_waiting_for_pane);
+                    }
+                }
                 let tab_of_layout = screen.tabs.get(&tab_id);
                 let pane_exists_in_tab = |pane_id: &PaneId| {
                     tab_of_layout
