@@ -6,13 +6,14 @@ use crate::web_client::types::{
 };
 use crate::web_client::utils::get_mime_type;
 use axum::{
-    extract::{Path as AxumPath, Query, State},
+    extract::{ConnectInfo, Path as AxumPath, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
     Json,
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use include_dir;
+use std::net::SocketAddr;
 use uuid::Uuid;
 use zellij_utils::{
     consts::VERSION, sessions::generate_unique_session_name,
@@ -38,15 +39,38 @@ pub async fn serve_html() -> impl IntoResponse {
 
 pub async fn login_handler(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(login_request): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    match create_session_token(
-        &login_request.auth_token,
-        login_request.remember_me.unwrap_or(false),
-    ) {
+    // this endpoint is unauthenticated and every attempt costs a database
+    // lookup, so cap how fast any one address can hammer it
+    let rate_limit_verdict = state.login_rate_limiter.lock().unwrap().check(peer.ip());
+    if let Err(retry_after) = rate_limit_verdict {
+        let retry_after_secs = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after_secs.to_string())],
+            Json(LoginResponse {
+                success: false,
+                message: "Too many login attempts, try again later".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let remember_me = login_request.remember_me.unwrap_or(false);
+    let auth_token = login_request.auth_token;
+    // opening the token database is blocking work
+    let session_token =
+        tokio::task::spawn_blocking(move || create_session_token(&auth_token, remember_me)).await;
+    let session_token = match session_token {
+        Ok(session_token) => session_token,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    match session_token {
         Ok(session_token) => {
             let is_https = state.is_https;
-            let cookie = if login_request.remember_me.unwrap_or(false) {
+            let cookie = if remember_me {
                 // Persistent cookie for remember_me
                 Cookie::build(("session_token", session_token))
                     .http_only(true)

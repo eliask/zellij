@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::os_input_output::ClientOsApi;
 use crate::web_client::control_message::SetConfigPayload;
+use crate::web_client::login_rate_limiter::LoginRateLimiter;
 use crate::web_client::session_management::spawn_new_session;
 use std::path::PathBuf;
 use zellij_utils::{
@@ -226,6 +227,7 @@ pub struct AppState {
     pub client_os_api_factory: Arc<dyn ClientOsApiFactory>,
     pub is_https: bool,
     pub pending_welcome_sessions: PendingWelcomeSessions,
+    pub login_rate_limiter: Arc<Mutex<LoginRateLimiter>>,
 }
 
 #[derive(Serialize)]

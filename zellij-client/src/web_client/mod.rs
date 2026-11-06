@@ -5,6 +5,7 @@ mod connection_manager;
 mod host_query_seed;
 mod http_handlers;
 mod ipc_listener;
+mod login_rate_limiter;
 mod message_handlers;
 mod server_listener;
 mod session_management;
@@ -13,7 +14,7 @@ mod utils;
 mod websocket_handlers;
 
 use std::{
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
     thread,
@@ -48,6 +49,7 @@ use http_handlers::{
     version_handler,
 };
 use ipc_listener::listen_to_web_server_instructions;
+use login_rate_limiter::LoginRateLimiter;
 
 use types::{
     AppState, ClientOsApiFactory, ConnectionTable, RealClientOsApiFactory, RealSessionManager,
@@ -227,6 +229,7 @@ pub async fn serve_web_client(
         client_os_api_factory,
         is_https,
         pending_welcome_sessions: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        login_rate_limiter: Arc::new(Mutex::new(LoginRateLimiter::new())),
     };
 
     tokio::spawn({
@@ -293,7 +296,7 @@ pub async fn serve_web_client(
             };
             let _ = server
                 .handle(server_handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await;
         },
         None => {
@@ -306,7 +309,7 @@ pub async fn serve_web_client(
             };
             let _ = server
                 .handle(server_handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await;
         },
     }
