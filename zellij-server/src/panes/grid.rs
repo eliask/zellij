@@ -7540,7 +7540,25 @@ impl Row {
                 marker.column += column_offset;
                 markers.push(marker);
             }
-            for character in &row.columns {
+            if max_row_length > 0 && row.columns.iter().any(|c| c.width() > max_row_length) {
+                // a character wider than the pane cannot be shown anywhere in it (typing one is
+                // ignored too): replace it with as many blanks as columns it took, rather than
+                // giving it a row wider than the pane. The cells that follow (and the OSC 133
+                // markers, which are positioned in columns) stay where they were.
+                let columns = std::mem::take(&mut row.columns);
+                for character in columns {
+                    let width = character.width();
+                    if width > max_row_length {
+                        for _ in 0..width {
+                            row.columns
+                                .push(TerminalCharacter::new_styled(' ', character.styles.clone()));
+                        }
+                    } else {
+                        row.columns.push(character);
+                    }
+                }
+            }
+            for character in row.columns.iter() {
                 let character_width = character.width();
                 if current_part_width + character_width > max_row_length {
                     if current_part_len > 0 {

@@ -69,8 +69,33 @@ fn a_wide_character_in_a_one_column_row_does_not_create_an_empty_leading_row() {
 
     let rows = Row::rewrap_rows(vec![row_from_str("你")], 1);
 
-    assert_eq!(rows.len(), 1);
-    assert_eq!(row_to_string(&rows[0]), "你");
+    // the character does not fit the row, so it is replaced by a blank for each of its two
+    // columns rather than kept in a wider row
+    assert_eq!(rows.len(), 2);
+    assert_eq!(row_to_string(&rows[0]), " ");
+    assert_eq!(row_to_string(&rows[1]), " ");
+    assert!(rows.iter().all(|row| row.width() <= 1));
+}
+
+#[test]
+fn blanking_a_wide_character_keeps_the_columns_of_the_osc133_markers() {
+    use crate::panes::grid::{Osc133MarkerKind, Row};
+
+    // the marker is at column 3: after the two columns of the wide character and the "X"
+    let mut row = row_from_str("你Xy");
+    row.add_osc133_marker(3, Osc133MarkerKind::Prompt);
+
+    let rows = Row::rewrap_rows(vec![row], 1);
+
+    assert_eq!(rows.len(), 4);
+    let marked: Vec<(usize, usize)> = rows
+        .iter()
+        .enumerate()
+        .flat_map(|(index, row)| row.osc133_markers.iter().map(move |m| (index, m.column)))
+        .collect();
+    // the marker stays right after the "X"
+    assert_eq!(row_to_string(&rows[2]), "X");
+    assert_eq!(marked, vec![(2, 1)]);
 }
 
 #[test]
@@ -11837,4 +11862,32 @@ fn ui_component_sequences_are_ignored_in_a_terminal_pane() {
     // while a grid that shows a plugin renders it
     let grid = render_ui_component("text", &serialize_text_bytes("component"));
     assert!(viewport_texts(&grid).join("\n").contains("component"));
+}
+
+#[test]
+fn no_row_is_wider_than_the_pane_after_it_shrinks_below_a_wide_character() {
+    // U+FF13 is two columns wide
+    let content = "\u{ff13}\r\n\u{ff13}ab\r\n\u{ff13}\r\n\u{ff13}\u{ff13}\u{ff13}\r\n\u{ff13}";
+    let mut grid = create_grid_with_size_and_raw(3, 10, content.as_bytes());
+    grid.change_size(1, 1);
+    let too_wide = |grid: &Grid| {
+        // (the lines above and below the screen are only reflowed as they come into it)
+        grid.viewport
+            .iter()
+            .map(|row| row.width())
+            .filter(|width| *width > 1)
+            .count()
+    };
+    assert_eq!(too_wide(&grid), 0);
+    // reflowing the lines kept above and below the screen into it must not bring any back
+    for _ in 0..20 {
+        grid.scroll_up_one_line();
+        assert_eq!(too_wide(&grid), 0);
+    }
+    for _ in 0..20 {
+        grid.scroll_down_one_line();
+        assert_eq!(too_wide(&grid), 0);
+    }
+    grid.change_size(3, 10);
+    assert!(grid.viewport.iter().all(|row| row.width() <= 10));
 }
