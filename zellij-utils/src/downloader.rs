@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt as _, sync::Mutex};
 use tokio_stream::StreamExt as _;
@@ -20,6 +20,14 @@ const MAX_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
 /// never answers is bounded by the same limit as a slow body.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A transfer that stays below `LOW_SPEED_LIMIT_BYTES_PER_SEC` for this long
+/// is aborted by curl itself. Dropping the future on the tokio deadline does
+/// not stop a completely silent transfer (isahc only notices cancellation
+/// when curl delivers header, body or upload data), so curl needs its own
+/// bound to reap the transfer.
+const LOW_SPEED_TIMEOUT: Duration = Duration::from_secs(30);
+const LOW_SPEED_LIMIT_BYTES_PER_SEC: u32 = 1;
+const CURL_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
 /// Redirects are followed manually so that every hop is re-validated
 /// against the https-only policy; this bounds how many hops we accept.
 const MAX_REDIRECTS: usize = 10;
@@ -71,9 +79,14 @@ pub struct Downloader {
 /// follow an https URL to plain http (or through a plain-http hop whose
 /// Location an on-path attacker controls) without re-checking the policy.
 fn build_client() -> Option<HttpClient> {
+    build_client_with_low_speed_timeout(LOW_SPEED_TIMEOUT)
+}
+
+fn build_client_with_low_speed_timeout(low_speed_timeout: Duration) -> Option<HttpClient> {
     HttpClient::builder()
         .redirect_policy(RedirectPolicy::None)
         .connect_timeout(CONNECT_TIMEOUT)
+        .low_speed_timeout(LOW_SPEED_LIMIT_BYTES_PER_SEC, low_speed_timeout)
         .build()
         .ok()
 }
@@ -127,12 +140,20 @@ impl Downloader {
             return Ok(());
         }
         let file_part_path = self.location.join(format!("{}.part", file_name));
-        match tokio::time::timeout(
+        // Creating the file is not cancellable: it completes before the
+        // deadline starts, so it can never land after the lock is released.
+        let (mut target, file_part_size) = open_part_file(&file_part_path)?;
+        let fetched = tokio::time::timeout(
             self.deadline,
-            Self::fetch_to_part_file(client, url, &file_part_path),
+            Self::fetch_to_part_file(client, url, &mut target, file_part_size, self.deadline),
         )
-        .await
-        {
+        .await;
+        // A write or truncation the deadline cut short may still be running
+        // on the blocking pool after its future was dropped. Wait for it, so
+        // the partial file is complete before the lock is released and a
+        // later attempt reads its size as the resume offset.
+        let _ = target.flush().await;
+        match fetched {
             Ok(Ok(())) => {},
             Ok(Err(error)) => {
                 if matches!(error, DownloaderError::TooLarge) {
@@ -157,66 +178,43 @@ impl Downloader {
     async fn fetch_to_part_file(
         client: &HttpClient,
         url: Url,
-        file_part_path: &PathBuf,
+        target: &mut tokio::fs::File,
+        mut file_part_size: u64,
+        deadline: Duration,
     ) -> Result<(), DownloaderError> {
-        let (mut target, mut file_part_size) = {
-            if file_part_path.exists() {
-                let file_part = tokio::fs::OpenOptions::new()
-                    .append(true)
-                    .write(true)
-                    .open(file_part_path)
-                    .await
-                    .map_err(|e| DownloaderError::Io(e))?;
-
-                let file_part_size = file_part
-                    .metadata()
-                    .await
-                    .map_err(|e| DownloaderError::Io(e))?
-                    .len();
-
-                log::debug!("Resuming download from {} bytes", file_part_size);
-
-                (file_part, file_part_size)
-            } else {
-                let file_part = tokio::fs::File::create(file_part_path)
-                    .await
-                    .map_err(|e| DownloaderError::Io(e))?;
-
-                (file_part, 0)
-            }
-        };
-        let mut res =
-            send_following_redirects(client, &url, (file_part_size > 0).then_some(file_part_size))
-                .await?;
+        let started = Instant::now();
+        let mut res = send_following_redirects(
+            client,
+            &url,
+            (file_part_size > 0).then_some(file_part_size),
+            curl_budget(started, deadline)?,
+        )
+        .await?;
         if file_part_size > 0 && res.status() == StatusCode::RANGE_NOT_SATISFIABLE {
             // The partial file may be complete, stale or longer than the
             // current artifact. None of that can be verified, so restart
             // from an empty file rather than failing every later attempt.
             log::debug!("Resume range not satisfiable; restarting download");
-            target = tokio::fs::File::create(file_part_path)
-                .await
-                .map_err(DownloaderError::Io)?;
+            truncate_part_file(target).await?;
             file_part_size = 0;
-            res = send_following_redirects(client, &url, None).await?;
+            res = send_following_redirects(client, &url, None, curl_budget(started, deadline)?)
+                .await?;
         } else if file_part_size > 0
             && res.status() == StatusCode::PARTIAL_CONTENT
             && content_range_start(&res) != Some(file_part_size)
         {
             // The server answered with a different range than requested, so
             // its bytes do not continue the partial file.
-            target = tokio::fs::File::create(file_part_path)
-                .await
-                .map_err(DownloaderError::Io)?;
+            truncate_part_file(target).await?;
             file_part_size = 0;
-            res = send_following_redirects(client, &url, None).await?;
+            res = send_following_redirects(client, &url, None, curl_budget(started, deadline)?)
+                .await?;
         }
         ensure_artifact_status(res.status(), file_part_size > 0)?;
         if file_part_size > 0 && res.status() != StatusCode::PARTIAL_CONTENT {
             // The server ignored the range and is sending the whole artifact:
             // appending it to the partial file would cache a corrupt plugin.
-            target = tokio::fs::File::create(file_part_path)
-                .await
-                .map_err(DownloaderError::Io)?;
+            truncate_part_file(target).await?;
             file_part_size = 0;
         }
         let body = res.body_mut();
@@ -238,18 +236,22 @@ impl Downloader {
         Ok(())
     }
     pub async fn download_without_cache(url: &str) -> Result<String, DownloaderError> {
-        Self::download_without_cache_within(url, DOWNLOAD_TIMEOUT).await
+        let client = build_client().ok_or(DownloaderError::ClientUnavailable)?;
+        Self::download_without_cache_with(&client, url, DOWNLOAD_TIMEOUT).await
     }
 
-    async fn download_without_cache_within(
+    async fn download_without_cache_with(
+        client: &HttpClient,
         url: &str,
         deadline: Duration,
     ) -> Result<String, DownloaderError> {
         let url = ensure_allowed_download_url(url)?;
-        let client = build_client().ok_or(DownloaderError::ClientUnavailable)?;
 
         let downloaded_bytes = tokio::time::timeout(deadline, async {
-            let mut res = send_following_redirects(&client, &url, None).await?;
+            let started = Instant::now();
+            let mut res =
+                send_following_redirects(client, &url, None, curl_budget(started, deadline)?)
+                    .await?;
             ensure_artifact_status(res.status(), false)?;
             let mut downloaded_bytes: Vec<u8> = vec![];
             let body = res.body_mut();
@@ -291,27 +293,36 @@ impl Downloader {
     /// sensibly be sync. Maybe in the future, when more code around here is async, we can drop
     /// this function.
     pub fn download_without_cache_blocking(url: &str) -> Result<String, DownloaderError> {
-        // The ephemeral runtime must outlive `block_on`, and needs its timer
-        // for the download deadline.
-        let ephemeral_runtime;
-        let runtime_handle = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle.clone(),
+        let client = build_client().ok_or(DownloaderError::ClientUnavailable)?;
+        Self::download_without_cache_blocking_with(&client, url, DOWNLOAD_TIMEOUT)
+    }
+
+    fn download_without_cache_blocking_with(
+        client: &HttpClient,
+        url: &str,
+        deadline: Duration,
+    ) -> Result<String, DownloaderError> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle.block_on(Downloader::download_without_cache_with(
+                client, url, deadline,
+            )),
             Err(e) if e.is_missing_context() => {
-                ephemeral_runtime = tokio::runtime::Builder::new_current_thread()
+                // `Handle::block_on` cannot drive the timer or IO of a
+                // `current_thread` runtime, so the deadline would never fire.
+                // Only `Runtime::block_on` on the runtime itself does.
+                let ephemeral_runtime = tokio::runtime::Builder::new_current_thread()
                     .thread_name("ephemeral runtime for downloader implementation")
                     .enable_all()
                     .build()
                     .map_err(DownloaderError::Io)?;
-                ephemeral_runtime.handle().clone()
+                ephemeral_runtime.block_on(Downloader::download_without_cache_with(
+                    client, url, deadline,
+                ))
             },
-            _ => {
-                return Err(DownloaderError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "failed to spawn runtime for download task",
-                )))
-            },
-        };
-        runtime_handle.block_on(async move { Downloader::download_without_cache(url).await })
+            _ => Err(DownloaderError::Io(std::io::Error::other(
+                "failed to spawn runtime for download task",
+            ))),
+        }
     }
 
     fn parse_name(&self, url: &str) -> Result<String, DownloaderError> {
@@ -335,15 +346,22 @@ impl Downloader {
 /// Send a GET, following up to `MAX_REDIRECTS` redirects. Every hop is
 /// resolved against the current URL and re-validated with
 /// `ensure_allowed_download_url` before it is requested.
+///
+/// `budget` is also handed to curl as the timeout of each request (reduced by
+/// the time already spent), so that the transfer is aborted by curl even when
+/// the future is dropped while the peer is completely silent.
 async fn send_following_redirects(
     client: &HttpClient,
     url: &Url,
     range_start: Option<u64>,
+    budget: Duration,
 ) -> Result<Response<AsyncBody>, DownloaderError> {
+    let started = Instant::now();
     let mut current = url.clone();
     for _ in 0..=MAX_REDIRECTS {
-        let mut request =
-            Request::get(current.as_str()).header("Content-Type", "application/octet-stream");
+        let mut request = Request::get(current.as_str())
+            .timeout(remaining_budget(started, budget)?)
+            .header("Content-Type", "application/octet-stream");
         if let Some(start) = range_start {
             request = request.header("Range", format!("bytes={}-", start));
         }
@@ -358,6 +376,42 @@ async fn send_following_redirects(
         current = redirect_target(&current, location)?;
     }
     Err(DownloaderError::TooManyRedirects)
+}
+
+fn remaining_budget(started: Instant, budget: Duration) -> Result<Duration, DownloaderError> {
+    match budget.checked_sub(started.elapsed()) {
+        Some(remaining) if !remaining.is_zero() => Ok(remaining),
+        _ => Err(DownloaderError::TimedOut),
+    }
+}
+
+/// Time curl itself is given: the remaining deadline plus a grace period, so
+/// the tokio deadline (which reports `TimedOut`) normally fires first and
+/// curl's own timeout only acts as the backstop that reaps the transfer.
+fn curl_budget(started: Instant, deadline: Duration) -> Result<Duration, DownloaderError> {
+    Ok(remaining_budget(started, deadline)? + CURL_TIMEOUT_GRACE)
+}
+
+/// Open (or create) the partial file synchronously, returning it with its
+/// current size. The file is in append mode so that truncating it with
+/// `set_len(0)` later restarts the download without leaving a hole.
+fn open_part_file(path: &PathBuf) -> Result<(tokio::fs::File, u64), DownloaderError> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(DownloaderError::Io)?;
+    let size = file.metadata().map_err(DownloaderError::Io)?.len();
+    if size > 0 {
+        log::debug!("Resuming download from {} bytes", size);
+    }
+    Ok((tokio::fs::File::from_std(file), size))
+}
+
+/// Empty the partial file in place. If the deadline cancels this, the
+/// pending operation is still awaited by the `flush` in `download`.
+async fn truncate_part_file(target: &mut tokio::fs::File) -> Result<(), DownloaderError> {
+    target.set_len(0).await.map_err(DownloaderError::Io)
 }
 
 fn redirect_target(current: &Url, location: Option<&str>) -> Result<Url, DownloaderError> {
@@ -689,7 +743,8 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_never_sends_headers_hits_the_deadline() {
         let (base, _seen) = scripted_server(|_| None).await;
-        let result = Downloader::download_without_cache_within(
+        let result = Downloader::download_without_cache_with(
+            &build_client().unwrap(),
             &format!("{}/plugin.wasm", base),
             Duration::from_millis(300),
         )
@@ -716,6 +771,137 @@ mod tests {
             result
         );
         assert!(!location.path().join("plugin.wasm").exists());
+    }
+
+    /// A raw listener that accepts connections and then says nothing.
+    fn silent_server() -> (String, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("http://{}/layout.kdl", listener.local_addr().unwrap());
+        (url, listener)
+    }
+
+    #[test]
+    fn the_blocking_entry_point_times_out_without_an_ambient_runtime() {
+        // No tokio runtime is ambient on this plain test thread, so the
+        // ephemeral runtime path runs. The server accepts and then stalls.
+        let (url, listener) = silent_server();
+        let _server = std::thread::spawn(move || {
+            let held = listener.accept();
+            std::thread::sleep(Duration::from_secs(5));
+            drop(held);
+        });
+        let client = build_client().unwrap();
+        let started = Instant::now();
+        let result = Downloader::download_without_cache_blocking_with(
+            &client,
+            &url,
+            Duration::from_millis(300),
+        );
+        assert!(
+            matches!(result, Err(DownloaderError::TimedOut)),
+            "unexpected result: {:?}",
+            result
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the deadline did not fire promptly"
+        );
+    }
+
+    #[tokio::test]
+    async fn curl_aborts_a_silent_transfer_on_its_own() {
+        // The future is not wrapped in a tokio deadline here, and the
+        // overall budget is far away: only the low speed limit can end it.
+        let (base, _seen) = scripted_server(|_| None).await;
+        let client = build_client_with_low_speed_timeout(Duration::from_secs(1)).unwrap();
+        let url = Url::parse(&format!("{}/plugin.wasm", base)).unwrap();
+        let started = Instant::now();
+        let result = send_following_redirects(&client, &url, None, Duration::from_secs(600)).await;
+        assert!(
+            matches!(result, Err(DownloaderError::Request(_))),
+            "unexpected result: {:?}",
+            result.map(|r| r.status())
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    #[tokio::test]
+    async fn curl_enforces_the_request_budget_on_its_own() {
+        let (base, _seen) = scripted_server(|_| None).await;
+        let client = build_client().unwrap();
+        let url = Url::parse(&format!("{}/plugin.wasm", base)).unwrap();
+        let started = Instant::now();
+        let result =
+            send_following_redirects(&client, &url, None, Duration::from_millis(300)).await;
+        match result {
+            Err(DownloaderError::Request(error)) => {
+                assert_eq!(error.kind(), isahc::error::ErrorKind::Timeout)
+            },
+            other => panic!("unexpected result: {:?}", other.map(|r| r.status())),
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn the_partial_file_exists_and_is_intact_once_a_timed_out_download_returns() {
+        let (base, _seen) = scripted_server(|_| None).await;
+        for deadline in [Duration::ZERO, Duration::from_millis(200)] {
+            // fresh: the part file was created before the deadline started
+            let location = tempdir().expect("Failed to create temp directory");
+            let downloader = Downloader {
+                client: build_client(),
+                location: location.path().to_path_buf(),
+                download_locks: Default::default(),
+                deadline,
+            };
+            let url = format!("{}/plugin.wasm", base);
+            let result = downloader.download(&url, Some("plugin.wasm")).await;
+            assert!(matches!(result, Err(DownloaderError::TimedOut)));
+            let part = location.path().join("plugin.wasm.part");
+            assert!(
+                part.exists(),
+                "part file must exist as soon as download returns"
+            );
+
+            // resume: the prefix survives a timed out attempt untouched
+            std::fs::write(&part, b"WHOL").unwrap();
+            let result = downloader.download(&url, Some("plugin.wasm")).await;
+            assert!(matches!(result, Err(DownloaderError::TimedOut)));
+            assert_eq!(std::fs::read(&part).unwrap(), b"WHOL");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_restart_leaves_a_complete_truncation_behind() {
+        // The server rejects the range (forcing a restart truncation) and
+        // then stalls. The truncation must be complete when download()
+        // returns, not still pending on the blocking pool.
+        let (base, _seen) = scripted_server(|head| {
+            if head.to_ascii_lowercase().contains("\r\nrange:") {
+                Some(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                        .to_owned(),
+                )
+            } else {
+                None
+            }
+        })
+        .await;
+        let location = tempdir().expect("Failed to create temp directory");
+        let part = location.path().join("plugin.wasm.part");
+        std::fs::write(&part, b"stale-prefix").unwrap();
+        let downloader = Downloader {
+            client: build_client(),
+            location: location.path().to_path_buf(),
+            download_locks: Default::default(),
+            deadline: Duration::from_millis(500),
+        };
+        let result = downloader
+            .download(&format!("{}/plugin.wasm", base), Some("plugin.wasm"))
+            .await;
+        assert!(matches!(result, Err(DownloaderError::TimedOut)));
+        assert_eq!(std::fs::read(&part).unwrap(), b"");
     }
 
     #[tokio::test]
