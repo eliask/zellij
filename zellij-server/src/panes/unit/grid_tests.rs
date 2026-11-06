@@ -11983,6 +11983,44 @@ fn scrollback_cells_follow_a_recount_through_cell_eviction_clears_and_the_altern
     assert_eq!(grid.scrollback_cells, 0);
 }
 
+fn recounted_scrollback_cells(grid: &Grid) -> usize {
+    grid.lines_above
+        .iter()
+        .map(|row| row.stored_cell_count())
+        .sum()
+}
+
+#[test]
+fn scrollback_cell_count_stays_exact_when_reflow_joins_a_wrapped_line_into_the_viewport() {
+    // A long logical line straddles the scrollback/viewport boundary, so
+    // the viewport starts with a continuation row. Every width change
+    // pulls that line's scrollback rows into the viewport to rewrap it;
+    // those rows must be debited from the retained-cell counter, or the
+    // counter only ever grows and scrollback is evicted early.
+    let mut grid = create_grid_with_size_and_raw(4, 20, b"");
+    let mut content: Vec<u8> = Vec::new();
+    for i in 0..30 {
+        content.extend_from_slice(format!("line {i}\r\n").as_bytes());
+    }
+    // 200 columns of text at width 20 wraps onto 10 rows; with 4 viewport
+    // rows the line starts in scrollback and ends in the viewport.
+    content.extend_from_slice("x".repeat(200).as_bytes());
+    feed_bytes(&mut grid, &content);
+    assert!(
+        !grid.viewport[0].is_canonical,
+        "witness setup: the viewport must begin with a continuation row"
+    );
+    assert_eq!(grid.scrollback_cells, recounted_scrollback_cells(&grid));
+    for (round, width) in [17, 23, 11, 29, 20, 13].into_iter().enumerate() {
+        grid.change_size(4, width);
+        assert_eq!(
+            grid.scrollback_cells,
+            recounted_scrollback_cells(&grid),
+            "retained-cell counter drifted after reflow round {round} (width {width})"
+        );
+    }
+}
+
 #[test]
 fn repeated_osc133_markers_on_one_row_are_bounded() {
     // `ESC ] 133 ; D ; 0 BEL` prints nothing and does not move the

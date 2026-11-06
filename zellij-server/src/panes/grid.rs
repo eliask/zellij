@@ -2442,9 +2442,18 @@ impl Grid {
                     && viewport_canonical_lines.is_empty()
                     && !self.lines_above.is_empty()
                 {
-                    let mut first_line_above = Row::from_rows(
-                        get_lines_above_bottom_canonical_row_and_wraps(&mut self.lines_above),
+                    let joined_rows =
+                        get_lines_above_bottom_canonical_row_and_wraps(&mut self.lines_above);
+                    // These rows leave scrollback for the viewport; debit
+                    // them like every other removal path so the cell
+                    // budget does not drift upward across reflows.
+                    self.scrollback_cells = self.scrollback_cells.saturating_sub(
+                        joined_rows
+                            .iter()
+                            .map(|row| row.stored_cell_count())
+                            .sum::<usize>(),
                     );
+                    let mut first_line_above = Row::from_rows(joined_rows);
                     first_line_above.append(&mut row);
                     viewport_canonical_lines.push(first_line_above);
                     cursor_canonical_line_index += 1;
