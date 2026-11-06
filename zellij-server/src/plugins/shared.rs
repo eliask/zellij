@@ -121,7 +121,24 @@ fn set_call_context(
 /// nonterminating callback exhausts it and traps instead of holding
 /// its executor thread forever. Engines without fuel metering (test
 /// fixtures) ignore the refuel.
+///
+/// TODO(plugin-hardening): fuel only meters guest instructions. WASI `poll_oneoff` is capped
+/// separately (see `add_wasi_to_linker`), but other synchronous host functions that can block
+/// for long (reads from slow or special files, for example) still hold the executor thread and
+/// the execution lock without consuming fuel. Bounding them needs a deadline checked by those
+/// host functions, or running guest calls under a watchdog that can abandon the executor.
 pub const PLUGIN_CALLBACK_FUEL_BUDGET: u64 = 1_000_000_000;
+
+/// Whether a callback failed because it ran out of its fuel budget, as opposed to an ordinary
+/// failure. Contexts around the trap do not hide it.
+pub fn is_out_of_fuel(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<wasmi::Error>()
+            .and_then(|error| error.as_trap_code())
+            == Some(wasmi::TrapCode::OutOfFuel)
+    })
+}
 
 pub fn refuel_for_callback<T>(store: &mut wasmi::Store<T>) {
     let _ = store.set_fuel(PLUGIN_CALLBACK_FUEL_BUDGET);
@@ -419,6 +436,7 @@ fn report_instance_error(
     ));
     report_error(
         senders,
+        running_plugin.store.data().plugin_id,
         pane_slot_ids(running_plugin),
         running_plugin.store.data().generation,
         error,
@@ -427,6 +445,7 @@ fn report_instance_error(
 
 fn report_error(
     senders: &ThreadSenders,
+    instance_id: PluginId,
     pane_slots: Vec<PluginId>,
     generation: u64,
     error: anyhow::Error,
@@ -436,6 +455,9 @@ fn report_error(
     for slot_id in pane_slots {
         handle_plugin_crash(slot_id, generation, message.clone(), senders.clone());
     }
+    // The instance executes under its own id, which is what shared events and pipes are
+    // dispatched by; quarantining only the pane slots would leave it running.
+    let _ = senders.send_to_plugin(PluginInstruction::Quarantine(instance_id, generation));
 }
 
 fn send_pipe_changes(
@@ -639,6 +661,7 @@ pub fn add_slot_job(
                 senders.send_to_background_jobs(BackgroundJob::StopPluginLoadingAnimation(slot_id));
             report_error(
                 &senders,
+                instance_id,
                 vec![slot_id],
                 running_plugin.store.data().generation,
                 e,
@@ -960,7 +983,7 @@ mod tests {
 
 #[cfg(test)]
 mod fuel_tests {
-    use super::{instantiate_metered, refuel_for_callback};
+    use super::{instantiate_metered, is_out_of_fuel, refuel_for_callback};
     use wasmi::{Linker, Module, Store};
 
     fn plugin_engine_module(wat: &str) -> (wasmi::Engine, Module) {
@@ -985,6 +1008,33 @@ mod fuel_tests {
         );
         let mut store = Store::new(&engine, ());
         assert!(instantiate_metered(&linker, &mut store, &module).is_ok());
+    }
+
+    #[test]
+    fn running_out_of_fuel_is_told_apart_from_other_failures() {
+        let (engine, module) = plugin_engine_module(
+            r#"(module
+                (func (export "spin") (loop br 0))
+                (func (export "crash") unreachable))"#,
+        );
+        let mut store = Store::new(&engine, ());
+        let linker = Linker::<()>::new(&engine);
+        let instance = instantiate_metered(&linker, &mut store, &module).unwrap();
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .unwrap();
+        let crash = instance
+            .get_typed_func::<(), ()>(&mut store, "crash")
+            .unwrap();
+        store.set_fuel(10_000).unwrap();
+        let spin_error = anyhow::Error::new(spin.call(&mut store, ()).unwrap_err())
+            .context("failed to call spin on the plugin");
+        assert!(is_out_of_fuel(&spin_error));
+        refuel_for_callback(&mut store);
+        let crash_error = anyhow::Error::new(crash.call(&mut store, ()).unwrap_err())
+            .context("failed to call crash on the plugin");
+        assert!(!is_out_of_fuel(&crash_error));
+        assert!(!is_out_of_fuel(&anyhow::anyhow!("not a wasm error")));
     }
 
     #[test]

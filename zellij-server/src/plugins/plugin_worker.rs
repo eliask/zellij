@@ -59,6 +59,21 @@ pub fn plugin_worker(mut worker: RunningWorker) -> UnboundedSender<MessageToWork
                     Some(MessageToWorker::Message(message, payload)) => {
                         if let Err(e) = worker.send_message(message, payload) {
                             log::error!("Failed to send message to worker: {:?}", e);
+                            // Other failures leave the plugin running, as they always have. A
+                            // worker that exhausts its fuel is what a runaway plugin looks like,
+                            // so it is treated like the plugin's own callbacks doing so.
+                            // TODO(plugin-hardening): ordinary worker traps (panics) are still
+                            // only logged; quarantine the plugin on those as well once it is
+                            // decided that a crashed worker should stop its plugin.
+                            if crate::plugins::shared::is_out_of_fuel(&e) {
+                                let data = worker.store.data();
+                                crate::plugins::wasm_bridge::handle_plugin_crash(
+                                    data.plugin_id,
+                                    data.generation,
+                                    format!("{:?}", e).replace("\n", "\n\r"),
+                                    data.senders.clone(),
+                                );
+                            }
                         }
                     },
                     Some(MessageToWorker::Exit) => {

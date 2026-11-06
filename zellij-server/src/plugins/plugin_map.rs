@@ -53,6 +53,10 @@ pub struct PluginMap {
     plugin_metadata: HashMap<PluginId, PluginMetadata>,
     shared_assets: HashMap<PluginId, PluginAssets>,
     shared_blocking_calls: HashMap<PluginId, Arc<AtomicBool>>,
+    // plugins whose loader is still publishing instances, and which of those were unloaded
+    // meanwhile
+    loads_in_progress: HashSet<PluginId>,
+    unloaded_during_load: HashSet<PluginId>,
 }
 
 impl PluginMap {
@@ -66,7 +70,25 @@ impl PluginMap {
     ) -> Option<PluginAssets> {
         self.plugin_assets.remove(&(plugin_id, client_id))
     }
+    /// A loader starts publishing instances of the plugin.
+    pub fn begin_load(&mut self, pid: PluginId) {
+        self.loads_in_progress.insert(pid);
+        self.unloaded_during_load.remove(&pid);
+    }
+    pub fn end_load(&mut self, pid: PluginId) {
+        self.loads_in_progress.remove(&pid);
+        self.unloaded_during_load.remove(&pid);
+    }
+    /// Whether the plugin was unloaded after its loader started. Instances published after that
+    /// point are not part of what the unload collected for cleanup, so the loader must not
+    /// publish them.
+    pub fn unloaded_during_load(&self, pid: PluginId) -> bool {
+        self.unloaded_during_load.contains(&pid)
+    }
     pub fn remove_plugins(&mut self, pid: PluginId) -> RemovedPluginAssets {
+        if self.loads_in_progress.contains(&pid) {
+            self.unloaded_during_load.insert(pid);
+        }
         self.plugin_metadata.remove(&pid);
         let mut removed = HashMap::new();
         let ids_in_plugin_map: Vec<PluginKey> = self.plugin_assets.keys().copied().collect();
@@ -111,6 +133,9 @@ impl PluginMap {
     pub fn remove_shared(&mut self, instance_id: PluginId) -> Option<PluginAssets> {
         self.shared_blocking_calls.remove(&instance_id);
         self.shared_assets.remove(&instance_id)
+    }
+    pub fn has_instance_of(&self, plugin_id: PluginId) -> bool {
+        self.plugin_assets.keys().any(|(pid, _)| *pid == plugin_id)
     }
     pub fn shared_instance_in_blocking_call(&self, instance_id: PluginId) -> bool {
         self.shared_blocking_calls

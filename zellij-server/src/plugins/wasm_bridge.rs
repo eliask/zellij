@@ -278,13 +278,15 @@ impl Quarantine {
     }
     /// Returns true if the plugin was newly quarantined; reports from superseded instances and
     /// repeated reports return false.
-    pub fn report_fatal(&mut self, plugin_id: PluginId, generation: u64) -> bool {
-        let is_stale = self
-            .oldest_current_generation
+    /// Whether a plugin was reloaded after the instance of `generation` was created.
+    pub fn is_superseded(&self, plugin_id: PluginId, generation: u64) -> bool {
+        self.oldest_current_generation
             .get(&plugin_id)
             .map(|oldest| generation < *oldest)
-            .unwrap_or(false);
-        !is_stale && self.quarantined.insert(plugin_id)
+            .unwrap_or(false)
+    }
+    pub fn report_fatal(&mut self, plugin_id: PluginId, generation: u64) -> bool {
+        !self.is_superseded(plugin_id, generation) && self.quarantined.insert(plugin_id)
     }
     /// The plugin id is gone for good.
     pub fn forget(&mut self, plugin_id: PluginId) {
@@ -342,6 +344,10 @@ pub struct WasmBridge {
     plugin_executor: Arc<PinnedExecutor>,
     next_plugin_id: PluginId,
     plugin_ids_waiting_for_permission_request: HashSet<PluginId>,
+    // plugins whose loader job has not yet published the instances of all connected clients
+    plugins_with_unfinished_load: HashSet<PluginId>,
+    // generation and module digest of each plugin's latest permission prompt
+    permission_prompts: HashMap<PluginId, (u64, String)>,
     cached_events_for_pending_plugins: HashMap<PluginId, Vec<EventOrPipeMessage>>,
     cached_resizes_for_pending_plugins: HashMap<PluginId, (usize, usize)>, // (rows, columns)
     cached_worker_messages: HashMap<PluginId, Vec<(ClientId, String, String, String)>>, // Vec<clientid,
@@ -424,6 +430,8 @@ impl WasmBridge {
             next_plugin_id: 0,
             cached_events_for_pending_plugins: HashMap::new(),
             plugin_ids_waiting_for_permission_request: HashSet::new(),
+            plugins_with_unfinished_load: HashSet::new(),
+            permission_prompts: HashMap::new(),
             cached_resizes_for_pending_plugins: HashMap::new(),
             cached_worker_messages: HashMap::new(),
             loading_plugins: HashSet::new(),
@@ -553,6 +561,7 @@ impl WasmBridge {
 
                 self.cached_events_for_pending_plugins
                     .insert(plugin_id, vec![]);
+                self.plugins_with_unfinished_load.insert(plugin_id);
                 self.cached_resizes_for_pending_plugins
                     .insert(plugin_id, (size.rows, size.cols));
                 self.loading_plugins.insert((plugin_id, run.clone()));
@@ -716,6 +725,7 @@ impl WasmBridge {
     pub fn unload_plugin(&mut self, pid: PluginId) -> Result<()> {
         info!("Bye from plugin {}", &pid);
         self.quarantine.forget(pid);
+        self.permission_prompts.remove(&pid);
         self.latest_hovers.lock().unwrap().evict_plugin(pid);
         let _ = self
             .senders
@@ -842,13 +852,25 @@ impl WasmBridge {
     pub fn quarantine_plugin(&mut self, pid: PluginId, generation: u64) {
         // A report can arrive after the plugin was unloaded; recording it would leave an entry
         // for a dead id that nothing ever clears.
-        if self.plugin_map.lock().unwrap().metadata(pid).is_none() {
+        if self.plugin_map.lock().unwrap().metadata(pid).is_none()
+            && !self.shared_instances.contains_key(&pid)
+        {
             return;
+        }
+        // A shared instance keeps executing under its own id, so a fatal error reported for
+        // one of its pane slots stops the whole instance, not just that slot.
+        if let Some(instance_id) = self.shared_slot_owner.get(&pid).copied() {
+            if self.quarantine.report_fatal(instance_id, generation) {
+                self.release_key_intercepts(instance_id);
+            }
         }
         if !self.quarantine.report_fatal(pid, generation) {
             return;
         }
         log::error!("Quarantining plugin {} after a fatal callback error", pid);
+        // Quarantine discards the plugin's updates, so a key intercept it still holds would
+        // swallow the client's typing until the plugin is unloaded.
+        self.release_key_intercepts(pid);
         self.plugin_ids_waiting_for_permission_request.remove(&pid);
         self.cached_events_for_pending_plugins.remove(&pid);
         self.cached_resizes_for_pending_plugins.remove(&pid);
@@ -856,6 +878,18 @@ impl WasmBridge {
         let pipes_to_release = self.pending_pipes.unload_plugin(&pid);
         self.send_pipe_releases(pipes_to_release);
         self.forget_pipe_popups_of_plugin(pid);
+    }
+    /// Drop `plugin_id`'s key intercept for every connected client. The screen only drops an
+    /// intercept the plugin owns, so this is harmless for clients it never intercepted.
+    fn release_key_intercepts(&self, plugin_id: PluginId) {
+        let clients: Vec<ClientId> = self.connected_clients.lock().unwrap().clone();
+        for client_id in clients {
+            let _ = self
+                .senders
+                .send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(
+                    plugin_id, client_id,
+                ));
+        }
     }
     fn prepare_plugin_reload(&mut self, plugin_id: PluginId) {
         let _ = self
@@ -901,6 +935,7 @@ impl WasmBridge {
         self.prepare_plugin_reload(plugin_id);
         self.cached_events_for_pending_plugins
             .insert(plugin_id, vec![]);
+        self.plugins_with_unfinished_load.insert(plugin_id);
         self.cached_resizes_for_pending_plugins
             .insert(plugin_id, (size.rows, size.cols));
 
@@ -1017,6 +1052,7 @@ impl WasmBridge {
             let (rows, columns) = self.size_of_plugin_id(plugin_id).unwrap_or((0, 0));
             self.cached_events_for_pending_plugins
                 .insert(plugin_id, vec![]);
+            self.plugins_with_unfinished_load.insert(plugin_id);
             self.cached_resizes_for_pending_plugins
                 .insert(plugin_id, (rows, columns));
 
@@ -1191,7 +1227,23 @@ impl WasmBridge {
                                             ]))
                                             .unwrap();
                                     },
-                                    Err(e) => log::error!("{}", e),
+                                    Err(e) => {
+                                        log::error!("{}", e);
+                                        // Other render failures only skip this frame, as they
+                                        // always have; a plugin that exhausts its fuel while
+                                        // rendering is stopped like one that does so in an
+                                        // event handler.
+                                        // TODO(plugin-hardening): a render that traps for any
+                                        // other reason is still only logged here.
+                                        if crate::plugins::shared::is_out_of_fuel(&e) {
+                                            handle_plugin_crash(
+                                                plugin_id,
+                                                running_plugin.store.data().generation,
+                                                format!("{:?}", e).replace("\n", "\n\r"),
+                                                senders.clone(),
+                                            );
+                                        }
+                                    },
                                 }
                             }
                         }
@@ -1638,10 +1690,24 @@ impl WasmBridge {
     ) -> Result<()> {
         let mut applied_plugin_paths = HashSet::new();
         for plugin_id in plugin_ids {
+            if !done_receiving_permissions {
+                // the loader reports that it is done with the instances of all clients
+                self.plugins_with_unfinished_load.remove(&plugin_id);
+            } else if self.plugins_with_unfinished_load.contains(&plugin_id) {
+                // An answer that arrives while the loader is still publishing the instances of
+                // the other clients must not drain the cached events: the instances published
+                // later would never see them. The loader applies them when it is done.
+                self.plugin_ids_waiting_for_permission_request
+                    .remove(&plugin_id);
+                continue;
+            }
+            // A plugin that was unloaded while it was loading is only waiting for this call to
+            // be unloaded again; its pending permission request must not hold that back.
             if !done_receiving_permissions
                 && self
                     .plugin_ids_waiting_for_permission_request
                     .contains(&plugin_id)
+                && !self.plugins_to_unload_once_loaded.contains(&plugin_id)
             {
                 continue;
             }
@@ -2364,6 +2430,49 @@ impl WasmBridge {
             };
         }
     }
+    /// Whether an answer to a permission prompt still concerns the module that is running. The
+    /// answer carries neither a digest nor a generation, so they are matched against what was
+    /// recorded when the prompt was requested: an answer is stale when no prompt was requested,
+    /// when the plugin was reloaded since, or when the running bytes are not the prompted ones.
+    pub fn permission_prompt_is_current(
+        &mut self,
+        plugin_id: PluginId,
+        client_id: Option<ClientId>,
+    ) -> bool {
+        let shared_instance = self.shared_instance_of(plugin_id);
+        let prompt_key = shared_instance.unwrap_or(plugin_id);
+        // TODO(plugin-hardening): when a prompt is stale its pane has already been dismissed by
+        // the answer, so the reloaded plugin has to ask again to get a new one. The prompt of a
+        // plugin that is reloaded while it is open should instead be closed at reload time
+        // (`prepare_plugin_reload`), which needs a screen instruction to drop a pane's pending
+        // request.
+        let Some((prompt_generation, prompt_digest)) =
+            self.permission_prompts.get(&prompt_key).cloned()
+        else {
+            return false;
+        };
+        if self.quarantine.is_superseded(prompt_key, prompt_generation) {
+            return false;
+        }
+        let running_plugin = match shared_instance {
+            Some(instance_id) => self
+                .plugin_map
+                .lock()
+                .unwrap()
+                .shared_running_plugin(instance_id)
+                .map(|(running_plugin, _)| running_plugin),
+            None => self
+                .plugin_map
+                .lock()
+                .unwrap()
+                .get_running_plugin(plugin_id, client_id),
+        };
+        let Some(running_plugin) = running_plugin else {
+            return false;
+        };
+        let running_plugin = running_plugin.lock().unwrap();
+        running_plugin.store.data().plugin_digest == prompt_digest
+    }
     pub fn cache_plugin_permissions(
         &mut self,
         plugin_id: PluginId,
@@ -2418,7 +2527,11 @@ impl WasmBridge {
 
         permission_cache.write_to_file().with_context(err_context)
     }
-    pub fn cache_plugin_events(&mut self, plugin_id: PluginId) {
+    pub fn cache_plugin_events(&mut self, plugin_id: PluginId, generation: u64, digest: String) {
+        // Remember which module instance the prompt that is about to be shown belongs to. Shared
+        // instances are keyed by instance id, as that is what their requests carry.
+        self.permission_prompts
+            .insert(plugin_id, (generation, digest));
         if self.shared_instance_of(plugin_id).is_some() {
             return;
         }
@@ -3084,6 +3197,8 @@ impl WasmBridge {
             if let Some(info) = self.shared_instances.remove(&instance_id) {
                 self.shared_keys.remove(&info.key);
             }
+            self.quarantine.forget(instance_id);
+            self.permission_prompts.remove(&instance_id);
             self.plugin_executor.execute_plugin_unload(
                 instance_id,
                 move |senders, plugin_map, _connected_clients, _plugin_cache, _engine| {
@@ -3143,6 +3258,8 @@ impl WasmBridge {
         let slot_ids: Vec<PluginId> = info.slots.iter().copied().collect();
         let mut loading_context = info.loading_context.clone();
         loading_context.generation = next_plugin_generation();
+        self.quarantine
+            .begin_generation(instance_id, loading_context.generation);
         for slot_id in &slot_ids {
             self.quarantine
                 .begin_generation(*slot_id, loading_context.generation);
@@ -3178,11 +3295,18 @@ impl WasmBridge {
         run_plugin: &RunPlugin,
         skip_cache: bool,
     ) -> Option<Vec<(PluginId, Option<ClientId>)>> {
-        let plugin_config = PluginConfig::from_run_plugin(run_plugin)?;
-        if !self.module_is_shared(&plugin_config, skip_cache) {
-            return None;
-        }
+        // Whether an instance is already running is answered from state; classifying the module
+        // reads the whole file, which every URL-addressed CLI pipe payload would otherwise pay
+        // on the management thread even for a plugin that has been running for hours. A key
+        // that has an instance is a shared module (only those are keyed), so the classification
+        // is only needed when the caller asks for a fresh look at the file.
         let instance_id = *self.shared_keys.get(&Self::shared_key_of(run_plugin))?;
+        if skip_cache {
+            let plugin_config = PluginConfig::from_run_plugin(run_plugin)?;
+            if !self.module_is_shared(&plugin_config, skip_cache) {
+                return None;
+            }
+        }
         let info = self.shared_instances.get(&instance_id)?;
         let matching_slots: Vec<PluginId> = {
             let plugin_map = self.plugin_map.lock().unwrap();
@@ -3366,10 +3490,17 @@ impl WasmBridge {
         }
         let mut batches: BTreeMap<PluginId, Vec<SharedEventBatchEntry>> = BTreeMap::new();
         let mut legacy_updates = vec![];
-        let all_instance_ids: Vec<PluginId> = self.shared_instances.keys().copied().collect();
+        let all_instance_ids: Vec<PluginId> = self
+            .shared_instances
+            .keys()
+            .copied()
+            .filter(|instance_id| !self.quarantine.contains(instance_id))
+            .collect();
         for (plugin_id, client_id, event) in updates {
             match plugin_id {
                 Some(plugin_id) => match self.shared_instance_of(plugin_id) {
+                    // a quarantined instance receives nothing until it is reloaded
+                    Some(instance_id) if self.quarantine.contains(&instance_id) => {},
                     Some(instance_id) => {
                         let slot_id = if plugin_id != instance_id {
                             Some(plugin_id)
@@ -3417,10 +3548,21 @@ impl WasmBridge {
         }
         let mut batches: BTreeMap<PluginId, Vec<(PipeMessage, EventContext)>> = BTreeMap::new();
         let mut legacy_messages = vec![];
-        let all_instance_ids: Vec<PluginId> = self.shared_instances.keys().copied().collect();
+        let all_instance_ids: Vec<PluginId> = self
+            .shared_instances
+            .keys()
+            .copied()
+            .filter(|instance_id| !self.quarantine.contains(instance_id))
+            .collect();
         for (plugin_id, client_id, pipe_message) in messages {
             let targets: Vec<(PluginId, Option<PluginId>)> = match plugin_id {
                 Some(plugin_id) => match self.shared_instance_of(plugin_id) {
+                    // a quarantined instance receives nothing until it is reloaded
+                    // TODO(plugin-hardening): a CLI pipe addressed only to a quarantined
+                    // instance is dropped here without being released, as it is for quarantined
+                    // plugins that are not shared; release it with an error exit code so the
+                    // `zellij pipe` client does not wait for a plugin that will never answer.
+                    Some(instance_id) if self.quarantine.contains(&instance_id) => continue,
                     Some(instance_id) => {
                         let slot_id = if plugin_id != instance_id {
                             Some(plugin_id)
@@ -3928,6 +4070,10 @@ mod hover_merge_tests;
 #[cfg(test)]
 #[path = "unit/quarantine_tests.rs"]
 mod quarantine_tests;
+
+#[cfg(test)]
+#[path = "unit/hardening_tests.rs"]
+mod hardening_tests;
 
 #[cfg(test)]
 #[path = "unit/startup_tests.rs"]

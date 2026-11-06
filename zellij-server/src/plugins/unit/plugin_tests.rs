@@ -6981,15 +6981,22 @@ pub fn pipe_message_to_plugin_plugin_command() {
         rows: 20,
     };
     let received_screen_instructions = Arc::new(Mutex::new(vec![]));
-    let screen_thread = grant_permissions_and_log_actions_in_thread!(
+    let screen_thread = grant_permissions_and_log_actions_until!(
         received_screen_instructions,
-        ScreenInstruction::PluginBytes,
         screen_receiver,
-        3,
         &PermissionType::ReadCliPipes,
         cache_path,
         plugin_thread_sender,
-        client_id
+        client_id,
+        |event: &ScreenInstruction| match event {
+            ScreenInstruction::PluginBytes(plugin_render_assets) => {
+                plugin_render_assets.iter().any(|plugin_render_asset| {
+                    String::from_utf8_lossy(&plugin_render_asset.bytes)
+                        .contains("Payload from self:")
+                })
+            },
+            _ => false,
+        }
     );
 
     let _ = plugin_thread_sender.send(PluginInstruction::AddClient(client_id));
@@ -7010,7 +7017,22 @@ pub fn pipe_message_to_plugin_plugin_command() {
         None,
         None,
     ));
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // A pipe that reaches the plugin thread before the plugin is running has no one to go to, so
+    // wait for the plugin's first render instead of guessing how long loading takes (hashing and
+    // compiling the module takes a variable time in a debug build).
+    let load_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !received_screen_instructions
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|i| matches!(i, ScreenInstruction::PluginBytes(..)))
+    {
+        assert!(
+            std::time::Instant::now() < load_deadline,
+            "the plugin did not render within 30 seconds"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     let _ = plugin_thread_sender.send(PluginInstruction::CliPipe {
         pipe_id: "input_pipe_id".to_owned(),
         name: "pipe_message_to_plugin".to_owned(),
@@ -7030,9 +7052,8 @@ pub fn pipe_message_to_plugin_plugin_command() {
         popup_capture_all_keys: false,
         popup_outside_click: zellij_utils::data::OutsideClick::Block,
     });
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    screen_thread.join().unwrap(); // the screen thread returns once the payload was rendered
     teardown();
-    screen_thread.join().unwrap(); // this might take a while if the cache is cold
     let plugin_bytes_event = received_screen_instructions
         .lock()
         .unwrap()

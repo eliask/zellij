@@ -146,6 +146,8 @@ pub enum PluginInstruction {
         PermissionStatus,
         Option<PathBuf>,
     ),
+    // permissions the plugin already holds for its current module bytes, no prompt involved
+    GrantKnownPermissions(PluginId, Option<ClientId>, Vec<PermissionType>),
     DumpLayout(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
     ListClientsMetadata(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
     DumpLayoutToPlugin {
@@ -215,6 +217,9 @@ pub enum PluginInstruction {
     },
     CachePluginEvents {
         plugin_id: PluginId,
+        // identify the module instance whose permission prompt is about to be shown
+        generation: u64,
+        digest: String,
     },
     MessageFromPlugin {
         source_plugin_id: u32,
@@ -323,6 +328,7 @@ impl From<&PluginInstruction> for PluginContext {
             PluginInstruction::PluginSubscribedToEvents(..) => {
                 PluginContext::PluginSubscribedToEvents
             },
+            PluginInstruction::GrantKnownPermissions(..) => PluginContext::PermissionRequestResult,
             PluginInstruction::PermissionRequestResult(..) => {
                 PluginContext::PermissionRequestResult
             },
@@ -984,27 +990,35 @@ pub(crate) fn plugin_thread_main(
                 status,
                 cache_path,
             ) => {
-                if let Err(e) = wasm_bridge.cache_plugin_permissions(
+                // An answer to a prompt that was shown for another module (the plugin was
+                // reloaded, possibly from different bytes, while the prompt was open) must not
+                // grant anything to its successor.
+                if wasm_bridge.permission_prompt_is_current(plugin_id, client_id) {
+                    apply_permission_result(
+                        &mut wasm_bridge,
+                        plugin_id,
+                        client_id,
+                        permissions,
+                        status,
+                        cache_path,
+                        &shutdown_send,
+                    )?;
+                } else {
+                    log::warn!(
+                        "Ignoring a permission response for plugin {}: its prompt belongs to a module that is no longer running",
+                        plugin_id
+                    );
+                }
+            },
+            PluginInstruction::GrantKnownPermissions(plugin_id, client_id, permissions) => {
+                apply_permission_result(
+                    &mut wasm_bridge,
                     plugin_id,
                     client_id,
                     permissions,
-                    status,
-                    cache_path,
-                ) {
-                    log::error!("{}", e);
-                }
-
-                let updates = vec![(
-                    Some(plugin_id),
-                    client_id,
-                    Event::PermissionRequestResult(status),
-                )];
-                wasm_bridge.update_plugins(updates, shutdown_send.clone())?;
-                let done_receiving_permissions = true;
-                wasm_bridge.apply_cached_events(
-                    vec![plugin_id],
-                    done_receiving_permissions,
-                    shutdown_send.clone(),
+                    PermissionStatus::Granted,
+                    None,
+                    &shutdown_send,
                 )?;
             },
             PluginInstruction::DumpLayout(
@@ -1407,8 +1421,12 @@ pub(crate) fn plugin_thread_main(
                     notification_end,
                 )?;
             },
-            PluginInstruction::CachePluginEvents { plugin_id } => {
-                wasm_bridge.cache_plugin_events(plugin_id);
+            PluginInstruction::CachePluginEvents {
+                plugin_id,
+                generation,
+                digest,
+            } => {
+                wasm_bridge.cache_plugin_events(plugin_id, generation, digest);
             },
             PluginInstruction::MessageFromPlugin {
                 source_plugin_id,
@@ -1730,6 +1748,36 @@ pub(crate) fn plugin_thread_main(
             }
         })
         .context("failed to cleanup plugin data directory")
+}
+
+fn apply_permission_result(
+    wasm_bridge: &mut WasmBridge,
+    plugin_id: PluginId,
+    client_id: Option<ClientId>,
+    permissions: Vec<PermissionType>,
+    status: PermissionStatus,
+    cache_path: Option<PathBuf>,
+    shutdown_send: &tokio::sync::mpsc::Sender<()>,
+) -> Result<()> {
+    if let Err(e) =
+        wasm_bridge.cache_plugin_permissions(plugin_id, client_id, permissions, status, cache_path)
+    {
+        log::error!("{}", e);
+    }
+
+    let updates = vec![(
+        Some(plugin_id),
+        client_id,
+        Event::PermissionRequestResult(status),
+    )];
+    wasm_bridge.update_plugins(updates, shutdown_send.clone())?;
+    let done_receiving_permissions = true;
+    wasm_bridge.apply_cached_events(
+        vec![plugin_id],
+        done_receiving_permissions,
+        shutdown_send.clone(),
+    )?;
+    Ok(())
 }
 
 fn populate_session_layout_metadata(
