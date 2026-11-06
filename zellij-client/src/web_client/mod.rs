@@ -22,6 +22,7 @@ use std::{
 };
 
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{any, get, post},
     Router,
@@ -193,6 +194,9 @@ pub fn start_web_client(
     ));
 }
 
+/// Upper bound for the body of any http request to the web server.
+const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
+
 pub async fn serve_web_client(
     config: Config,
     config_options: Options,
@@ -260,6 +264,9 @@ pub async fn serve_web_client(
         .route("/command/login", post(login_handler))
         .route("/info/version", get(version_handler))
         .with_state(state)
+        // the only request bodies are the login and session requests, a few
+        // dozen bytes each
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(axum::middleware::from_fn(move |request, next: axum::middleware::Next| {
             async move {
                 let mut response = next.run(request).await;

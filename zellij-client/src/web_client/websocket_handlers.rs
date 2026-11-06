@@ -40,6 +40,12 @@ use zellij_utils::{
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// The largest message (and frame) a client may send us over a websocket.
+/// Keystrokes, mouse events and control messages are tiny; the biggest thing a
+/// person sends is a paste. Anything beyond this closes the connection instead
+/// of being buffered, where the library default would take up to 64 MiB.
+const MAX_INBOUND_WEBSOCKET_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+
 /// How often a live websocket checks that the session token it was opened with
 /// is still valid (not revoked and not expired). Kept apart from the ping
 /// interval so that a revoked token is noticed reasonably fast, but it is still
@@ -164,7 +170,9 @@ pub async fn ws_handler_control(
         );
         return StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_control(socket, params, state, session_token_hash))
+    ws.max_message_size(MAX_INBOUND_WEBSOCKET_MESSAGE_BYTES)
+        .max_frame_size(MAX_INBOUND_WEBSOCKET_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_ws_control(socket, params, state, session_token_hash))
 }
 
 pub async fn ws_handler_terminal(
@@ -179,9 +187,11 @@ pub async fn ws_handler_terminal(
         log::warn!("Terminal WebSocket: refusing upgrade from a foreign Origin");
         return StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(move |socket| {
-        handle_ws_terminal(socket, session_name, params, state, session_token_hash)
-    })
+    ws.max_message_size(MAX_INBOUND_WEBSOCKET_MESSAGE_BYTES)
+        .max_frame_size(MAX_INBOUND_WEBSOCKET_MESSAGE_BYTES)
+        .on_upgrade(move |socket| {
+            handle_ws_terminal(socket, session_name, params, state, session_token_hash)
+        })
 }
 
 async fn handle_ws_control(
@@ -235,7 +245,20 @@ async fn handle_ws_control(
         let msg = tokio::select! {
             msg = control_socket_rx.next() => match msg {
                 Some(Ok(msg)) => msg,
-                _ => break,
+                Some(Err(e)) => {
+                    // for instance a message over the size limit
+                    log::warn!(
+                        "Control WebSocket for web_client_id {} failed: {}",
+                        web_client_id,
+                        e
+                    );
+                    let _ = heartbeat_tx.try_send(Message::Close(Some(CloseFrame {
+                        code: close_code::SIZE,
+                        reason: "Invalid or oversized message".into(),
+                    })));
+                    break;
+                },
+                None => break,
             },
             tick = heartbeat.tick() => {
                 match tick {

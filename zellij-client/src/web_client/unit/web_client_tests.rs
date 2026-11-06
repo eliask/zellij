@@ -3949,6 +3949,76 @@ mod web_client_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn test_oversized_request_bodies_are_refused() {
+        let _ = delete_db();
+        let (port, server_handle) = spawn_test_server_with_config(Config::default()).await;
+
+        let login_url = format!("http://127.0.0.1:{}/command/login", port);
+        let oversized = serde_json::json!({ "auth_token": "a".repeat(100 * 1024) }).to_string();
+        let response = timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                isahc::Request::post(&login_url)
+                    .header("Content-Type", "application/json")
+                    .body(oversized)
+                    .unwrap()
+                    .send()
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), 413);
+
+        // an ordinary login request is still judged on its merits
+        assert_eq!(post_login(port, "not-a-real-token").await.status(), 401);
+
+        server_handle.abort();
+        let _ = delete_db();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_oversized_websocket_messages_close_the_connection() {
+        let _ = delete_db();
+        let test_token_name = "test_token_oversized_ws_message";
+        let (auth_token, _) =
+            create_token(Some(test_token_name.to_string()), false).expect("token");
+
+        let (port, server_handle, factory) = spawn_structured_test_server().await;
+        let session_token = login_and_get_session_token(port, &auth_token).await;
+        let mut client = attach_test_client(port, &session_token, &factory, true).await;
+
+        // a message of an ordinary size does not bother the connection
+        client
+            .control_sink
+            .send(Message::Text("x".repeat(64 * 1024).into()))
+            .await
+            .unwrap();
+        assert!(
+            !closes_within(&mut client.control_stream, Duration::from_millis(300)).await,
+            "a modest message must not close the control websocket"
+        );
+
+        client
+            .control_sink
+            .send(Message::Text("x".repeat(3 * 1024 * 1024).into()))
+            .await
+            .unwrap();
+        assert!(
+            closes_within(&mut client.control_stream, Duration::from_secs(5)).await,
+            "an oversized message must close the control websocket"
+        );
+
+        server_handle.abort();
+        let _ = delete_db();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     async fn post_login(port: u16, auth_token: &str) -> isahc::Response<isahc::Body> {
         let login_url = format!("http://127.0.0.1:{}/command/login", port);
         let payload = serde_json::json!({ "auth_token": auth_token }).to_string();
