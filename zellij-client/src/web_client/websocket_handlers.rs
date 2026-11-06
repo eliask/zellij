@@ -1,4 +1,9 @@
 use crate::web_client::authentication::SessionTokenHash;
+use crate::web_client::client_channel::{
+    client_channel, CONTROL_CHANNEL_MAX_BYTES, CONTROL_CHANNEL_MAX_MESSAGES,
+    KEEPALIVE_CHANNEL_MAX_BYTES, KEEPALIVE_CHANNEL_MAX_MESSAGES, OUTPUT_CHANNEL_MAX_BYTES,
+    OUTPUT_CHANNEL_MAX_MESSAGES,
+};
 use crate::web_client::control_message::{
     TerminalMetricsPayload, WebClientToWebServerControlMessage,
     WebClientToWebServerControlMessagePayload,
@@ -189,7 +194,8 @@ async fn handle_ws_control(
 
     let (control_socket_tx, mut control_socket_rx) = socket.split();
 
-    let (control_channel_tx, control_channel_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (control_channel_tx, control_channel_rx) =
+        client_channel(CONTROL_CHANNEL_MAX_MESSAGES, CONTROL_CHANNEL_MAX_BYTES);
     send_control_messages_to_client(control_channel_rx, control_socket_tx);
     let heartbeat_tx = control_channel_tx.clone();
 
@@ -234,14 +240,14 @@ async fn handle_ws_control(
             tick = heartbeat.tick() => {
                 match tick {
                     HeartbeatTick::SendPing => {
-                        let _ = heartbeat_tx.send(Message::Ping(Default::default()));
+                        let _ = heartbeat_tx.try_send(Message::Ping(Default::default()));
                     },
                     HeartbeatTick::TimedOut => {
                         log::warn!(
                             "Control WebSocket for web_client_id {} timed out (no Pong received)",
                             web_client_id
                         );
-                        let _ = heartbeat_tx.send(Message::Close(Some(CloseFrame {
+                        let _ = heartbeat_tx.try_send(Message::Close(Some(CloseFrame {
                             code: close_code::NORMAL,
                             reason: "Connection timed out".into(),
                         })));
@@ -256,7 +262,7 @@ async fn handle_ws_control(
                         "Control WebSocket for web_client_id {} closed: session token is no longer valid",
                         web_client_id
                     );
-                    let _ = heartbeat_tx.send(Message::Close(Some(CloseFrame {
+                    let _ = heartbeat_tx.try_send(Message::Close(Some(CloseFrame {
                         code: close_code::POLICY,
                         reason: "Session expired or revoked".into(),
                     })));
@@ -352,8 +358,10 @@ async fn handle_ws_terminal(
     };
 
     let (client_terminal_channel_tx, mut client_terminal_channel_rx) = socket.split();
-    let (stdout_channel_tx, stdout_channel_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (terminal_frame_tx, terminal_frame_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stdout_channel_tx, stdout_channel_rx) =
+        client_channel(OUTPUT_CHANNEL_MAX_MESSAGES, OUTPUT_CHANNEL_MAX_BYTES);
+    let (terminal_frame_tx, terminal_frame_rx) =
+        client_channel(KEEPALIVE_CHANNEL_MAX_MESSAGES, KEEPALIVE_CHANNEL_MAX_BYTES);
     state
         .connection_table
         .lock()
@@ -439,7 +447,7 @@ async fn handle_ws_terminal(
             TerminalSocketEvent::Frame(m) => m,
             TerminalSocketEvent::Closed => break,
             TerminalSocketEvent::Heartbeat(HeartbeatTick::SendPing) => {
-                let _ = terminal_frame_tx.send(Message::Ping(Default::default()));
+                let _ = terminal_frame_tx.try_send(Message::Ping(Default::default()));
                 continue;
             },
             TerminalSocketEvent::Heartbeat(HeartbeatTick::TimedOut) => {

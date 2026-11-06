@@ -1,9 +1,9 @@
 use crate::os_input_output::ClientOsApi;
+use crate::web_client::client_channel::{ClientSender, SendFailure};
 use crate::web_client::control_message::WebServerToWebClientControlMessage;
 use crate::web_client::types::{ClientChannels, ClientConnectionBus, ConnectionTable};
 use axum::extract::ws::{CloseFrame, Message};
 use std::sync::{atomic::AtomicBool, Arc};
-use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 impl ConnectionTable {
@@ -48,11 +48,7 @@ impl ConnectionTable {
             .unwrap_or(false)
     }
 
-    pub fn add_client_control_tx(
-        &mut self,
-        client_id: &str,
-        control_channel_tx: UnboundedSender<Message>,
-    ) {
+    pub fn add_client_control_tx(&mut self, client_id: &str, control_channel_tx: ClientSender) {
         self.client_id_to_channels
             .get_mut(client_id)
             .map(|c| c.add_control_tx(control_channel_tx));
@@ -64,11 +60,7 @@ impl ConnectionTable {
             .map(|c| c.queue_control_message(message));
     }
 
-    pub fn add_client_terminal_tx(
-        &mut self,
-        client_id: &str,
-        terminal_channel_tx: UnboundedSender<Message>,
-    ) {
+    pub fn add_client_terminal_tx(&mut self, client_id: &str, terminal_channel_tx: ClientSender) {
         self.client_id_to_channels
             .get_mut(client_id)
             .map(|c| c.add_terminal_tx(terminal_channel_tx));
@@ -88,13 +80,13 @@ impl ConnectionTable {
         self.client_id_to_channels.get(client_id).map(|c| &c.os_api)
     }
 
-    pub fn get_client_terminal_tx(&self, client_id: &str) -> Option<UnboundedSender<Message>> {
+    pub fn get_client_terminal_tx(&self, client_id: &str) -> Option<ClientSender> {
         self.client_id_to_channels
             .get(client_id)
             .and_then(|c| c.terminal_channel_tx.clone())
     }
 
-    pub fn get_client_control_tx(&self, client_id: &str) -> Option<UnboundedSender<Message>> {
+    pub fn get_client_control_tx(&self, client_id: &str) -> Option<ClientSender> {
         self.client_id_to_channels
             .get(client_id)
             .and_then(|c| c.control_channel_tx.clone())
@@ -126,37 +118,47 @@ impl ClientConnectionBus {
     }
 
     fn send_terminal_message(&mut self, message: Message) {
+        if self.stdout_channel_tx.is_none() {
+            self.get_stdout_channel_tx();
+        }
         match self.stdout_channel_tx.as_ref() {
             Some(stdout_channel_tx) => {
-                let _ = stdout_channel_tx.send(message);
-            },
-            None => {
-                self.get_stdout_channel_tx();
-                if let Some(stdout_channel_tx) = self.stdout_channel_tx.as_ref() {
-                    let _ = stdout_channel_tx.send(message);
-                } else {
-                    log::error!("Failed to send STDOUT message to client");
+                if let Err(SendFailure::Full) = stdout_channel_tx.try_send(message) {
+                    self.disconnect_slow_client("terminal output");
                 }
             },
+            None => log::error!("Failed to send STDOUT message to client"),
         }
+    }
+
+    /// The client is not reading what we send it. Rather than queue output for it
+    /// without bound, drop the connection (the browser reconnects with a fresh
+    /// screen if it is still there).
+    fn disconnect_slow_client(&mut self, what: &str) {
+        log::warn!(
+            "Web client {} is not keeping up with its {} queue, disconnecting it",
+            self.web_client_id,
+            what
+        );
+        self.close_connection();
     }
 
     pub fn send_control(&mut self, message: WebServerToWebClientControlMessage) {
         let message = Message::Text(serde_json::to_string(&message).unwrap().into());
+        if self.control_channel_tx.is_none() {
+            self.get_control_channel_tx();
+        }
         match self.control_channel_tx.as_ref() {
             Some(control_channel_tx) => {
-                let _ = control_channel_tx.send(message);
+                if let Err(SendFailure::Full) = control_channel_tx.try_send(message) {
+                    self.disconnect_slow_client("control message");
+                }
             },
             None => {
-                self.get_control_channel_tx();
-                if let Some(control_channel_tx) = self.control_channel_tx.as_ref() {
-                    let _ = control_channel_tx.send(message);
-                } else {
-                    self.connection_table
-                        .lock()
-                        .unwrap()
-                        .queue_client_control_message(&self.web_client_id, message);
-                }
+                self.connection_table
+                    .lock()
+                    .unwrap()
+                    .queue_client_control_message(&self.web_client_id, message);
             },
         }
     }
@@ -178,18 +180,15 @@ impl ClientConnectionBus {
             reason: "Connection closed".into(),
         };
         let close_message = Message::Close(Some(close_frame));
+        if self.control_channel_tx.is_none() {
+            self.get_control_channel_tx();
+        }
         match self.control_channel_tx.as_ref() {
+            // if the queue is full the client is being dropped anyway
             Some(control_channel_tx) => {
-                let _ = control_channel_tx.send(close_message);
+                let _ = control_channel_tx.try_send(close_message);
             },
-            None => {
-                self.get_control_channel_tx();
-                if let Some(control_channel_tx) = self.control_channel_tx.as_ref() {
-                    let _ = control_channel_tx.send(close_message);
-                } else {
-                    log::error!("Failed to send close message to client");
-                }
-            },
+            None => log::error!("Failed to send close message to client"),
         }
         self.connection_table
             .lock()
@@ -236,6 +235,7 @@ impl ClientConnectionBus {
 mod tests {
     use super::*;
     use crate::os_input_output::ClientOsApi;
+    use crate::web_client::client_channel::client_channel;
     use std::io::{BufRead, Cursor, Write};
     use std::path::Path;
     use std::sync::Mutex;
@@ -319,7 +319,7 @@ mod tests {
         bus.send_control(WebServerToWebClientControlMessage::QueryTerminalSize);
         bus.send_control(WebServerToWebClientControlMessage::SetSoftKeyboard { on: true });
 
-        let (control_channel_tx, mut control_channel_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (control_channel_tx, mut control_channel_rx) = client_channel(256, 1024 * 1024);
         connection_table
             .lock()
             .unwrap()
@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn control_messages_are_delivered_directly_once_registered() {
         let connection_table = connection_table_with_client("client");
-        let (control_channel_tx, mut control_channel_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (control_channel_tx, mut control_channel_rx) = client_channel(256, 1024 * 1024);
         connection_table
             .lock()
             .unwrap()
@@ -356,6 +356,65 @@ mod tests {
     }
 
     #[test]
+    fn a_client_that_stops_reading_terminal_output_is_disconnected_not_buffered() {
+        let connection_table = connection_table_with_client("client");
+        // the receiving end stays alive but is never read from
+        let (stdout_channel_tx, _stdout_channel_rx) = client_channel(4, 1024);
+        connection_table
+            .lock()
+            .unwrap()
+            .add_client_terminal_tx("client", stdout_channel_tx);
+        let mut bus = ClientConnectionBus::new("client", &connection_table);
+
+        for _ in 0..4 {
+            bus.send_stdout("output".to_owned());
+        }
+        assert!(
+            connection_table
+                .lock()
+                .unwrap()
+                .get_client_os_api("client")
+                .is_some(),
+            "a client within its queue limit stays connected"
+        );
+
+        bus.send_stdout("one too many".to_owned());
+        assert!(
+            connection_table
+                .lock()
+                .unwrap()
+                .get_client_os_api("client")
+                .is_none(),
+            "a client past its queue limit is dropped"
+        );
+    }
+
+    #[test]
+    fn a_client_that_stops_reading_control_messages_is_disconnected_not_buffered() {
+        let connection_table = connection_table_with_client("client");
+        let (control_channel_tx, _control_channel_rx) = client_channel(2, 1024);
+        connection_table
+            .lock()
+            .unwrap()
+            .add_client_control_tx("client", control_channel_tx);
+        let mut bus = ClientConnectionBus::new("client", &connection_table);
+
+        bus.send_control(WebServerToWebClientControlMessage::QueryTerminalSize);
+        bus.send_control(WebServerToWebClientControlMessage::QueryTerminalSize);
+        assert!(connection_table
+            .lock()
+            .unwrap()
+            .get_client_os_api("client")
+            .is_some());
+        bus.send_control(WebServerToWebClientControlMessage::QueryTerminalSize);
+        assert!(connection_table
+            .lock()
+            .unwrap()
+            .get_client_os_api("client")
+            .is_none());
+    }
+
+    #[test]
     fn buffered_control_messages_are_bounded() {
         let connection_table = connection_table_with_client("client");
         let mut bus = ClientConnectionBus::new("client", &connection_table);
@@ -364,7 +423,7 @@ mod tests {
             bus.send_control(WebServerToWebClientControlMessage::QueryTerminalSize);
         }
 
-        let (control_channel_tx, mut control_channel_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (control_channel_tx, mut control_channel_rx) = client_channel(256, 1024 * 1024);
         connection_table
             .lock()
             .unwrap()

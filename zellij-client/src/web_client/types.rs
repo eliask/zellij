@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::os_input_output::ClientOsApi;
+use crate::web_client::client_channel::ClientSender;
 use crate::web_client::control_message::SetConfigPayload;
 use crate::web_client::login_rate_limiter::LoginRateLimiter;
 use crate::web_client::session_management::spawn_new_session;
@@ -109,8 +109,8 @@ const MAX_PENDING_CONTROL_MESSAGES: usize = 64;
 #[derive(Debug, Clone)]
 pub struct ClientChannels {
     pub os_api: Box<dyn ClientOsApi>,
-    pub control_channel_tx: Option<UnboundedSender<Message>>,
-    pub terminal_channel_tx: Option<UnboundedSender<Message>>,
+    pub control_channel_tx: Option<ClientSender>,
+    pub terminal_channel_tx: Option<ClientSender>,
     terminal_channel_cancellation_token: Option<CancellationToken>,
     pub should_not_reconnect: Arc<AtomicBool>,
     pending_control_messages: Vec<Message>,
@@ -128,9 +128,9 @@ impl ClientChannels {
         }
     }
 
-    pub fn add_control_tx(&mut self, control_channel_tx: UnboundedSender<Message>) {
+    pub fn add_control_tx(&mut self, control_channel_tx: ClientSender) {
         for message in self.pending_control_messages.drain(..) {
-            let _ = control_channel_tx.send(message);
+            let _ = control_channel_tx.try_send(message);
         }
         self.control_channel_tx = Some(control_channel_tx);
     }
@@ -142,7 +142,7 @@ impl ClientChannels {
         self.pending_control_messages.push(message);
     }
 
-    pub fn add_terminal_tx(&mut self, terminal_channel_tx: UnboundedSender<Message>) {
+    pub fn add_terminal_tx(&mut self, terminal_channel_tx: ClientSender) {
         self.terminal_channel_tx = Some(terminal_channel_tx);
     }
 
@@ -164,8 +164,8 @@ impl ClientChannels {
 #[derive(Debug)]
 pub struct ClientConnectionBus {
     pub connection_table: Arc<Mutex<ConnectionTable>>,
-    pub stdout_channel_tx: Option<UnboundedSender<Message>>,
-    pub control_channel_tx: Option<UnboundedSender<Message>>,
+    pub stdout_channel_tx: Option<ClientSender>,
+    pub control_channel_tx: Option<ClientSender>,
     pub web_client_id: String,
 }
 

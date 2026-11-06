@@ -1,6 +1,7 @@
 pub mod control_message;
 
 pub(crate) mod authentication;
+mod client_channel;
 mod connection_manager;
 mod host_query_seed;
 mod http_handlers;
