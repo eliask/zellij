@@ -1930,6 +1930,17 @@ impl Grid {
         if self.alternate_screen_state.is_some() {
             // in alternate screen we do nothing but log the new size, the program in the terminal
             // is in control now...
+            //
+            // It has no scrollback to push rows into, though, so the rows
+            // that no longer fit are cut from the bottom and the cursors
+            // are kept on the screen. Without this the viewport keeps the
+            // rows of the old size until the program exits.
+            self.viewport.truncate(new_rows);
+            let last_row = new_rows - 1;
+            self.cursor.y = self.cursor.y.min(last_row);
+            if let Some(saved_cursor) = self.saved_cursor_position.as_mut() {
+                saved_cursor.y = saved_cursor.y.min(last_row);
+            }
             self.height = new_rows;
             self.width = new_columns;
             self.set_scroll_region_to_viewport_size();
