@@ -414,13 +414,7 @@ async fn handle_ws_terminal(
     state: AppState,
     session_token_hash: SessionTokenHash,
 ) {
-    let client_size = match (params.rows, params.cols) {
-        (Some(rows), Some(cols)) if rows > 0 && cols > 0 => Some(Size {
-            rows: rows as usize,
-            cols: cols as usize,
-        }),
-        _ => None,
-    };
+    let client_size = client_size_from_params(params.rows, params.cols);
     let client_pixel_dims = match (params.cell_width, params.cell_height) {
         (Some(width), Some(height)) if width > 0 && height > 0 => Some(SizeInPixels {
             width: width as usize,
@@ -693,6 +687,43 @@ async fn handle_ws_terminal(
     os_input.send_to_server(ClientToServerMsg::ClientExited);
 }
 
+/// The smallest and largest size a client may ask for. A real terminal never
+/// comes close to the upper bounds (a full screen window on an 8K display with
+/// a small font is some 1000 columns by 400 rows), but the size is passed on to
+/// the session, which sizes its screen and pane grids by it, and renders a
+/// full grid of cells for the client on every pass; at 10000x10000 that alone
+/// is over a gigabyte per render. So besides limiting each dimension, the
+/// total number of cells is limited (to 1 million, some 16 MB per render).
+const MIN_TERMINAL_DIMENSION: usize = 1;
+const MAX_TERMINAL_DIMENSION: usize = 2_000;
+const MAX_TERMINAL_CELLS: usize = 1_000_000;
+
+fn clamp_terminal_size(size: Size) -> Size {
+    let rows = size
+        .rows
+        .clamp(MIN_TERMINAL_DIMENSION, MAX_TERMINAL_DIMENSION);
+    let cols = size
+        .cols
+        .clamp(MIN_TERMINAL_DIMENSION, MAX_TERMINAL_DIMENSION);
+    // both are at most MAX_TERMINAL_DIMENSION, so this cannot overflow
+    let cols = if rows * cols > MAX_TERMINAL_CELLS {
+        (MAX_TERMINAL_CELLS / rows).max(MIN_TERMINAL_DIMENSION)
+    } else {
+        cols
+    };
+    Size { rows, cols }
+}
+
+fn client_size_from_params(rows: Option<u16>, cols: Option<u16>) -> Option<Size> {
+    match (rows, cols) {
+        (Some(rows), Some(cols)) if rows > 0 && cols > 0 => Some(clamp_terminal_size(Size {
+            rows: rows as usize,
+            cols: cols as usize,
+        })),
+        _ => None,
+    }
+}
+
 fn control_payload_to_server_msg(
     payload: WebClientToWebServerControlMessagePayload,
     is_structured_client: bool,
@@ -706,7 +737,9 @@ fn control_payload_to_server_msg(
     }
     let client_msg = match payload {
         WebClientToWebServerControlMessagePayload::TerminalResize(size) => {
-            ClientToServerMsg::TerminalResize { new_size: size }
+            ClientToServerMsg::TerminalResize {
+                new_size: clamp_terminal_size(size),
+            }
         },
         WebClientToWebServerControlMessagePayload::TerminalMetrics(metrics) => {
             terminal_metrics_to_ipc(metrics)
@@ -845,6 +878,112 @@ fn terminal_metrics_to_ipc(metrics: TerminalMetricsPayload) -> ClientToServerMsg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_resize_is_clamped_to_sane_bounds() {
+        for (requested, expected) in [
+            (Size { rows: 24, cols: 80 }, Size { rows: 24, cols: 80 }),
+            (Size { rows: 0, cols: 0 }, Size { rows: 1, cols: 1 }),
+            // a big but real terminal is left alone
+            (
+                Size {
+                    rows: 400,
+                    cols: 1_000,
+                },
+                Size {
+                    rows: 400,
+                    cols: 1_000,
+                },
+            ),
+            (
+                Size {
+                    rows: usize::MAX,
+                    cols: 1,
+                },
+                Size {
+                    rows: 2_000,
+                    cols: 1,
+                },
+            ),
+            (
+                Size {
+                    rows: 1,
+                    cols: 2_001,
+                },
+                Size {
+                    rows: 1,
+                    cols: 2_000,
+                },
+            ),
+            // the area is limited too, not only each dimension
+            (
+                Size {
+                    rows: 10_000,
+                    cols: 10_000,
+                },
+                Size {
+                    rows: 2_000,
+                    cols: 500,
+                },
+            ),
+            (
+                Size {
+                    rows: 1_000,
+                    cols: 2_000,
+                },
+                Size {
+                    rows: 1_000,
+                    cols: 1_000,
+                },
+            ),
+        ] {
+            let msg = control_payload_to_server_msg(
+                WebClientToWebServerControlMessagePayload::TerminalResize(requested),
+                false,
+            );
+            match msg {
+                Some(ClientToServerMsg::TerminalResize { new_size }) => {
+                    assert_eq!(new_size, expected, "resize to {:?}", requested);
+                    assert!(new_size.rows * new_size.cols <= MAX_TERMINAL_CELLS);
+                },
+                other => panic!("expected a resize, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn no_accepted_terminal_size_exceeds_the_cell_budget() {
+        for rows in [1, 2, 499, 500, 501, 1_000, 1_999, 2_000, 2_001, 65_535] {
+            for cols in [1, 2, 499, 500, 501, 1_000, 1_999, 2_000, 2_001, 65_535] {
+                let size = clamp_terminal_size(Size { rows, cols });
+                assert!(size.rows >= 1 && size.cols >= 1);
+                assert!(
+                    size.rows * size.cols <= MAX_TERMINAL_CELLS,
+                    "{}x{} became {:?}",
+                    rows,
+                    cols,
+                    size
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn initial_size_from_the_query_is_clamped_and_needs_both_dimensions() {
+        assert_eq!(
+            client_size_from_params(Some(24), Some(80)),
+            Some(Size { rows: 24, cols: 80 })
+        );
+        assert_eq!(
+            client_size_from_params(Some(u16::MAX), Some(u16::MAX)),
+            Some(Size {
+                rows: 2_000,
+                cols: 500
+            })
+        );
+        assert_eq!(client_size_from_params(Some(0), Some(80)), None);
+        assert_eq!(client_size_from_params(Some(24), None), None);
+    }
 
     #[test]
     fn terminal_metrics_to_ipc_preserves_all_dimensions() {
