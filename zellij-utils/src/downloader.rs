@@ -210,7 +210,7 @@ impl Downloader {
             file_part_size = 0;
             res = send_following_redirects(client, &url, None).await?;
         }
-        ensure_success_status(res.status())?;
+        ensure_artifact_status(res.status(), file_part_size > 0)?;
         if file_part_size > 0 && res.status() != StatusCode::PARTIAL_CONTENT {
             // The server ignored the range and is sending the whole artifact:
             // appending it to the partial file would cache a corrupt plugin.
@@ -250,7 +250,7 @@ impl Downloader {
 
         let downloaded_bytes = tokio::time::timeout(deadline, async {
             let mut res = send_following_redirects(&client, &url, None).await?;
-            ensure_success_status(res.status())?;
+            ensure_artifact_status(res.status(), false)?;
             let mut downloaded_bytes: Vec<u8> = vec![];
             let body = res.body_mut();
             let mut stream = ReaderStream::with_capacity(body.compat(), STREAM_BUFFER_SIZE_BYTES);
@@ -376,11 +376,14 @@ fn content_range_start<T>(res: &isahc::Response<T>) -> Option<u64> {
     start.trim().parse().ok()
 }
 
-fn ensure_success_status(status: StatusCode) -> Result<(), DownloaderError> {
-    if status.is_success() {
-        Ok(())
-    } else {
-        Err(DownloaderError::UnexpectedStatus(status.as_u16()))
+/// Only a 200, or a 206 answering a resumed request, carries the artifact.
+/// Other 2xx statuses (204 No Content, 205, an unrequested 206, ...) would
+/// otherwise be cached as an empty or partial plugin.
+fn ensure_artifact_status(status: StatusCode, resuming: bool) -> Result<(), DownloaderError> {
+    match status {
+        StatusCode::OK => Ok(()),
+        StatusCode::PARTIAL_CONTENT if resuming => Ok(()),
+        _ => Err(DownloaderError::UnexpectedStatus(status.as_u16())),
     }
 }
 
@@ -445,17 +448,44 @@ mod tests {
     }
 
     #[test]
-    fn success_statuses_are_accepted() {
-        assert!(ensure_success_status(StatusCode::OK).is_ok());
-        assert!(ensure_success_status(StatusCode::PARTIAL_CONTENT).is_ok());
+    fn artifact_statuses_are_accepted() {
+        assert!(ensure_artifact_status(StatusCode::OK, false).is_ok());
+        assert!(ensure_artifact_status(StatusCode::OK, true).is_ok());
+        assert!(ensure_artifact_status(StatusCode::PARTIAL_CONTENT, true).is_ok());
     }
 
     #[test]
     fn non_success_statuses_are_rejected() {
         assert!(matches!(
-            ensure_success_status(StatusCode::NOT_FOUND),
+            ensure_artifact_status(StatusCode::NOT_FOUND, false),
             Err(DownloaderError::UnexpectedStatus(404))
         ));
+        assert!(matches!(
+            ensure_artifact_status(StatusCode::NO_CONTENT, true),
+            Err(DownloaderError::UnexpectedStatus(204))
+        ));
+        assert!(matches!(
+            ensure_artifact_status(StatusCode::PARTIAL_CONTENT, false),
+            Err(DownloaderError::UnexpectedStatus(206))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_empty_success_response_is_not_cached() {
+        let (base, _seen) = scripted_server(|_| {
+            Some("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_owned())
+        })
+        .await;
+        let location = tempdir().expect("Failed to create temp directory");
+        let result = Downloader::new(location.path().to_path_buf())
+            .download(&format!("{}/plugin.wasm", base), Some("plugin.wasm"))
+            .await;
+        assert!(
+            matches!(result, Err(DownloaderError::UnexpectedStatus(204))),
+            "unexpected result: {:?}",
+            result
+        );
+        assert!(!location.path().join("plugin.wasm").exists());
     }
 
     #[test]
