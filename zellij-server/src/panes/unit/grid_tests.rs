@@ -11660,3 +11660,129 @@ fn scroll_region_operations_never_grow_the_viewport_beyond_the_screen() {
         }
     }
 }
+
+#[test]
+fn scrolling_by_a_huge_count_adds_at_most_a_screenful_to_the_scrollback() {
+    for sequence in [
+        &b"\x1b[65535S"[..],
+        b"\x1b[65535T",
+        b"\x1b[65535M",
+        b"\x1b[65535L",
+        b"\x1b[3;8r\x1b[65535S",
+        b"\x1b[3;8r\x1b[3;1H\x1b[65535M",
+    ] {
+        let mut grid = create_grid_with_size_and_raw(10, 40, b"one\r\ntwo\r\nthree");
+        feed_bytes(&mut grid, sequence);
+        assert!(
+            grid.lines_above.len() <= grid.height,
+            "{:?} put {} lines in the scrollback",
+            sequence,
+            grid.lines_above.len()
+        );
+        assert!(grid.viewport.len() <= grid.height);
+    }
+}
+
+#[test]
+fn counts_larger_than_the_screen_still_have_their_full_effect() {
+    // SU: the whole screen scrolls into the scrollback and a blank one remains
+    let mut grid = create_grid_with_size_and_raw(5, 10, b"one\r\ntwo\r\nthree");
+    feed_bytes(&mut grid, b"\x1b[65535S");
+    assert_eq!(grid.lines_above.len(), 5);
+    assert_eq!(scrollback_texts(&grid)[..3], ["one", "two", "three"]);
+    assert!(viewport_texts(&grid)
+        .iter()
+        .all(|row| row.trim().is_empty()));
+    // IL / DL stop at the end of the region
+    let mut grid = create_grid_with_size_and_raw(5, 10, b"1\r\n2\r\n3\r\n4\r\n5\x1b[2;1H");
+    feed_bytes(&mut grid, b"\x1b[65535L");
+    assert_eq!(
+        viewport_texts(&grid)
+            .iter()
+            .map(|row| row.trim().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["1", "", "", "", ""]
+    );
+    let mut grid = create_grid_with_size_and_raw(5, 10, b"1\r\n2\r\n3\r\n4\r\n5\x1b[2;1H");
+    feed_bytes(&mut grid, b"\x1b[65535M");
+    assert_eq!(
+        viewport_texts(&grid)
+            .iter()
+            .map(|row| row.trim().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["1", "", "", "", ""]
+    );
+    // ICH / DCH / ECH
+    let row_after = |sequence: &[u8]| {
+        let mut grid = create_grid_with_size_and_raw(5, 10, b"abcdefghij\x1b[1;3H");
+        feed_bytes(&mut grid, sequence);
+        row_text(&grid.viewport[0]).trim_end().to_owned()
+    };
+    assert_eq!(row_after(b"\x1b[3@"), "ab   cdefg");
+    assert_eq!(row_after(b"\x1b[65535@"), "ab");
+    assert_eq!(row_after(b"\x1b[2P"), "abefghij");
+    assert_eq!(row_after(b"\x1b[65535P"), "ab");
+    assert_eq!(row_after(b"\x1b[3X"), "ab   fghij");
+    assert_eq!(row_after(b"\x1b[65535X"), "ab");
+    // CHT / CBT
+    let mut grid = create_grid_with_size_and_raw(5, 40, b"");
+    feed_bytes(&mut grid, b"\x1b[65535I");
+    assert_eq!(grid.cursor.x, 39);
+    feed_bytes(&mut grid, b"\x1b[65535Z");
+    assert_eq!(grid.cursor.x, 0);
+}
+
+#[test]
+fn repeating_a_character_wraps_like_typing_it() {
+    let typed = |count: usize, setup: &[u8]| {
+        let mut content = setup.to_vec();
+        content.extend(std::iter::repeat(b'a').take(count));
+        let grid = create_grid_with_size_and_raw(5, 10, &content);
+        (viewport_texts(&grid), grid.cursor.x, grid.cursor.y)
+    };
+    let repeated = |count: usize, setup: &[u8]| {
+        let mut content = setup.to_vec();
+        content.extend_from_slice(format!("a\x1b[{}b", count - 1).as_bytes());
+        let grid = create_grid_with_size_and_raw(5, 10, &content);
+        (viewport_texts(&grid), grid.cursor.x, grid.cursor.y)
+    };
+    for setup in [&b""[..], b"xyz\x1b[2;4H", b"\x1b[5;7H"] {
+        for count in [
+            2, 9, 10, 11, 25, 49, 59, 60, 61, 69, 70, 71, 72, 75, 81, 100, 1003, 65536,
+        ] {
+            assert_eq!(
+                typed(count, setup),
+                repeated(count, setup),
+                "count {} after {:?}",
+                count,
+                setup
+            );
+        }
+    }
+    // without line wrapping the repeat stops at the edge
+    let grid = create_grid_with_size_and_raw(5, 10, b"\x1b[?7la\x1b[65535b");
+    assert_eq!(viewport_texts(&grid)[0], "aaaaaaaaaa");
+    assert!(viewport_texts(&grid)[1..]
+        .iter()
+        .all(|row| row.trim().is_empty()));
+}
+
+#[test]
+fn huge_repeat_counts_cost_no_more_than_the_screen_allows() {
+    let mut grid = create_grid_with_size_and_raw(24, 80, b"abc");
+    let started = std::time::Instant::now();
+    for _ in 0..300 {
+        feed_bytes(
+            &mut grid,
+            b"\x1b[1;1H\x1b[65535@\x1b[65535P\x1b[65535X\x1b[65535I\x1b[65535Z",
+        );
+    }
+    for _ in 0..20 {
+        feed_bytes(&mut grid, b"a\x1b[65535b");
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+}

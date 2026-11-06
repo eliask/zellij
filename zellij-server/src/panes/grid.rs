@@ -2615,6 +2615,11 @@ impl Grid {
     }
     pub fn rotate_scroll_region_up(&mut self, count: usize) {
         let (scroll_region_top, scroll_region_bottom) = self.scroll_region;
+        // scrolling by more than the height of the region cannot show anything more
+        let count = std::cmp::min(
+            count,
+            scroll_region_bottom.saturating_sub(scroll_region_top) + 1,
+        );
         self.pad_lines_until(scroll_region_bottom, EMPTY_TERMINAL_CHARACTER);
         for _ in 0..count {
             if self.cursor.y >= scroll_region_top && self.cursor.y <= scroll_region_bottom {
@@ -2632,6 +2637,11 @@ impl Grid {
     }
     pub fn rotate_scroll_region_down(&mut self, count: usize) {
         let (scroll_region_top, scroll_region_bottom) = self.scroll_region;
+        // scrolling by more than the height of the region cannot show anything more
+        let count = std::cmp::min(
+            count,
+            scroll_region_bottom.saturating_sub(scroll_region_top) + 1,
+        );
         self.pad_lines_until(scroll_region_bottom, EMPTY_TERMINAL_CHARACTER);
         let mut pad_character = EMPTY_TERMINAL_CHARACTER;
         pad_character.styles = self.cursor.pending_styles.clone();
@@ -3240,6 +3250,12 @@ impl Grid {
         let (scroll_region_top, scroll_region_bottom) = self.scroll_region;
         let current_line_index = self.cursor.y;
         if current_line_index >= scroll_region_top && current_line_index <= scroll_region_bottom {
+            // deleting more lines than there are from the cursor to the end of the region
+            // cannot do anything more
+            let count = std::cmp::min(
+                count,
+                scroll_region_bottom.saturating_sub(current_line_index) + 1,
+            );
             // when deleting lines inside the scroll region, we must make sure it stays the
             // same size (and that other lines below it aren't shifted inside it)
             // so we delete the current line(s) and add an empty line at the end of the scroll
@@ -3264,6 +3280,12 @@ impl Grid {
         let (scroll_region_top, scroll_region_bottom) = self.scroll_region;
         let current_line_index = self.cursor.y;
         if current_line_index >= scroll_region_top && current_line_index <= scroll_region_bottom {
+            // inserting more lines than there are from the cursor to the end of the region
+            // cannot do anything more
+            let count = std::cmp::min(
+                count,
+                scroll_region_bottom.saturating_sub(current_line_index) + 1,
+            );
             // when adding empty lines inside the scroll region, we must make sure it stays the
             // same size and that lines don't "leak" outside of it
             // so we add an empty line where the cursor currently is, and delete the last line
@@ -3293,6 +3315,8 @@ impl Grid {
     pub fn replace_with_empty_chars(&mut self, count: usize, empty_char_style: RcCharacterStyles) {
         let mut empty_character = EMPTY_TERMINAL_CHARACTER;
         empty_character.styles = empty_char_style;
+        // nothing past the end of the line can be erased
+        let count = std::cmp::min(count, self.width.saturating_sub(self.cursor.x));
         let pad_until = std::cmp::min(self.width, self.cursor.x + count);
         self.pad_current_line_until(pad_until, empty_character.clone());
         if let Some(current_row) = self.viewport.get_mut(self.cursor.y) {
@@ -3303,6 +3327,8 @@ impl Grid {
         }
     }
     fn erase_characters(&mut self, count: usize, empty_char_style: RcCharacterStyles) {
+        // nothing past the end of the line can be deleted
+        let count = std::cmp::min(count, self.width.saturating_sub(self.cursor.x));
         let mut empty_character = EMPTY_TERMINAL_CHARACTER;
         empty_character.styles = empty_char_style;
         if let Some(current_row) = self.viewport.get_mut(self.cursor.y) {
@@ -6491,7 +6517,8 @@ impl Handler for Grid {
         } else if c == 'u' {
             self.restore_cursor_position();
         } else if c == '@' {
-            let count = next_param_or(1);
+            // characters inserted past the end of the line are pushed off it
+            let count = std::cmp::min(next_param_or(1), self.width.saturating_sub(self.cursor.x));
             for _ in 0..count {
                 let mut pad_character = EMPTY_TERMINAL_CHARACTER;
                 pad_character.styles = self.cursor.pending_styles.clone();
@@ -6499,7 +6526,23 @@ impl Handler for Grid {
             }
         } else if c == 'b' {
             if let Some(c) = self.preceding_char.clone() {
-                for _ in 0..next_param_or(1) {
+                let count = next_param_or(1);
+                let count = if self.disable_linewrap {
+                    // everything past the edge of the line is dropped
+                    std::cmp::min(count, self.width.saturating_sub(self.cursor.x))
+                } else {
+                    // once the repeat has filled the screen, more characters only move the
+                    // cursor along the last line: skip whole lines of them, keeping the
+                    // position within the line the repeat would have ended at
+                    let per_line = std::cmp::max(1, self.width / std::cmp::max(1, c.width()));
+                    let screenful = per_line.saturating_mul(self.height.saturating_add(1));
+                    if count > screenful.saturating_add(per_line) {
+                        screenful + count % per_line
+                    } else {
+                        count
+                    }
+                };
+                for _ in 0..count {
                     self.add_character(c.clone());
                 }
             }
@@ -6515,7 +6558,8 @@ impl Handler for Grid {
             self.move_cursor_up(count);
             self.move_cursor_to_beginning_of_line();
         } else if c == 'I' {
-            for _ in 0..next_param_or(1) {
+            // there are no more tab stops than columns
+            for _ in 0..std::cmp::min(next_param_or(1), self.width) {
                 self.advance_to_next_tabstop(self.cursor.pending_styles.clone());
             }
         } else if c == 'q' {
@@ -6543,7 +6587,8 @@ impl Handler for Grid {
                     .push(xtversion.as_bytes().to_vec());
             }
         } else if c == 'Z' {
-            for _ in 0..next_param_or(1) {
+            // there are no more tab stops than columns
+            for _ in 0..std::cmp::min(next_param_or(1), self.width) {
                 self.move_to_previous_tabstop();
             }
         } else if c == 'c' {
