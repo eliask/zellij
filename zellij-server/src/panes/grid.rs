@@ -2804,7 +2804,8 @@ impl Grid {
             self.kitty_reanchor_all_from_pixels();
             return;
         }
-        if self.viewport.len() <= self.cursor.y + 1 {
+        // (on the last line of the screen, below the scroll region, there is no line to add)
+        if self.viewport.len() <= self.cursor.y + 1 && self.cursor.y + 1 < self.height {
             // FIXME: this should add an empty line with the pad_character
             // but for some reason this breaks rendering in various situations
             // it needs to be investigated and fixed

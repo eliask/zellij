@@ -11786,3 +11786,13 @@ fn huge_repeat_counts_cost_no_more_than_the_screen_allows() {
         started.elapsed()
     );
 }
+
+#[test]
+fn a_newline_below_the_scroll_region_on_the_last_line_does_not_add_a_row() {
+    let mut grid = create_grid_with_size_and_raw(10, 40, b"\x1b[1;3r\x1b[10;1H");
+    for _ in 0..5 {
+        feed_bytes(&mut grid, b"\n");
+        assert!(grid.viewport.len() <= grid.height);
+    }
+    assert_eq!(grid.cursor.y, 9);
+}
