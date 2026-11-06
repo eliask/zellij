@@ -1687,18 +1687,18 @@ fn show_cursor(env: &PluginEnv, cursor_position: Option<(usize, usize)>) {
 }
 
 fn request_permission(env: &PluginEnv, permissions: Vec<PermissionType>) -> Result<()> {
+    let permission_cache_key = permission_cache_key(env);
     if env.plugin.is_builtin()
         || PermissionCache::from_path_or_default(None)
-            .check_permissions(env.plugin.location.to_string(), &permissions)
+            .check_permissions(permission_cache_key, &permissions)
     {
+        // already granted for these exact module bytes, no prompt is involved
         return env
             .senders
-            .send_to_plugin(PluginInstruction::PermissionRequestResult(
+            .send_to_plugin(PluginInstruction::GrantKnownPermissions(
                 env.plugin_id,
                 Some(acting_client(env)),
                 permissions.to_vec(),
-                PermissionStatus::Granted,
-                None,
             ));
     }
 
@@ -1708,6 +1708,8 @@ fn request_permission(env: &PluginEnv, permissions: Vec<PermissionType>) -> Resu
         .senders
         .send_to_plugin(PluginInstruction::CachePluginEvents {
             plugin_id: env.plugin_id,
+            generation: env.generation,
+            digest: env.plugin_digest.clone(),
         });
 
     env.senders
@@ -1715,6 +1717,10 @@ fn request_permission(env: &PluginEnv, permissions: Vec<PermissionType>) -> Resu
             permission_pane_id(env),
             PluginPermission::new(env.plugin.location.to_string(), permissions),
         ))
+}
+
+fn permission_cache_key(env: &PluginEnv) -> String {
+    format!("{}#{}", env.plugin.location, env.plugin_digest)
 }
 
 fn get_plugin_ids(env: &PluginEnv) {
@@ -6552,9 +6558,10 @@ fn clear_key_presses_intercepts(env: &mut PluginEnv) {
     env.intercepting_key_presses = false;
     let _ = env
         .senders
-        .send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(acting_client(
-            env,
-        )));
+        .send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(
+            env.plugin_id,
+            acting_client(env),
+        ));
 }
 
 fn replace_pane_with_existing_pane(
@@ -6639,7 +6646,13 @@ fn report_panic(env: &PluginEnv, msg: &str) {
             .send_to_plugin(PluginInstruction::UnregisterSettingsEntry(env.plugin_id));
     }
     for pane_id in crash_pane_ids(env) {
-        handle_plugin_crash(pane_id, msg.to_owned(), env.senders.clone());
+        handle_plugin_crash(pane_id, env.generation, msg.to_owned(), env.senders.clone());
+    }
+    if env.shared.is_some() {
+        // shared events and pipes are dispatched by instance id, see `Quarantine`
+        let _ = env
+            .senders
+            .send_to_plugin(PluginInstruction::Quarantine(env.plugin_id, env.generation));
     }
 }
 
