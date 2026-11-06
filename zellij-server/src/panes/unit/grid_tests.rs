@@ -11891,3 +11891,32 @@ fn no_row_is_wider_than_the_pane_after_it_shrinks_below_a_wide_character() {
     grid.change_size(3, 10);
     assert!(grid.viewport.iter().all(|row| row.width() <= 10));
 }
+
+#[test]
+fn a_scroll_region_below_the_screen_cannot_make_scrolling_grow_the_viewport() {
+    let mut content = Vec::new();
+    for line in 0..24 {
+        content.extend_from_slice(format!("line {}\r\n", line).as_bytes());
+    }
+    for region in ["42;96", "100;200", "30;24", "25;30", "24;24", "1;1"] {
+        for operation in ["S", "T", "L", "M", "\n"] {
+            let mut grid = create_grid_with_size_and_raw(24, 80, &content);
+            let operation_bytes = if operation == "\n" {
+                operation.to_owned()
+            } else {
+                format!("\x1b[{}", operation)
+            };
+            feed_bytes(
+                &mut grid,
+                format!("\x1b[{}r{}", region, operation_bytes).as_bytes(),
+            );
+            assert_eq!(
+                grid.viewport.len(),
+                24,
+                "region {} then {:?}",
+                region,
+                operation
+            );
+        }
+    }
+}
