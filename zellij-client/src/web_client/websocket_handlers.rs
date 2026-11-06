@@ -8,13 +8,14 @@ use crate::web_client::message_handlers::{
 };
 use crate::web_client::server_listener::zellij_server_listener;
 use crate::web_client::types::{AppState, ControlParams, TerminalParams};
+use crate::web_client::utils::websocket_origin_is_allowed;
 
 use axum::{
     extract::{
         ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade},
         Path as AxumPath, Query, State,
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures::StreamExt;
@@ -136,11 +137,16 @@ enum TerminalSocketEvent {
 
 pub async fn ws_handler_control(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     _path: Option<AxumPath<String>>,
     Query(params): Query<ControlParams>,
     State(state): State<AppState>,
     axum::Extension(session_token_hash): axum::Extension<SessionTokenHash>,
 ) -> Response {
+    if !websocket_origin_is_allowed(&headers, state.is_https) {
+        log::warn!("Control WebSocket: refusing upgrade from a foreign Origin");
+        return StatusCode::FORBIDDEN.into_response();
+    }
     if !state
         .connection_table
         .lock()
@@ -158,11 +164,16 @@ pub async fn ws_handler_control(
 
 pub async fn ws_handler_terminal(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     session_name: Option<AxumPath<String>>,
     Query(params): Query<TerminalParams>,
     State(state): State<AppState>,
     axum::Extension(session_token_hash): axum::Extension<SessionTokenHash>,
-) -> impl IntoResponse {
+) -> Response {
+    if !websocket_origin_is_allowed(&headers, state.is_https) {
+        log::warn!("Terminal WebSocket: refusing upgrade from a foreign Origin");
+        return StatusCode::FORBIDDEN.into_response();
+    }
     ws.on_upgrade(move |socket| {
         handle_ws_terminal(socket, session_name, params, state, session_token_hash)
     })

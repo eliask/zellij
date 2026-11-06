@@ -3869,6 +3869,86 @@ mod web_client_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    /// Attempts a websocket handshake the way a browser page would: addressed
+    /// to `127.0.0.1:port` and carrying the given `Origin`. Returns the HTTP
+    /// status of a refused handshake as the error.
+    async fn try_websocket_with_origin(
+        url: &str,
+        session_token: &str,
+        port: u16,
+        origin: &str,
+    ) -> Result<(), u16> {
+        let request = Request::builder()
+            .uri(url)
+            .header("Cookie", format!("session_token={}", session_token))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("Host", format!("127.0.0.1:{}", port))
+            .header("Origin", origin)
+            .body(())
+            .unwrap();
+        match timeout(Duration::from_secs(5), connect_async(request))
+            .await
+            .expect("websocket handshake timed out")
+        {
+            Ok(_) => Ok(()),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                Err(response.status().as_u16())
+            },
+            Err(e) => panic!("unexpected websocket error: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_websocket_upgrade_from_a_foreign_origin_is_refused() {
+        let _ = delete_db();
+        let test_token_name = "test_token_foreign_origin";
+        let (auth_token, _) =
+            create_token(Some(test_token_name.to_string()), false).expect("token");
+
+        let (port, server_handle, _factory) = spawn_structured_test_server().await;
+        let session_token = login_and_get_session_token(port, &auth_token).await;
+        let web_client_id = create_client_session(port, &session_token).await;
+        let own_origin = format!("http://127.0.0.1:{}", port);
+
+        for (kind, path) in [
+            ("control", "ws/control?web_client_id="),
+            (
+                "terminal",
+                "ws/terminal/origin-test?rows=24&cols=80&web_client_id=",
+            ),
+        ] {
+            let url = format!("ws://127.0.0.1:{}/{}{}", port, path, web_client_id);
+            for foreign in [
+                "https://evil.example",
+                "http://127.0.0.1:1",
+                "http://localhost:80",
+                "null",
+            ] {
+                assert_eq!(
+                    try_websocket_with_origin(&url, &session_token, port, foreign).await,
+                    Err(403),
+                    "{} websocket from origin {} must be refused",
+                    kind,
+                    foreign
+                );
+            }
+            assert_eq!(
+                try_websocket_with_origin(&url, &session_token, port, &own_origin).await,
+                Ok(()),
+                "{} websocket from the server's own origin must be accepted",
+                kind
+            );
+        }
+
+        server_handle.abort();
+        let _ = delete_db();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     async fn post_login(port: u16, auth_token: &str) -> isahc::Response<isahc::Body> {
         let login_url = format!("http://127.0.0.1:{}/command/login", port);
         let payload = serde_json::json!({ "auth_token": auth_token }).to_string();
