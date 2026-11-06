@@ -137,7 +137,7 @@ fn write_changed_styles(
     character_styles: &mut CharacterStyles,
     current_character_styles: CharacterStyles,
     chunk_changed_colors: Option<[Option<AnsiCode>; 256]>,
-    link_handler: Option<&std::cell::Ref<LinkHandler>>,
+    link_handler: Option<&LinkHandler>,
     osc8_hyperlinks: bool,
     vte_output: &mut String,
 ) -> Result<()> {
@@ -188,6 +188,8 @@ fn serialize_chunks_with_newlines(
         let chunk_changed_colors = character_chunk.changed_colors();
         let pane_default_fg = character_chunk.pane_default_fg;
         let pane_default_bg = character_chunk.pane_default_bg;
+        let chunk_link_handler = character_chunk.link_handler.as_ref().map(|h| h.borrow());
+        let link_handler = chunk_link_handler.as_deref().or(link_handler.as_deref());
         let mut character_styles = DEFAULT_STYLES.enable_styled_underlines(styled_underlines);
         if chunk_starts_a_line
             .get(chunk_index)
@@ -219,7 +221,7 @@ fn serialize_chunks_with_newlines(
                 &mut character_styles,
                 current_character_styles,
                 chunk_changed_colors,
-                link_handler.as_ref(),
+                link_handler,
                 osc8_hyperlinks,
                 &mut vte_output,
             )
@@ -664,6 +666,13 @@ fn flatten_chunks(
         let pane_default_fg = character_chunk.pane_default_fg;
         let pane_default_bg = character_chunk.pane_default_bg;
         let styles_vary_by_column = !character_chunk.selection_and_colors().is_empty();
+        // Link ids are only meaningful in the table that issued them, so a
+        // chunk from a pane resolves its links through that pane's own
+        // handler; chunks without one use the output's handler.
+        let chunk_link_handler = character_chunk.link_handler.as_ref().map(|h| h.borrow());
+        let link_handler: Option<&LinkHandler> = chunk_link_handler
+            .as_deref()
+            .or_else(|| links.as_deref().map(|links| links.handler));
         let mut last_styled: Option<(RcCharacterStyles, WireCell)> = None;
         run.clear();
         let cells = &character_chunk.terminal_characters;
@@ -727,7 +736,9 @@ fn flatten_chunks(
                     },
                 };
                 if let Some(links) = links.as_deref_mut() {
-                    if let Some(uri) = links.handler.uri(t_character.styles.link_anchor) {
+                    if let Some(uri) =
+                        link_handler.and_then(|h| h.uri(t_character.styles.link_anchor))
+                    {
                         cell.link = links.table.id_for(uri, cols, rows);
                     }
                 }
@@ -789,7 +800,7 @@ fn flatten_chunks(
                     cell.attrs |= ATTR_GROUP_CONTINUE;
                 }
                 if let Some(links) = links.as_deref_mut() {
-                    if let Some(uri) = links.handler.uri(member.styles.link_anchor) {
+                    if let Some(uri) = link_handler.and_then(|h| h.uri(member.styles.link_anchor)) {
                         cell.link = links.table.id_for(uri, cols, rows);
                     }
                 }
@@ -941,6 +952,8 @@ fn serialize_chunks(
         let chunk_changed_colors = character_chunk.changed_colors();
         let pane_default_fg = character_chunk.pane_default_fg;
         let pane_default_bg = character_chunk.pane_default_bg;
+        let chunk_link_handler = character_chunk.link_handler.as_ref().map(|h| h.borrow());
+        let link_handler = chunk_link_handler.as_deref().or(link_handler.as_deref());
         let mut character_styles = DEFAULT_STYLES.enable_styled_underlines(styled_underlines);
         vte_goto_instruction(character_chunk.x, character_chunk.y, &mut vte_output)
             .with_context(err_context)?;
@@ -981,7 +994,7 @@ fn serialize_chunks(
                     &mut character_styles,
                     current_character_styles,
                     chunk_changed_colors,
-                    link_handler.as_ref(),
+                    link_handler,
                     osc8_hyperlinks,
                     &mut vte_output,
                 )
@@ -1041,7 +1054,7 @@ fn serialize_chunks(
                 &mut character_styles,
                 current_character_styles,
                 chunk_changed_colors,
-                link_handler.as_ref(),
+                link_handler,
                 osc8_hyperlinks,
                 &mut vte_output,
             )
@@ -3099,6 +3112,7 @@ impl FloatingPanesStack {
                 left_chunk.pane_default_bg = c_chunk.pane_default_bg;
                 left_chunk.changed_colors = c_chunk.changed_colors;
                 left_chunk.may_have_groups = c_chunk.may_have_groups;
+                left_chunk.link_handler = c_chunk.link_handler.clone();
                 // The left part starts where the original chunk started, so it needs erasing
                 // only if the original did.
                 left_chunk.erase_first = c_chunk.erase_first;
@@ -3348,6 +3362,10 @@ pub struct CharacterChunk {
     pub pane_default_bg: Option<AnsiCode>,
     selection_and_colors: Vec<HighlightSelection>,
     pub row_shift: Option<RowShift>,
+    /// The handler that issued the link ids in `terminal_characters`, when
+    /// the chunk comes from a pane that owns one. Ids resolve through it
+    /// regardless of which tab the pane is displayed in.
+    pub link_handler: Option<Rc<RefCell<LinkHandler>>>,
 }
 
 pub use crate::panes::kitty_graphics::grid_state::KittyImageChunk;
