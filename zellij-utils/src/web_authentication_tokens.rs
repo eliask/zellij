@@ -2,7 +2,9 @@
 use crate::consts::ZELLIJ_PROJ_DIR;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -72,26 +74,70 @@ fn get_db_path() -> Result<PathBuf> {
     Ok(db_path)
 }
 
-fn open_db() -> Result<Connection> {
-    let db_path = get_db_path()?;
-    let conn = Connection::open(&db_path)?;
-    init_db(&conn)?;
+/// Database files whose schema has already been set up by this process.
+///
+/// Schema setup (several `CREATE TABLE IF NOT EXISTS` statements and a
+/// migration) only has to run once per database file, not on every request.
+static INITIALIZED_DBS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
-    // Set restrictive permissions on the database file
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(&db_path, perms);
+#[cfg(test)]
+static SCHEMA_INIT_COUNTS: Mutex<Option<std::collections::HashMap<PathBuf, usize>>> =
+    Mutex::new(None);
+
+fn open_db() -> Result<Connection> {
+    open_db_at(&get_db_path()?)
+}
+
+fn open_db_at(db_path: &Path) -> Result<Connection> {
+    let freshly_created = create_private_db_file(db_path)?;
+    let conn = Connection::open(db_path)?;
+    // these are per-connection settings, so they have to be applied every time
+    conn.execute_batch("PRAGMA busy_timeout = 5000")?;
+    conn.execute_batch("PRAGMA foreign_keys = ON")?;
+
+    let mut initialized = INITIALIZED_DBS.lock().unwrap();
+    let initialized = initialized.get_or_insert_with(HashSet::new);
+    if freshly_created {
+        // the file was (re)created behind our back, so whatever we knew about
+        // its schema is stale
+        initialized.remove(db_path);
+    }
+    if !initialized.contains(db_path) {
+        init_db(&conn)?;
+        initialized.insert(db_path.to_path_buf());
+        #[cfg(test)]
+        {
+            *SCHEMA_INIT_COUNTS
+                .lock()
+                .unwrap()
+                .get_or_insert_with(Default::default)
+                .entry(db_path.to_path_buf())
+                .or_insert(0) += 1;
+        }
     }
 
     Ok(conn)
 }
 
-fn init_db(conn: &Connection) -> Result<()> {
-    conn.execute_batch("PRAGMA busy_timeout = 5000")?;
-    conn.execute_batch("PRAGMA foreign_keys = ON")?;
+/// Creates the database file if it does not exist yet. On unix it is created
+/// with mode 0600 right away, so there is no window in which it is readable by
+/// other users. Returns whether this call created the file.
+fn create_private_db_file(db_path: &Path) -> Result<bool> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(db_path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
 
+fn init_db(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -374,7 +420,10 @@ pub fn list_tokens() -> Result<Vec<TokenInfo>> {
 pub fn delete_db() -> Result<()> {
     let db_path = get_db_path()?;
     if db_path.exists() {
-        std::fs::remove_file(db_path)?;
+        std::fs::remove_file(&db_path)?;
+    }
+    if let Some(initialized) = INITIALIZED_DBS.lock().unwrap().as_mut() {
+        initialized.remove(&db_path);
     }
     Ok(())
 }
@@ -390,4 +439,62 @@ pub fn validate_token(token: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(count > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema_init_count(db_path: &Path) -> usize {
+        SCHEMA_INIT_COUNTS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|counts| counts.get(db_path).copied())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn schema_is_set_up_once_per_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tokens.db");
+        for _ in 0..5 {
+            let conn = open_db_at(&db_path).unwrap();
+            // the schema is there for every connection
+            conn.query_row("SELECT COUNT(*) FROM session_tokens", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        }
+        assert_eq!(schema_init_count(&db_path), 1);
+    }
+
+    #[test]
+    fn schema_is_set_up_again_if_the_database_file_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tokens.db");
+        drop(open_db_at(&db_path).unwrap());
+        std::fs::remove_file(&db_path).unwrap();
+        let conn = open_db_at(&db_path).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM tokens", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(schema_init_count(&db_path), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_file_is_private_from_the_moment_it_is_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tokens.db");
+        // a permissive umask must not leak into the new file
+        let old_umask = unsafe { libc::umask(0) };
+        let created = create_private_db_file(&db_path);
+        unsafe { libc::umask(old_umask) };
+        assert!(created.unwrap());
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // creating it a second time reports that it already existed
+        assert!(!create_private_db_file(&db_path).unwrap());
+    }
 }
