@@ -3806,6 +3806,69 @@ mod web_client_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    /// Reads from a websocket until it is closed (a close frame, an error or the
+    /// end of the stream). Returns false if it is still open after `within`.
+    async fn closes_within<S>(stream: &mut S, within: Duration) -> bool
+    where
+        S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        let deadline = Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match timeout(remaining, stream.next()).await {
+                Err(_) => return false,
+                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return true,
+                Ok(Some(Ok(_))) => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_revoking_a_token_closes_its_live_websockets() {
+        let _ = delete_db();
+        let test_token_name = "test_token_revoked_while_connected";
+        let (auth_token, _) =
+            create_token(Some(test_token_name.to_string()), false).expect("token");
+
+        let (port, server_handle, factory) = spawn_structured_test_server().await;
+        let session_token = login_and_get_session_token(port, &auth_token).await;
+        let mut client = attach_test_client(port, &session_token, &factory, true).await;
+
+        // several recheck intervals pass and the still valid session is left alone
+        assert!(
+            !closes_within(&mut client.control_stream, Duration::from_millis(800)).await,
+            "a valid session must keep its control websocket"
+        );
+        assert!(
+            !closes_within(&mut client.terminal_stream, Duration::from_millis(100)).await,
+            "a valid session must keep its terminal websocket"
+        );
+
+        revoke_token(test_token_name).expect("Failed to revoke test token");
+
+        assert!(
+            closes_within(&mut client.control_stream, Duration::from_secs(5)).await,
+            "the control websocket must be closed once the token is revoked"
+        );
+        assert!(
+            closes_within(&mut client.terminal_stream, Duration::from_secs(5)).await,
+            "the terminal websocket must be closed once the token is revoked"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || client
+                .sent_to_session()
+                .contains(&ClientToServerMsg::ClientExited))
+            .await,
+            "the session must be told that the client is gone"
+        );
+
+        server_handle.abort();
+        let _ = delete_db();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     async fn post_login(port: u16, auth_token: &str) -> isahc::Response<isahc::Body> {
         let login_url = format!("http://127.0.0.1:{}/command/login", port);
         let payload = serde_json::json!({ "auth_token": auth_token }).to_string();

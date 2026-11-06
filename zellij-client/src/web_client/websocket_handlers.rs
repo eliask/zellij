@@ -28,10 +28,65 @@ use zellij_utils::{
     input::mouse::MouseEvent,
     ipc::{ClientToServerMsg, PixelDimensions},
     pane_size::{Size, SizeInPixels},
+    web_authentication_tokens::session_allows_live_connection,
 };
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How often a live websocket checks that the session token it was opened with
+/// is still valid (not revoked and not expired). Kept apart from the ping
+/// interval so that a revoked token is noticed reasonably fast, but it is still
+/// a single indexed lookup per connection every few seconds, never per message.
+#[cfg(not(test))]
+const SESSION_RECHECK_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const SESSION_RECHECK_INTERVAL: Duration = Duration::from_millis(200);
+
+struct SessionWatch {
+    interval: Interval,
+    session_token_hash: String,
+}
+
+impl SessionWatch {
+    fn new(session_token_hash: String) -> Self {
+        let mut interval = tokio::time::interval_at(
+            Instant::now() + SESSION_RECHECK_INTERVAL,
+            SESSION_RECHECK_INTERVAL,
+        );
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        SessionWatch {
+            interval,
+            session_token_hash,
+        }
+    }
+
+    async fn tick(&mut self) {
+        self.interval.tick().await;
+    }
+
+    /// False only if the token is known to be revoked or expired. If the
+    /// database cannot be consulted we keep the connection and look again at
+    /// the next tick.
+    async fn is_still_valid(&self) -> bool {
+        let session_token_hash = self.session_token_hash.clone();
+        match tokio::task::spawn_blocking(move || {
+            session_allows_live_connection(&session_token_hash)
+        })
+        .await
+        {
+            Ok(Ok(valid)) => valid,
+            Ok(Err(e)) => {
+                log::warn!("Could not re-validate a web session: {}", e);
+                true
+            },
+            Err(e) => {
+                log::warn!("Could not re-validate a web session: {}", e);
+                true
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeartbeatTick {
@@ -76,6 +131,7 @@ enum TerminalSocketEvent {
     Closed,
     FinalizeIdle,
     Heartbeat(HeartbeatTick),
+    SessionRecheck,
 }
 
 pub async fn ws_handler_control(
@@ -97,7 +153,7 @@ pub async fn ws_handler_control(
         );
         return StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_control(socket, params, state))
+    ws.on_upgrade(move |socket| handle_ws_control(socket, params, state, session_token_hash))
 }
 
 pub async fn ws_handler_terminal(
@@ -112,7 +168,12 @@ pub async fn ws_handler_terminal(
     })
 }
 
-async fn handle_ws_control(socket: WebSocket, params: ControlParams, state: AppState) {
+async fn handle_ws_control(
+    socket: WebSocket,
+    params: ControlParams,
+    state: AppState,
+    session_token_hash: SessionTokenHash,
+) {
     let web_client_id = params.web_client_id;
 
     let (control_socket_tx, mut control_socket_rx) = socket.split();
@@ -128,6 +189,7 @@ async fn handle_ws_control(socket: WebSocket, params: ControlParams, state: AppS
         .add_client_control_tx(&web_client_id, control_channel_tx);
 
     let mut heartbeat = Heartbeat::new(PING_INTERVAL, PONG_TIMEOUT);
+    let mut session_watch = SessionWatch::new(session_token_hash.0);
 
     let send_message_to_server = |deserialized_msg: WebClientToWebServerControlMessage| {
         let (client_os_api, is_structured) = {
@@ -174,6 +236,25 @@ async fn handle_ws_control(socket: WebSocket, params: ControlParams, state: AppS
                         })));
                         break;
                     },
+                }
+                continue;
+            },
+            _ = session_watch.tick() => {
+                if !session_watch.is_still_valid().await {
+                    log::info!(
+                        "Control WebSocket for web_client_id {} closed: session token is no longer valid",
+                        web_client_id
+                    );
+                    let _ = heartbeat_tx.send(Message::Close(Some(CloseFrame {
+                        code: close_code::POLICY,
+                        reason: "Session expired or revoked".into(),
+                    })));
+                    state
+                        .connection_table
+                        .lock()
+                        .unwrap()
+                        .remove_client(&web_client_id);
+                    break;
                 }
                 continue;
             },
@@ -326,6 +407,7 @@ async fn handle_ws_terminal(
     let mut stdin_session = StdinSession::new(explicitly_disable_kitty_keyboard_protocol);
     let finalize_idle = std::time::Duration::from_millis(50);
     let mut heartbeat = Heartbeat::new(PING_INTERVAL, PONG_TIMEOUT);
+    let mut session_watch = SessionWatch::new(session_token_hash.0.clone());
     loop {
         // When termwiz is holding ambiguous-but-complete events from
         // the previous frame, race the next frame against an idle
@@ -340,6 +422,7 @@ async fn handle_ws_terminal(
                 TerminalSocketEvent::FinalizeIdle
             },
             tick = heartbeat.tick() => TerminalSocketEvent::Heartbeat(tick),
+            _ = session_watch.tick() => TerminalSocketEvent::SessionRecheck,
         };
         let msg = match event {
             TerminalSocketEvent::Frame(m) => m,
@@ -359,6 +442,21 @@ async fn handle_ws_terminal(
                     .unwrap()
                     .remove_client(&web_client_id);
                 break;
+            },
+            TerminalSocketEvent::SessionRecheck => {
+                if !session_watch.is_still_valid().await {
+                    log::info!(
+                        "Terminal WebSocket for web_client_id {} closed: session token is no longer valid",
+                        web_client_id
+                    );
+                    state
+                        .connection_table
+                        .lock()
+                        .unwrap()
+                        .remove_client(&web_client_id);
+                    break;
+                }
+                continue;
             },
             TerminalSocketEvent::FinalizeIdle => {
                 // Idle timeout fired with `pending_finalize` set:
