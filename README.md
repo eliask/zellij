@@ -41,7 +41,9 @@
 
 ## About this fork
 
-This is a fork of [Zellij](https://github.com/zellij-org/zellij), based on upstream commit `87276681`. It hardens the server, the client and the plugin host against hostile input: output from a program running in a pane (`cat` of an untrusted file, an `ssh` session to a hostile host), a misbehaving plugin, or a misbehaving client. It also fixes a number of correctness and performance problems found while doing so. Apart from the plugin changes listed below, nothing here changes how Zellij is used.
+This is a fork of [Zellij](https://github.com/zellij-org/zellij), based on upstream commit `87276681`. It hardens the server, the client and the plugin host against hostile input: output from a program running in a pane (`cat` of an untrusted file, an `ssh` session to a hostile host), a misbehaving plugin, or a misbehaving client. It also fixes a number of correctness and performance problems found while doing so.
+
+Some of that hardening is visible. A character wider than the pane is clipped while the pane is that narrow and restored when the pane grows, instead of being kept on a row wider than the pane. Output and exits that arrive before a pane exists are bounded; past the cap, further panes are not started, and output that does not fit is cut off with an explicit notice rather than replayed as a suffix. Kitty file, temporary-file and shared-memory image transfers from pane output are refused; direct image data still works. Plugin downloads are not resumed from a partial file. A plugin callback that asks the host to wait is cut off with an error when its time budget runs out, rather than reporting that the timer elapsed. Scrolling still uses the existing catch-up path: it has been bounded, not replaced by an independent view.
 
 Every change lives on its own topic branch of this repository, each one small enough to review (and to cherry-pick or upstream) on its own. `main` is those branches merged together, plus this README.
 
@@ -63,18 +65,18 @@ To try it without touching an existing install, give cargo another root: `cargo 
 
 #### Small fixes (`audit/local-fixes`)
 - Output of a pane can no longer make the server retain unbounded memory through OSC and DCS payloads, titles, hyperlinks, scroll and search loops, malformed reflows, scrolled-pane output or per-client history.
-- Hyperlink anchors no longer go stale or get reused, detected links are budgeted, and an oversized wide character no longer leaves a phantom row.
+- Hyperlink anchors no longer go stale or get reused, and detected links are budgeted. An oversized wide character is clipped to the pane and restored when the pane is wide enough again, instead of leaving a row wider than the pane.
 - State files (resurrection layouts, session metadata) are replaced atomically; IPC frames have a size limit in both directions; a failed flush or send is reported and stops the writer.
 - PTY handling: interrupted reads are retried, descriptors do not leak, a reaped child's PID is forgotten, a launch no longer panics, and a held pane's process is tracked by run.
 - Clipboard helpers are fed through a bounded queue and reaped, copy commands with quoted arguments are parsed properly and a stalled helper is killed.
 - Background jobs bound their timers and deduplication state; several screen paths skip redundant renders.
 - Plugin host: consistent executor lock ordering, live executor thread counts, reload validated before state is changed.
-- Downloads fail closed on setup errors, HTTP errors and ignored resumes; `rustls` is updated for published security fixes; the xtask invalidates plugin assets from the real inputs.
+- Downloads fail closed on setup errors and HTTP errors, and a partial download is not resumed; `rustls` is updated for published security fixes; the xtask invalidates plugin assets from the real inputs.
 
 #### Hostile pane output
 - `fix/pane-output-bounds`: escape sequences from a pane can no longer crash the server (the plugin-only UI component sequence is only parsed for plugin panes, a saved cursor survives the switch to the alternate screen safely, invalid scroll regions and huge repeat, insert, delete and scroll counts are clamped) or let a pane exceed its own size.
 - `fix/graphics-cache-bounds`: sixel and kitty graphics are bounded while they are parsed, scaled and cached (raster size limits, chunk assembly caps, quota-aware eviction, a cap on bytes copied into one frame).
-- `fix/kitty-file-mediums`: the kitty file, temporary file and shared memory transmission mediums no longer delete or read arbitrary files: paths are resolved without following symlinks, `/proc`, `/sys` and `/dev` are refused, and only a marker-named file directly in the temp directory is deleted, after it was read.
+- `fix/kitty-file-mediums`: kitty file, temporary-file and shared-memory transfers are refused. Pane output cannot ask the host to read or delete a local file. Direct (`t=d`) image data still works. The unix open and delete helpers remain tested, and they are not what a pane can invoke.
 - `fix/forwarded-query-buffer`: output arriving while a pane waits for a forwarded host query is capped instead of buffered and copied without limit.
 - `fix/per-pane-hyperlinks`: hyperlink ids are tracked per pane, so links keep their target when a pane moves between tabs.
 - `fix/grid-scrollback-accounting`: scrollback is bounded by cells, not just rows, with cheap accounting on eviction and fast paths for scrolling and rewrapping.
@@ -84,18 +86,18 @@ To try it without touching an existing install, give cargo another root: `cargo 
 - `fix/client-budgets`: a byte budget for the messages queued to each client, and a watchdog that stops the writer of a client that is not reading.
 - `fix/pty-writer-bounds`: the PTY writer bounds each terminal's turn and reports discarded writes as failures.
 - `fix/thread-bus-fairness`: a flood of priority messages can no longer starve the other queues, including PTY output.
-- `fix/pending-pane-events`: output and exit events that arrive before their pane exists are buffered within bounds and replayed.
+- `fix/pending-pane-events`: output and exit events that arrive before their pane exists are buffered within bounds and replayed. A pane is not spawned once too many are still waiting to be created. Buffered output keeps its prefix; what does not fit is dropped and the pane is told it was cut off. An exit or hold for an admitted pane is not discarded to make room.
 - `fix/persistence-saves`: saves are reported only after they were published, and unchanged writes are skipped.
 - `fix/command-hook-bounds`: the post-command discovery hook runs with a time, output and thread limit.
-- `fix/downloader-hardening`: every redirect hop is revalidated, the whole exchange has a deadline, only complete artifact responses are accepted, and a write cut off by the deadline finishes first.
-- `feat/diagnostics-counters`: counters for slow screen operations, plugin concurrency and pending PTY bytes.
+- `fix/downloader-hardening`: every redirect hop is revalidated, the whole exchange has a deadline, only a complete HTTP 200 is published, and each attempt writes a unique temporary file. Partial files are not resumed, so a changed object at the same URL cannot be spliced onto an old prefix.
+- `feat/diagnostics-counters`: counters for slow screen operations, plugin concurrency and pending PTY bytes. The screen operation in progress is readable while it is still running, so a stuck operation is visible before its guard is dropped.
 - `ci/dependency-advisories`: a CI job that audits dependencies against published advisories.
 
 #### Web client
 - `fix/web-client-hardening`: revoked sessions are cut off on open websockets, other origins are refused, logins are rate limited, the number of clients, queue sizes, message sizes and terminal sizes are bounded, a slow client is dropped, and the token database is created with restricted permissions.
 
 #### Plugins
-- `fix/plugin-hardening`: plugins run with an empty environment, are cut off after a fatal callback error and on running out of fuel, must be granted permissions again after their module changes (grants are bound to the module bytes), and no longer hold a global lock while running guest code. A few non-trivial gaps are left as `TODO` comments in the code.
+- `fix/plugin-hardening`: plugins run with an empty environment, are cut off after a fatal callback error and on running out of fuel, must be granted permissions again after their module changes (grants are bound to the module bytes), and no longer hold a global lock while running guest code. A callback also has one wall-clock budget for host waits. `poll_oneoff` does not rewrite the guest's clock subscriptions or report a timer that has not elapsed; past the budget it returns `EINTR`. Other blocking host calls are not all covered yet (`TODO` comments in the code).
 
 # What is this?
 
