@@ -74,34 +74,6 @@ You can get started by [installing](https://zellij.dev/documentation/installatio
 
 For more details about our future plans, read about upcoming features in our [roadmap](#roadmap).
 
-## How do I install it?
-
-The easiest way to install Zellij is through a [package for your OS](./docs/THIRD_PARTY_INSTALL.md).
-
-If one is not available for your OS, you could download a prebuilt binary from the [latest release](https://github.com/zellij-org/zellij/releases/latest) and place it in your `$PATH`. If you'd like, we could [automatically choose one for you](#try-zellij-without-installing).
-
-You can also install (compile) with `cargo`:
-
-```
-cargo install --locked zellij
-```
-
-#### Try Zellij without installing
-
-bash/zsh:
-```bash
-bash <(curl -L https://zellij.dev/launch)
-```
-fish/xonsh:
-```bash
-bash -c 'bash <(curl -L https://zellij.dev/launch)'
-```
-
-#### Installing from `main`
-Installing Zellij from the `main` branch is not recommended. This branch represents pre-release code, is constantly being worked on and may contain broken or unusable features. In addition, using it may corrupt the cache for future versions, forcing users to clear it before they can use the officially released version.
-
-That being said - no-one will stop you from using it (and bug reports involving new features are greatly appreciated), but please consider using the latest release instead as detailed at the top of this section.
-
 ## How do I start a development environment?
 
 * Clone the project
