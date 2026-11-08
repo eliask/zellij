@@ -1,47 +1,8 @@
-<h1 align="center">
-  <br>
-  <img src="https://raw.githubusercontent.com/zellij-org/zellij/main/assets/logo.png" alt="logo" width="200">
-  <br>
-  Zellij
-  <br>
-  <br>
-</h1>
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/zellij-org/zellij/main/assets/demo.gif" alt="demo">
-</p>
-<h4 align="center">
-  [<a href="https://zellij.dev/documentation/installation">Installation</a>]
-  [<a href="https://zellij.dev/screencasts/">Screencasts & Tutorials</a>]
-  [<a href="https://zellij.dev/documentation/configuration">Configuration</a>]
-  [<a href="https://zellij.dev/documentation/layouts">Layouts</a>]
-  [<a href="https://zellij.dev/documentation/faq">FAQ</a>]
-</h4>
-<p align="center">
-  <a href="https://discord.gg/CrUAFH3"><img alt="Discord Chat" src="https://img.shields.io/discord/771367133715628073?color=5865F2&label=discord&style=flat-square"></a>
-  <a href="https://matrix.to/#/#zellij_general:matrix.org"><img alt="Matrix Chat" src="https://img.shields.io/matrix/zellij_general:matrix.org?color=1d7e64&label=matrix%20chat&style=flat-square&logo=matrix"></a>
-  <a href="https://zellij.dev/documentation/"><img alt="Zellij documentation" src="https://img.shields.io/badge/zellij-documentation-fc0060?style=flat-square"></a>
-</p>
-
-<br>
-    <p align="center">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/bc5daac4-140a-4b83-8729-71c944ee1100">
-      <img src="https://github.com/user-attachments/assets/55156624-a71a-46b5-939e-f562e3b2dd7f" alt="Sponsored by ">
-    </picture>
-    &nbsp;
-    &nbsp;
-    <a href="https://www.gresearch.com/">
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/d609936a-abf8-4406-8cfc-889f76a09d74">
-          <img src="https://github.com/user-attachments/assets/742ae902-fe9d-41c6-baf2-4bc143061da3" alt="gresearch logo">
-        </picture>
-    </a>
-</p>
-
 ## About this fork
 
-This is a fork of [Zellij](https://github.com/zellij-org/zellij), based on upstream commit `87276681`. It hardens the server, the client and the plugin host against hostile input: output from a program running in a pane (`cat` of an untrusted file, an `ssh` session to a hostile host), a misbehaving plugin, or a misbehaving client. It also fixes a number of correctness and performance problems found while doing so.
+This is a fork of [Zellij](https://github.com/zellij-org/zellij). Its goal is to fix every correctness, security, performance/algorithmic-complexity and freeze/hang issue that can be found and removed without a behavioral tradeoff. That includes hardening the server, the client and the plugin host against hostile input: output from a program running in a pane (`cat` of an untrusted file, an `ssh` session to a hostile host), a misbehaving plugin, or a misbehaving client.
+
+The fork is the result of repeated audits of every subsystem rather than a single patch series. Each issue is fixed at its root, covered by a regression test where one can be written, and kept bounded under adversarial input. Remaining tradeoffs are documented rather than hidden.
 
 Some of that hardening is visible. A character wider than the pane is clipped while the pane is that narrow and restored when the pane grows, instead of being kept on a row wider than the pane. Output and exits that arrive before a pane exists are bounded; past the cap, further panes are not started, and output that does not fit is cut off with an explicit notice rather than replayed as a suffix. Kitty file, temporary-file and shared-memory image transfers from pane output are refused; direct image data still works. Plugin downloads are not resumed from a partial file. A plugin callback that asks the host to wait is cut off with an error when its time budget runs out, rather than reporting that the timer elapsed. Scrolling still uses the existing catch-up path: it has been bounded, not replaced by an independent view.
 
