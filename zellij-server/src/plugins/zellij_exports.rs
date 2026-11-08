@@ -342,6 +342,7 @@ fn close_slot(env: &PluginEnv, slot_id: PluginId) {
                 None,
                 None,
                 ClosePaneSource::External,
+                None,
             ))
             .map_err(|e| e.to_string())?;
         env.senders
@@ -3574,6 +3575,7 @@ fn close_self(env: &PluginEnv) {
             None,
             None,
             ClosePaneSource::External,
+            None,
         ))
         .with_context(|| format!("failed to close self"))
         .non_fatal();
@@ -5305,7 +5307,9 @@ fn enumerate_drives() -> Vec<(PathBuf, Option<zellij_utils::data::FileMetadata>)
     use windows_sys::Win32::Storage::FileSystem::GetLogicalDriveStringsW;
     let mut buf = [0u16; 256];
     let len = unsafe { GetLogicalDriveStringsW(buf.len() as u32, buf.as_mut_ptr()) };
-    if len == 0 {
+    // A short buffer returns the required length, which is at least `buf.len()`.
+    // A successful length excludes the terminating null, so it is strictly shorter.
+    if len == 0 || len as usize >= buf.len() {
         return vec![];
     }
     let drive_strings = &buf[..len as usize];

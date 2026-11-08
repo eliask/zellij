@@ -2832,6 +2832,7 @@ impl WasmBridge {
                         None,
                         None,
                         ClosePaneSource::External,
+                        None,
                     ));
                     let _ = self
                         .senders
