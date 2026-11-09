@@ -1298,19 +1298,17 @@ impl SessionMetaData {
                     shared_keybinds
                 },
             };
-            self.senders
+            let _ = self.senders
                 .send_to_screen(ScreenInstruction::UpdateContextMenuConfig(
                     client_id,
                     new_config.context_menu.clone(),
-                ))
-                .unwrap();
-            self.senders
+                ));
+            let _ = self.senders
                 .send_to_screen(ScreenInstruction::UpdateMousebinds(
                     client_id,
                     new_config.mousebinds.clone(),
-                ))
-                .unwrap();
-            self.senders
+                ));
+            let _ = self.senders
                 .send_to_screen(ScreenInstruction::Reconfigure {
                     client_id,
                     keybinds: shared_keybinds.clone(),
@@ -1381,8 +1379,7 @@ impl SessionMetaData {
                         .options
                         .nested_session_handling
                         .unwrap_or_default(),
-                })
-                .unwrap();
+                });
             let _ = self
                 .senders
                 .send_to_screen(ScreenInstruction::SetSwapLayoutNotification(
@@ -1438,16 +1435,15 @@ impl SessionMetaData {
                 ));
             if base_mode_changed {
                 self.current_input_modes.insert(client_id, base_mode);
-                self.senders
+                let _ = self.senders
                     .send_to_screen(ScreenInstruction::ChangeMode(
                         base_mode,
                         Some(base_mode),
                         client_id,
                         None,
-                    ))
-                    .unwrap();
+                    ));
             }
-            self.senders
+            let _ = self.senders
                 .send_to_plugin(PluginInstruction::Reconfigure {
                     client_id,
                     keybinds: Some(shared_keybinds),
@@ -1455,24 +1451,21 @@ impl SessionMetaData {
                     default_shell: self.default_shell.clone(),
                     layout_dir: new_config.options.layout_dir,
                     was_written_to_disk: config_was_written_to_disk,
-                })
-                .unwrap();
-            self.senders
+                });
+            let _ = self.senders
                 .send_to_pty(PtyInstruction::Reconfigure {
                     client_id,
                     default_editor: new_config.options.scrollback_editor,
                     post_command_discovery_hook: new_config.options.post_command_discovery_hook,
                     pane_env: pane_env.clone(),
-                })
-                .unwrap();
+                });
         }
 
         // Detect and notify plugins of configuration changes
         if config_was_written_to_disk {
             if let Some(new_plugins) = new_plugin_config {
-                self.senders
-                    .send_to_plugin(PluginInstruction::DetectPluginConfigChanges(new_plugins))
-                    .unwrap();
+                let _ = self.senders
+                    .send_to_plugin(PluginInstruction::DetectPluginConfigChanges(new_plugins));
             }
         }
     }
@@ -1556,7 +1549,8 @@ macro_rules! remove_client {
 
 macro_rules! remove_watcher {
     ($client_id:expr, $os_input:expr, $session_state:expr) => {
-        $os_input.remove_client($client_id).unwrap();
+        let _ = $os_input.remove_client($client_id);
+        // SAFETY: lock poison implies prior panic
         $session_state.write().unwrap().remove_watcher($client_id);
     };
 }
@@ -3375,7 +3369,7 @@ pub fn start_server(os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
         let current_umask = umask(Mode::all());
         umask(current_umask);
         daemonize::Daemonize::new()
-            .working_directory(std::env::current_dir().unwrap())
+            .working_directory(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
             .umask(current_umask.bits() as u32)
             .start()
             .expect("could not daemonize the server process");
@@ -3431,6 +3425,7 @@ fn handle_new_connection(
         } => {
             let senders = session_data
                 .read()
+                // SAFETY: lock poison implies prior panic
                 .unwrap()
                 .as_ref()
                 .map(|s| s.senders.clone());
@@ -3454,6 +3449,7 @@ fn handle_new_connection(
         } => {
             let senders = session_data
                 .read()
+                // SAFETY: lock poison implies prior panic
                 .unwrap()
                 .as_ref()
                 .map(|s| s.senders.clone());
@@ -3529,7 +3525,9 @@ fn answer_before_registration(
         zellij_utils::ipc::IpcSenderWithContext::<ServerToClientMsg>::new(reply_stream)
     };
     #[cfg(not(windows))]
-    let mut sender = receiver.get_sender::<ServerToClientMsg>();
+    let Ok(mut sender) = receiver.get_sender::<ServerToClientMsg>() else {
+        return;
+    };
     let _ = sender.send_server_msg(message);
 }
 
@@ -3817,7 +3815,19 @@ pub fn start_server_impl(
                 // On Windows, named pipes are half-duplex, so we need a separate
                 // reply pipe for server→client messages.
                 #[cfg(windows)]
-                let reply_listener = zellij_utils::consts::ipc_bind_reply(&socket_path).unwrap();
+                let reply_listener = match zellij_utils::consts::ipc_bind_reply(&socket_path) {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        let message = format!(
+                            "Failed to bind the session reply socket {}: {}",
+                            socket_path.display(),
+                            err
+                        );
+                        log::error!("{}", message);
+                        let _ = to_server.send(ServerInstruction::Error(message));
+                        return;
+                    },
+                };
 
                 for stream in listener.incoming() {
                     match stream {
@@ -3889,7 +3899,10 @@ pub fn start_server_impl(
         if let Some(session_data) = session_data.read().unwrap().as_ref() {
             session_data.publish_live_view_release_keys();
         }
-        let (instruction, mut err_ctx) = server_receiver.recv().unwrap();
+        let (instruction, mut err_ctx) = match server_receiver.recv() {
+            Ok(msg) => msg,
+            Err(_) => break,
+        };
         err_ctx.add_call(ContextType::IPCServer((&instruction).into()));
         match instruction {
             ServerInstruction::FirstClientConnected(cli_assets, is_web_client, client_id) => {
@@ -4014,24 +4027,29 @@ pub fn start_server_impl(
                     .current_input_modes
                     .insert(client_id, default_input_mode);
 
+                // SAFETY: lock poison implies prior panic
                 *session_data.write().unwrap() = Some(session);
+                // SAFETY: lock poison implies prior panic
                 session_state.write().unwrap().set_client_data(
                     client_id,
                     client_attributes.size,
                     is_web_client,
                 );
 
-                session_data
+                // SAFETY: session was just initialized above
+                let session_senders = session_data
                     .read()
+                    // SAFETY: lock poison implies prior panic
                     .unwrap()
                     .as_ref()
-                    .unwrap()
+                    .expect("session just initialized")
                     .senders
+                    .clone();
+                let _ = session_senders
                     .send_to_screen(ScreenInstruction::RecomputeTabSize(
                         client_id,
                         client_attributes.size,
-                    ))
-                    .unwrap();
+                    ));
 
                 let default_shell = runtime_config_options.default_shell.map(|shell| {
                     TerminalAction::RunCommand(RunCommand {
@@ -4055,12 +4073,7 @@ pub fn start_server_impl(
                     } else {
                         None
                     };
-                    session_data
-                        .read()
-                        .unwrap()
-                        .as_ref()
-                        .unwrap()
-                        .senders
+                    let _ = session_senders
                         .send_to_screen(ScreenInstruction::NewTab(
                             cwd.clone(),
                             default_shell.clone(),
@@ -4073,8 +4086,7 @@ pub fn start_server_impl(
                             should_focus_tab,
                             (client_id, is_web_client),
                             None,
-                        ))
-                        .unwrap()
+                        ));
                 };
 
                 let mut onboarding_pane = if is_resumed_session {
@@ -4130,8 +4142,10 @@ pub fn start_server_impl(
                     );
                 }
                 {
+                    // SAFETY: lock poison implies prior panic
                     let rlock = session_data.read().unwrap();
-                    let session_data = rlock.as_ref().unwrap();
+                    // SAFETY: session was just initialized above
+                    let session_data = rlock.as_ref().expect("session just initialized");
                     let _ = session_data.senders.send_to_background_jobs(
                         BackgroundJob::SessionSuggestions(SessionSuggestionsJob::Configure {
                             config: config.session_suggestions.clone(),
@@ -4161,17 +4175,15 @@ pub fn start_server_impl(
                         false,
                         None,
                     );
-                    session_data
+                    let _ = session_data
                         .senders
-                        .send_to_plugin(PluginInstruction::AddClient(client_id))
-                        .unwrap();
-                    session_data
+                        .send_to_plugin(PluginInstruction::AddClient(client_id));
+                    let _ = session_data
                         .senders
                         .send_to_screen(ScreenInstruction::SetClientHostTerminalEnv(
                             client_id,
                             host_terminal_env,
-                        ))
-                        .unwrap();
+                        ));
                 }
             },
             ServerInstruction::AttachClient(
@@ -4181,6 +4193,7 @@ pub fn start_server_impl(
                 is_web_client,
                 client_id,
             ) => {
+                // SAFETY: lock poison implies prior panic
                 let mut rlock = session_data.write().unwrap();
                 let Some(session_data) = rlock.as_mut() else {
                     drop(rlock);
@@ -4204,6 +4217,7 @@ pub fn start_server_impl(
                 let host_terminal_env = cli_assets.host_terminal_env.clone();
                 let is_a_reattach = !session_state
                     .read()
+                    // SAFETY: lock poison implies prior panic
                     .unwrap()
                     .other_clients_are_attached(client_id);
                 report_attached_client_history(
@@ -4259,20 +4273,20 @@ pub fn start_server_impl(
                     .current_input_modes
                     .insert(client_id, default_input_mode);
 
+                // SAFETY: lock poison implies prior panic
                 session_state.write().unwrap().set_client_data(
                     client_id,
                     client_attributes.size,
                     is_web_client,
                 );
 
-                session_data
+                let _ = session_data
                     .senders
                     .send_to_screen(ScreenInstruction::SetClientHostTerminalEnv(
                         client_id,
                         host_terminal_env,
-                    ))
-                    .unwrap();
-                session_data
+                    ));
+                let _ = session_data
                     .senders
                     .send_to_screen(ScreenInstruction::AddClient(
                         client_id,
@@ -4280,12 +4294,10 @@ pub fn start_server_impl(
                         client_attributes.size,
                         tab_position_to_focus,
                         pane_id_to_focus,
-                    ))
-                    .unwrap();
-                session_data
+                    ));
+                let _ = session_data
                     .senders
-                    .send_to_plugin(PluginInstruction::AddClient(client_id))
-                    .unwrap();
+                    .send_to_plugin(PluginInstruction::AddClient(client_id));
                 let client_configuration = session_data
                     .session_configuration
                     .get_client_configuration(&client_id);
@@ -4298,15 +4310,14 @@ pub fn start_server_impl(
                 let default_mode = default_input_mode;
                 // ModeUpdate broadcast is handled by the screen thread via
                 // change_mode() -> update_input_modes()
-                session_data
+                let _ = session_data
                     .senders
                     .send_to_screen(ScreenInstruction::ChangeMode(
                         default_mode,
                         Some(default_mode),
                         client_id,
                         None,
-                    ))
-                    .unwrap();
+                    ));
                 if last_host_program_status.is_some() {
                     let _ = os_input.send_to_client(
                         client_id,
@@ -4323,21 +4334,20 @@ pub fn start_server_impl(
                 // Convert to watcher in SessionState (needed for input filtering in route.rs)
                 session_state
                     .write()
+                    // SAFETY: lock poison implies prior panic
                     .unwrap()
                     .convert_client_to_watcher(client_id, is_web_client);
 
                 // Also notify Screen to add this as a watcher client (for rendering) with the terminal size
-                session_data
-                    .write()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .senders
-                    .send_to_screen(ScreenInstruction::AddWatcherClient(
-                        client_id,
-                        terminal_size,
-                    ))
-                    .unwrap();
+                // SAFETY: lock poison implies prior panic
+                if let Some(session_data) = session_data.write().unwrap().as_ref() {
+                    let _ = session_data
+                        .senders
+                        .send_to_screen(ScreenInstruction::AddWatcherClient(
+                            client_id,
+                            terminal_size,
+                        ));
+                }
             },
             ServerInstruction::UnblockInputThread => {
                 let client_ids = session_state.read().unwrap().client_ids();
@@ -4439,7 +4449,7 @@ pub fn start_server_impl(
                             .send_to_screen(ScreenInstruction::RemoveWatcherClient(client_id));
                     }
 
-                    os_input.remove_client(client_id).unwrap();
+                    let _ = os_input.remove_client(client_id);
                 } else {
                     if let Some(session_data) = session_data.write().unwrap().as_mut() {
                         session_data.remove_key_passthrough_client(client_id);
@@ -4456,10 +4466,13 @@ pub fn start_server_impl(
                             .senders
                             .send_to_plugin(PluginInstruction::RemoveClient(client_id));
                     }
+                    // SAFETY: lock poison implies prior panic
                     if !session_state.read().unwrap().active_clients_are_connected() {
+                        // SAFETY: lock poison implies prior panic
                         *session_data.write().unwrap() = None;
                         let client_ids_to_cleanup: Vec<ClientId> = session_state
                             .read()
+                            // SAFETY: lock poison implies prior panic
                             .unwrap()
                             .clients
                             .keys()
@@ -4500,7 +4513,7 @@ pub fn start_server_impl(
                             .send_to_screen(ScreenInstruction::RemoveWatcherClient(client_id));
                     }
 
-                    os_input.remove_client(client_id).unwrap();
+                    let _ = os_input.remove_client(client_id);
                 } else {
                     if let Some(session_data) = session_data.write().unwrap().as_mut() {
                         session_data.remove_key_passthrough_client(client_id);
@@ -4543,6 +4556,7 @@ pub fn start_server_impl(
             ServerInstruction::DisconnectAllClientsExcept(client_id, exit_reason) => {
                 let client_ids: Vec<ClientId> = session_state
                     .read()
+                    // SAFETY: lock poison implies prior panic
                     .unwrap()
                     .client_ids()
                     .iter()
@@ -4618,6 +4632,7 @@ pub fn start_server_impl(
                     // Also disconnect all watchers
                     let watcher_ids: Vec<ClientId> = session_state
                         .read()
+                        // SAFETY: lock poison implies prior panic
                         .unwrap()
                         .watchers
                         .keys()
@@ -4708,6 +4723,7 @@ pub fn start_server_impl(
                     && connect_to_session.name.as_deref() != Some(own_session_name.as_str());
                 let command_was_run = session_data
                     .read()
+                    // SAFETY: lock poison implies prior panic
                     .unwrap()
                     .as_ref()
                     .map(|s| {
@@ -4717,6 +4733,7 @@ pub fn start_server_impl(
                     .unwrap_or(true);
                 let other_clients_attached = session_state
                     .read()
+                    // SAFETY: lock poison implies prior panic
                     .unwrap()
                     .other_clients_are_attached(client_id);
                 let _ = to_server.send(ServerInstruction::SwitchSession(
@@ -4775,13 +4792,18 @@ pub fn start_server_impl(
                     );
                     let layout_dir = session_data
                         .read()
+                        // SAFETY: lock poison implies prior panic
                         .unwrap()
                         .as_ref()
-                        .unwrap()
-                        .session_configuration
-                        .get_client_configuration(&client_id)
-                        .options
-                        .layout_dir
+                        .map(|session_data| {
+                            session_data
+                                .session_configuration
+                                .get_client_configuration(&client_id)
+                                .options
+                                .layout_dir
+                                .clone()
+                        })
+                        .flatten()
                         .or_else(|| default_layout_dir());
                     if let Some(layout_dir) = layout_dir {
                         connect_to_session.apply_layout_dir(&layout_dir);
@@ -4797,59 +4819,50 @@ pub fn start_server_impl(
                     remove_client!(client_id, os_input, session_state, session_data);
                     drop(completion_tx); // do not deadlock with route thread
 
+                    // SAFETY: lock poison implies prior panic
                     if let Some(session_data) = session_data.write().unwrap().as_mut() {
                         session_data.session_configuration.remove_client(&client_id);
+                        let _ = session_data
+                            .senders
+                            .send_to_screen(ScreenInstruction::RemoveClient(client_id));
+                        let _ = session_data
+                            .senders
+                            .send_to_plugin(PluginInstruction::RemoveClient(client_id));
                     }
-                    session_data
-                        .write()
-                        .unwrap()
-                        .as_ref()
-                        .unwrap()
-                        .senders
-                        .send_to_screen(ScreenInstruction::RemoveClient(client_id))
-                        .unwrap();
-                    session_data
-                        .write()
-                        .unwrap()
-                        .as_ref()
-                        .unwrap()
-                        .senders
-                        .send_to_plugin(PluginInstruction::RemoveClient(client_id))
-                        .unwrap();
                 }
             },
             ServerInstruction::AssociatePipeWithClient { pipe_id, client_id } => {
                 session_state
                     .write()
+                    // SAFETY: lock poison implies prior panic
                     .unwrap()
                     .associate_pipe_with_client(pipe_id, client_id);
             },
             ServerInstruction::ChangeMode(client_id, input_mode, completion) => {
+                // SAFETY: lock poison implies prior panic
                 let mut session_data = session_data.write().unwrap();
-                let session_data = session_data.as_mut().unwrap();
-                let base_mode = session_data
-                    .session_configuration
-                    .get_client_default_input_mode(&client_id);
-                session_data
-                    .current_input_modes
-                    .insert(client_id, input_mode);
-                session_data
-                    .senders
-                    .send_to_screen(ScreenInstruction::ChangeMode(
-                        input_mode,
-                        Some(base_mode),
-                        client_id,
-                        completion,
-                    ))
-                    .unwrap();
+                if let Some(session_data) = session_data.as_mut() {
+                    let base_mode = session_data
+                        .session_configuration
+                        .get_client_default_input_mode(&client_id);
+                    session_data
+                        .current_input_modes
+                        .insert(client_id, input_mode);
+                    let _ = session_data
+                        .senders
+                        .send_to_screen(ScreenInstruction::ChangeMode(
+                            input_mode,
+                            Some(base_mode),
+                            client_id,
+                            completion,
+                        ));
+                }
             },
             ServerInstruction::ChangeModeForAllClients(input_mode) => {
-                session_data
-                    .write()
-                    .unwrap()
-                    .as_mut()
-                    .unwrap()
-                    .change_mode_for_all_clients(input_mode);
+                // SAFETY: lock poison implies prior panic
+                if let Some(session_data) = session_data.write().unwrap().as_mut() {
+                    session_data.change_mode_for_all_clients(input_mode);
+                }
             },
             ServerInstruction::Reconfigure {
                 client_id,
@@ -4857,13 +4870,17 @@ pub fn start_server_impl(
                 write_config_to_disk,
             } => {
                 let config_before = client_configuration(&session_data, client_id);
-                let (new_config, runtime_config_changed) = session_data
+                // SAFETY: lock poison implies prior panic
+                let (new_config, runtime_config_changed) = match session_data
                     .write()
                     .unwrap()
                     .as_mut()
-                    .unwrap()
-                    .session_configuration
-                    .reconfigure_runtime_config(&client_id, config);
+                {
+                    Some(session_data) => session_data
+                        .session_configuration
+                        .reconfigure_runtime_config(&client_id, config),
+                    None => continue,
+                };
                 apply_runtime_change(
                     config_before,
                     new_config,
@@ -4943,6 +4960,7 @@ pub fn start_server_impl(
             } => {
                 let snapshot = session_data
                     .read()
+                    // SAFETY: lock poison implies prior panic
                     .unwrap()
                     .as_ref()
                     .map(|session_data| session_data.config_snapshot_for(client_id));
@@ -4951,23 +4969,23 @@ pub fn start_server_impl(
                 }
             },
             ServerInstruction::RevertConfig { client_id, key } => {
-                let reverted_config = session_data
-                    .write()
-                    .unwrap()
-                    .as_mut()
-                    .unwrap()
-                    .session_configuration
-                    .revert_runtime_config(&client_id, key);
+                // SAFETY: lock poison implies prior panic
+                let reverted_config = match session_data.write().unwrap().as_mut() {
+                    Some(session_data) => session_data
+                        .session_configuration
+                        .revert_runtime_config(&client_id, key),
+                    None => continue,
+                };
                 propagate_runtime_config_change(reverted_config, &session_data, client_id);
             },
             ServerInstruction::UnsetConfigSetting { client_id, key } => {
-                let unset_config = session_data
-                    .write()
-                    .unwrap()
-                    .as_mut()
-                    .unwrap()
-                    .session_configuration
-                    .unset_runtime_config_setting(&client_id, key);
+                // SAFETY: lock poison implies prior panic
+                let unset_config = match session_data.write().unwrap().as_mut() {
+                    Some(session_data) => session_data
+                        .session_configuration
+                        .unset_runtime_config_setting(&client_id, key),
+                    None => continue,
+                };
                 propagate_runtime_config_change(unset_config, &session_data, client_id);
             },
             ServerInstruction::SaveConfig { client_id } => {
@@ -4986,6 +5004,7 @@ pub fn start_server_impl(
             } => {
                 let result = session_data
                     .read()
+                    // SAFETY: lock poison implies prior panic
                     .unwrap()
                     .as_ref()
                     .map(|session_data| {
@@ -5006,6 +5025,7 @@ pub fn start_server_impl(
             } => {
                 let result = session_data
                     .read()
+                    // SAFETY: lock poison implies prior panic
                     .unwrap()
                     .as_ref()
                     .map(|session_data| {
@@ -5025,6 +5045,7 @@ pub fn start_server_impl(
             } => {
                 let written = session_data
                     .read()
+                    // SAFETY: lock poison implies prior panic
                     .unwrap()
                     .as_ref()
                     .map(|session_data| {
@@ -5060,6 +5081,7 @@ pub fn start_server_impl(
             } => {
                 let deleted = session_data
                     .read()
+                    // SAFETY: lock poison implies prior panic
                     .unwrap()
                     .as_ref()
                     .map(|session_data| {
@@ -5092,13 +5114,19 @@ pub fn start_server_impl(
                 write_config_to_disk,
             } => {
                 let config_before = client_configuration(&session_data, client_id);
-                let (new_config, runtime_config_changed) = session_data
+                // SAFETY: lock poison implies prior panic
+                let (new_config, runtime_config_changed) = match session_data
                     .write()
                     .unwrap()
                     .as_mut()
-                    .unwrap()
-                    .session_configuration
-                    .rebind_keys(&client_id, keys_to_rebind, keys_to_unbind);
+                {
+                    Some(session_data) => session_data.session_configuration.rebind_keys(
+                        &client_id,
+                        keys_to_rebind,
+                        keys_to_unbind,
+                    ),
+                    None => continue,
+                };
                 apply_runtime_change(
                     config_before,
                     new_config,
@@ -5110,13 +5138,17 @@ pub fn start_server_impl(
             },
             ServerInstruction::ReplaceConfigBlocks { client_id, config } => {
                 let config_before = client_configuration(&session_data, client_id);
-                let (new_config, runtime_config_changed) = session_data
+                // SAFETY: lock poison implies prior panic
+                let (new_config, runtime_config_changed) = match session_data
                     .write()
                     .unwrap()
                     .as_mut()
-                    .unwrap()
-                    .session_configuration
-                    .replace_config_blocks(&client_id, &config);
+                {
+                    Some(session_data) => session_data
+                        .session_configuration
+                        .replace_config_blocks(&client_id, &config),
+                    None => continue,
+                };
                 apply_runtime_change(
                     config_before,
                     new_config,
@@ -5132,13 +5164,17 @@ pub fn start_server_impl(
                 write_config_to_disk,
             } => {
                 let config_before = client_configuration(&session_data, client_id);
-                let (new_config, runtime_config_changed) = session_data
+                // SAFETY: lock poison implies prior panic
+                let (new_config, runtime_config_changed) = match session_data
                     .write()
                     .unwrap()
                     .as_mut()
-                    .unwrap()
-                    .session_configuration
-                    .reset_mousebinds(&client_id, triggers);
+                {
+                    Some(session_data) => session_data
+                        .session_configuration
+                        .reset_mousebinds(&client_id, triggers),
+                    None => continue,
+                };
                 apply_runtime_change(
                     config_before,
                     new_config,
@@ -5154,13 +5190,17 @@ pub fn start_server_impl(
                 write_config_to_disk,
             } => {
                 let config_before = client_configuration(&session_data, client_id);
-                let (new_config, runtime_config_changed) = session_data
+                // SAFETY: lock poison implies prior panic
+                let (new_config, runtime_config_changed) = match session_data
                     .write()
                     .unwrap()
                     .as_mut()
-                    .unwrap()
-                    .session_configuration
-                    .reset_keys(&client_id, keys);
+                {
+                    Some(session_data) => session_data
+                        .session_configuration
+                        .reset_keys(&client_id, keys),
+                    None => continue,
+                };
                 apply_runtime_change(
                     config_before,
                     new_config,
@@ -5192,14 +5232,14 @@ pub fn start_server_impl(
                         .and_then(|mut s| s.as_mut().map(|s| s.web_sharing.set_sharing()))
                         .unwrap_or(false);
                     if successfully_changed {
-                        session_data
-                            .write()
-                            .unwrap()
-                            .as_ref()
-                            .unwrap()
-                            .senders
-                            .send_to_screen(ScreenInstruction::SessionSharingStatusChange(true))
-                            .unwrap();
+                        // SAFETY: lock poison implies prior panic
+                        if let Some(session_data) = session_data.write().unwrap().as_ref() {
+                            let _ = session_data
+                                .senders
+                                .send_to_screen(ScreenInstruction::SessionSharingStatusChange(
+                                    true,
+                                ));
+                        }
                     }
                 } else {
                     log::error!("Cannot share session: this instance of Zellij was compiled without web_server_capability");
@@ -5216,6 +5256,7 @@ pub fn start_server_impl(
                         // disconnect existing web clients
                         let web_client_ids: Vec<ClientId> = session_state
                             .read()
+                            // SAFETY: lock poison implies prior panic
                             .unwrap()
                             .web_client_ids()
                             .iter()
@@ -5232,6 +5273,7 @@ pub fn start_server_impl(
                         }
                         let web_watcher_client_ids: Vec<ClientId> = session_state
                             .read()
+                            // SAFETY: lock poison implies prior panic
                             .unwrap()
                             .web_watcher_client_ids()
                             .iter()
@@ -5247,14 +5289,14 @@ pub fn start_server_impl(
                             remove_watcher!(client_id, os_input, session_state);
                         }
 
-                        session_data
-                            .write()
-                            .unwrap()
-                            .as_ref()
-                            .unwrap()
-                            .senders
-                            .send_to_screen(ScreenInstruction::SessionSharingStatusChange(false))
-                            .unwrap();
+                        // SAFETY: lock poison implies prior panic
+                        if let Some(session_data) = session_data.write().unwrap().as_ref() {
+                            let _ = session_data
+                                .senders
+                                .send_to_screen(ScreenInstruction::SessionSharingStatusChange(
+                                    false,
+                                ));
+                        }
                     }
                 } else {
                     // TODO: test this
@@ -5262,44 +5304,36 @@ pub fn start_server_impl(
                 }
             },
             ServerInstruction::WebServerStarted(base_url) => {
-                session_data
-                    .write()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .senders
-                    .send_to_plugin(PluginInstruction::WebServerStarted(base_url))
-                    .unwrap();
+                // SAFETY: lock poison implies prior panic
+                if let Some(session_data) = session_data.write().unwrap().as_ref() {
+                    let _ = session_data
+                        .senders
+                        .send_to_plugin(PluginInstruction::WebServerStarted(base_url));
+                }
             },
             ServerInstruction::FailedToStartWebServer(error) => {
-                session_data
-                    .write()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .senders
-                    .send_to_plugin(PluginInstruction::FailedToStartWebServer(error))
-                    .unwrap();
+                // SAFETY: lock poison implies prior panic
+                if let Some(session_data) = session_data.write().unwrap().as_ref() {
+                    let _ = session_data
+                        .senders
+                        .send_to_plugin(PluginInstruction::FailedToStartWebServer(error));
+                }
             },
             ServerInstruction::ClearMouseHelpText(client_id) => {
-                session_data
-                    .write()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .senders
-                    .send_to_screen(ScreenInstruction::ClearMouseHelpText(client_id))
-                    .unwrap();
+                // SAFETY: lock poison implies prior panic
+                if let Some(session_data) = session_data.write().unwrap().as_ref() {
+                    let _ = session_data
+                        .senders
+                        .send_to_screen(ScreenInstruction::ClearMouseHelpText(client_id));
+                }
             },
             ServerInstruction::ClearCommandOutputFlash(pane_id) => {
-                session_data
-                    .write()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .senders
-                    .send_to_screen(ScreenInstruction::ClearCommandOutputFlash(pane_id))
-                    .unwrap();
+                // SAFETY: lock poison implies prior panic
+                if let Some(session_data) = session_data.write().unwrap().as_ref() {
+                    let _ = session_data
+                        .senders
+                        .send_to_screen(ScreenInstruction::ClearCommandOutputFlash(pane_id));
+                }
             },
             ServerInstruction::ForwardQueryToHost(token, query_bytes, resolve_async) => {
                 // Pick a regular (non-watcher) client to carry the
@@ -5580,7 +5614,8 @@ fn init_session(
             let session_id = session_id.clone();
             move || pty_thread_main(pty, layout.clone(), session_id).fatal()
         })
-        .unwrap();
+        // infallible: thread spawn only fails under OS resource exhaustion
+        .expect("failed to spawn pty thread");
 
     let screen_thread = thread::Builder::new()
         .name("screen".to_string())
@@ -5621,7 +5656,8 @@ fn init_session(
                 .fatal();
             }
         })
-        .unwrap();
+        // infallible: thread spawn only fails under OS resource exhaustion
+        .expect("failed to spawn screen thread");
 
     let zellij_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let session_env_vars: std::collections::BTreeMap<String, String> = std::env::vars().collect();
@@ -5673,7 +5709,8 @@ fn init_session(
                 .fatal()
             }
         })
-        .unwrap();
+        // infallible: thread spawn only fails under OS resource exhaustion
+        .expect("failed to spawn wasm/plugin thread");
 
     let pty_writer_thread = thread::Builder::new()
         .name("pty_writer".to_string())
@@ -5690,7 +5727,8 @@ fn init_session(
             );
             || pty_writer_main(pty_writer_bus).fatal()
         })
-        .unwrap();
+        // infallible: thread spawn only fails under OS resource exhaustion
+        .expect("failed to spawn pty_writer thread");
 
     let live_sessions = crate::attention::peers::LiveSessions::default();
     let background_jobs_thread = thread::Builder::new()
@@ -5727,7 +5765,8 @@ fn init_session(
                 .fatal()
             }
         })
-        .unwrap();
+        // infallible: thread spawn only fails under OS resource exhaustion
+        .expect("failed to spawn background_jobs thread");
     let mut keybinds_dir_watcher = None;
     if let Some(config_file_path) = cli_assets.config_file_path.clone() {
         let layout_dir = config_options
@@ -6061,17 +6100,16 @@ fn apply_new_saved_config(
     new_saved_config: Config,
     session_data: &Arc<RwLock<Option<SessionMetaData>>>,
 ) -> bool {
+    // SAFETY: lock poison implies prior panic
+    let mut session_data = session_data.write().unwrap();
+    let Some(session_data) = session_data.as_mut() else {
+        return false;
+    };
     let (changes, dropped_changes) = session_data
-        .write()
-        .unwrap()
-        .as_mut()
-        .unwrap()
         .session_configuration
         .change_saved_config(new_saved_config);
     let propagated_changes = !changes.is_empty();
     let config_was_written_to_disk = true;
-    let mut session_data = session_data.write().unwrap();
-    let session_data = session_data.as_mut().unwrap();
     session_data.propagate_configuration_changes(changes, config_was_written_to_disk);
     for (client_id, dropped_settings) in dropped_changes {
         let _ = session_data
@@ -6091,15 +6129,13 @@ fn propagate_runtime_config_change(
 ) {
     if let Some(new_config) = new_config {
         let config_was_written_to_disk = false;
-        session_data
-            .write()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .propagate_configuration_changes(
+        // SAFETY: lock poison implies prior panic
+        if let Some(session_data) = session_data.write().unwrap().as_mut() {
+            session_data.propagate_configuration_changes(
                 vec![(client_id, new_config)],
                 config_was_written_to_disk,
             );
+        }
     }
 }
 
@@ -6118,6 +6154,7 @@ fn client_configuration(
 ) -> Config {
     session_data
         .read()
+        // SAFETY: lock poison implies prior panic
         .unwrap()
         .as_ref()
         .map(|session_data| {
@@ -6308,6 +6345,7 @@ fn save_client_config_to_disk(
 ) {
     let client_config = session_data
         .read()
+        // SAFETY: lock poison implies prior panic
         .unwrap()
         .as_ref()
         .map(|session_data| {
