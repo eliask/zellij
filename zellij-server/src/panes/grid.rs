@@ -1478,6 +1478,7 @@ fn bounded_push(
             };
             *scrollback_cells = scrollback_cells.saturating_sub(row.stored_cell_count());
             line_index.note_back_rows_removed(vec, 1);
+            kitty_grid.invalidate_canonical_starts();
             *history_truncated = true;
             continue;
         }
@@ -1499,6 +1500,7 @@ fn bounded_push(
                 };
                 *scrollback_cells = scrollback_cells.saturating_sub(row.stored_cell_count());
                 line_index.note_back_rows_removed(vec, 1);
+                kitty_grid.invalidate_canonical_starts();
             }
             *history_truncated = true;
             continue;
@@ -2983,8 +2985,13 @@ impl Grid {
     /// caller that reads the length immediately use this. The screen thread
     /// uses [`Self::continue_display_row_recount`] one quantum at a time.
     pub(crate) fn finish_display_row_recount(&mut self) {
-        self.line_index.measure_all(&self.lines_above);
-        let _ = self.trim_scrollback_to_budget(usize::MAX);
+        loop {
+            self.line_index.measure_all(&self.lines_above);
+            let trimmed = self.trim_scrollback_to_budget(usize::MAX);
+            if !trimmed || !self.display_recount_pending() {
+                break;
+            }
+        }
     }
     /// Drop the bounded evacuation reserve admitted while a recount owned the
     /// front line. Only called once every line has an exact summary.
@@ -3016,6 +3023,7 @@ impl Grid {
             .scrollback_cells
             .saturating_sub(row.stored_cell_count());
         self.line_index.note_back_rows_removed(&self.lines_above, 1);
+        self.kitty_grid.invalidate_canonical_starts();
         self.history_truncated = true;
         self.content_epoch = self.content_epoch.wrapping_add(1);
         true
