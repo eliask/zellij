@@ -6319,6 +6319,7 @@ fn load_new_plugin(
                     None,
                     None,
                     None,
+                    None,
                 ));
             },
             Err(e) => {
