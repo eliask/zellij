@@ -6,9 +6,11 @@ use crate::{
     data::SessionInfo,
     envs,
     input::layout::Layout,
-    ipc::{ClientToServerMsg, IpcReceiverWithContext, IpcSenderWithContext, ServerToClientMsg},
+    ipc::{ClientToServerMsg, IpcSenderWithContext, ServerToClientMsg},
     session_index::{self, SessionIndex},
 };
+#[cfg(windows)]
+use crate::ipc::IpcReceiverWithContext;
 use anyhow;
 use humantime::format_duration;
 use std::collections::{BTreeMap, HashMap};
@@ -392,7 +394,9 @@ fn assert_socket_in(dir: &Path, name: &str, timeout: Duration) -> bool {
             let mut sender: IpcSenderWithContext<ClientToServerMsg> =
                 IpcSenderWithContext::new(stream);
             let _ = sender.send_client_msg(ClientToServerMsg::ConnStatus);
-            let mut receiver: IpcReceiverWithContext<ServerToClientMsg> = sender.get_receiver();
+            let Ok(mut receiver) = sender.get_receiver::<ServerToClientMsg>() else {
+                return false;
+            };
             match receiver.recv_server_msg() {
                 Some((ServerToClientMsg::Connected, _)) => true,
                 None | Some((_, _)) => false,

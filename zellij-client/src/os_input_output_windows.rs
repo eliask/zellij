@@ -187,10 +187,10 @@ impl Iterator for BlockingSignalIterator {
 pub(crate) fn setup_ipc(
     socket: interprocess::local_socket::Stream,
     path: &Path,
-) -> (
+) -> std::io::Result<(
     IpcSenderWithContext<zellij_utils::ipc::ClientToServerMsg>,
     IpcReceiverWithContext<zellij_utils::ipc::ServerToClientMsg>,
-) {
+)> {
     let reply_socket;
     loop {
         match zellij_utils::consts::ipc_connect_reply(path) {
@@ -205,7 +205,7 @@ pub(crate) fn setup_ipc(
     }
     let sender = IpcSenderWithContext::new(socket);
     let receiver = IpcReceiverWithContext::new(reply_socket);
-    (sender, receiver)
+    Ok((sender, receiver))
 }
 
 /// Enable ENABLE_VIRTUAL_TERMINAL_PROCESSING on stdout so that ConPTY enters

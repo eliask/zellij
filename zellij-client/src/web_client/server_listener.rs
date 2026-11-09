@@ -113,7 +113,7 @@ pub fn zellij_server_listener(
                     // Look up read-only status from connection table
                     let is_read_only = connection_table
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|p| p.into_inner())
                         .is_client_read_only(&web_client_id);
 
 
@@ -139,15 +139,34 @@ pub fn zellij_server_listener(
 
                     let should_create_new_session = !session_exists;
                     let first_message = create_first_message(is_read_only, config_file_path.clone(), client_attributes.clone(), config_options.clone(), should_create_new_session, &session_name, initial_layout, switch_context, focus);
-                    let zellij_ipc_pipe = create_ipc_pipe(&session_name, session_exists);
+                    let zellij_ipc_pipe = match create_ipc_pipe(&session_name, session_exists) {
+                        Ok(pipe) => pipe,
+                        Err(e) => {
+                            log::error!(
+                                "Failed to prepare IPC pipe for session {:?}: {}",
+                                session_name,
+                                e
+                            );
+                            client_connection_bus.close_connection();
+                            return;
+                        },
+                    };
 
-                    session_manager.spawn_session_if_needed(
+                    if let Err(e) = session_manager.spawn_session_if_needed(
                         &session_name,
                         os_input.clone(),
                         session_exists,
                         &zellij_ipc_pipe,
                         first_message,
-                    );
+                    ) {
+                        log::error!(
+                            "Failed to spawn/connect session {:?}: {}",
+                            session_name,
+                            e
+                        );
+                        client_connection_bus.close_connection();
+                        return;
+                    }
 
                     if let Some(pixel_dims) = client_pixel_dims {
                         os_input.send_to_server(ClientToServerMsg::TerminalPixelDimensions {

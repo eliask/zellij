@@ -272,7 +272,9 @@ fn reply_channel(
     _path: &Path,
     _deadline: Instant,
 ) -> Result<IpcReceiverWithContext<ServerToClientMsg>> {
-    Ok(sender.get_receiver())
+    sender
+        .get_receiver()
+        .map_err(|e| anyhow!("failed to clone IPC reply channel: {}", e))
 }
 
 #[cfg(windows)]
