@@ -471,6 +471,9 @@ pub(crate) struct Tab {
     pending_vte_event_bytes: HashMap<u32, usize>,
     pub selecting_with_mouse_in_pane: Option<PaneId>, // this is only pub for the tests
     pane_being_resized_with_mouse: Option<PaneResizeState>,
+    // Resolves link ids on chunks that carry no handler of their own (live
+    // views, popups). Panes own their handlers, so a pane's cells never
+    // resolve through this one.
     link_handler: Rc<RefCell<LinkHandler>>,
     clipboard_provider: ClipboardProvider,
     // TODO: used only to focus the pane when the layout is loaded
@@ -2390,7 +2393,6 @@ impl Tab {
             &self.senders,
             &self.sixel_image_store,
             &self.kitty_image_store,
-            &self.link_handler,
             &self.terminal_emulator_colors,
             &self.terminal_emulator_color_codes,
             &self.character_cell_size,
@@ -2485,7 +2487,6 @@ impl Tab {
             &self.senders,
             &self.sixel_image_store,
             &self.kitty_image_store,
-            &self.link_handler,
             &self.terminal_emulator_colors,
             &self.terminal_emulator_color_codes,
             &self.character_cell_size,
@@ -2594,7 +2595,6 @@ impl Tab {
                 &self.senders,
                 &self.sixel_image_store,
                 &self.kitty_image_store,
-                &self.link_handler,
                 &self.terminal_emulator_colors,
                 &self.terminal_emulator_color_codes,
                 &self.character_cell_size,
@@ -2663,7 +2663,6 @@ impl Tab {
                 &self.senders,
                 &self.sixel_image_store,
                 &self.kitty_image_store,
-                &self.link_handler,
                 &self.terminal_emulator_colors,
                 &self.terminal_emulator_color_codes,
                 &self.character_cell_size,
@@ -3429,7 +3428,6 @@ impl Tab {
                         self.style,
                         next_terminal_position,
                         initial_pane_title.clone().unwrap_or_default(),
-                        self.link_handler.clone(),
                         self.character_cell_size.clone(),
                         self.sixel_image_store.clone(),
                         self.kitty_image_store.clone(),
@@ -3462,7 +3460,6 @@ impl Tab {
                     self.kitty_image_store.clone(),
                     self.terminal_emulator_colors.clone(),
                     self.terminal_emulator_color_codes.clone(),
-                    self.link_handler.clone(),
                     self.character_cell_size.clone(),
                     self.connected_clients_in_app
                         .borrow()
@@ -3557,7 +3554,6 @@ impl Tab {
                         self.style,
                         next_terminal_position,
                         initial_pane_title.clone().unwrap_or_default(),
-                        self.link_handler.clone(),
                         self.character_cell_size.clone(),
                         self.sixel_image_store.clone(),
                         self.kitty_image_store.clone(),
@@ -3590,7 +3586,6 @@ impl Tab {
                     self.kitty_image_store.clone(),
                     self.terminal_emulator_colors.clone(),
                     self.terminal_emulator_color_codes.clone(),
-                    self.link_handler.clone(),
                     self.character_cell_size.clone(),
                     self.connected_clients_in_app
                         .borrow()
@@ -3675,7 +3670,6 @@ impl Tab {
                         self.style,
                         next_terminal_position,
                         initial_pane_title.clone().unwrap_or_default(),
-                        self.link_handler.clone(),
                         self.character_cell_size.clone(),
                         self.sixel_image_store.clone(),
                         self.kitty_image_store.clone(),
@@ -3708,7 +3702,6 @@ impl Tab {
                     self.kitty_image_store.clone(),
                     self.terminal_emulator_colors.clone(),
                     self.terminal_emulator_color_codes.clone(),
-                    self.link_handler.clone(),
                     self.character_cell_size.clone(),
                     self.connected_clients_in_app
                         .borrow()
@@ -3856,7 +3849,6 @@ impl Tab {
                         self.style,
                         next_terminal_position,
                         initial_pane_title.clone().unwrap_or_default(),
-                        self.link_handler.clone(),
                         self.character_cell_size.clone(),
                         self.sixel_image_store.clone(),
                         self.kitty_image_store.clone(),
@@ -3889,7 +3881,6 @@ impl Tab {
                     self.kitty_image_store.clone(),
                     self.terminal_emulator_colors.clone(),
                     self.terminal_emulator_color_codes.clone(),
-                    self.link_handler.clone(),
                     self.character_cell_size.clone(),
                     self.connected_clients_in_app
                         .borrow()
@@ -4106,7 +4097,6 @@ impl Tab {
                     self.style,
                     next_terminal_position,
                     String::new(),
-                    self.link_handler.clone(),
                     self.character_cell_size.clone(),
                     self.sixel_image_store.clone(),
                     self.kitty_image_store.clone(),
@@ -4193,7 +4183,6 @@ impl Tab {
                     self.kitty_image_store.clone(),
                     self.terminal_emulator_colors.clone(),
                     self.terminal_emulator_color_codes.clone(),
-                    self.link_handler.clone(),
                     self.character_cell_size.clone(),
                     self.connected_clients_in_app
                         .borrow()
@@ -4348,7 +4337,6 @@ impl Tab {
                     self.style,
                     next_terminal_position,
                     String::new(),
-                    self.link_handler.clone(),
                     self.character_cell_size.clone(),
                     self.sixel_image_store.clone(),
                     self.kitty_image_store.clone(),
@@ -4441,7 +4429,6 @@ impl Tab {
                     self.style,
                     next_terminal_position,
                     String::new(),
-                    self.link_handler.clone(),
                     self.character_cell_size.clone(),
                     self.sixel_image_store.clone(),
                     self.kitty_image_store.clone(),
@@ -4595,7 +4582,6 @@ impl Tab {
                 self.style,
                 next_terminal_position,
                 String::new(),
-                self.link_handler.clone(),
                 self.character_cell_size.clone(),
                 self.sixel_image_store.clone(),
                 self.kitty_image_store.clone(),
@@ -9706,7 +9692,6 @@ impl Tab {
             self.style,
             next_terminal_position,
             String::new(),
-            self.link_handler.clone(),
             self.character_cell_size.clone(),
             self.sixel_image_store.clone(),
             self.kitty_image_store.clone(),
