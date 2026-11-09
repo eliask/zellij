@@ -3322,6 +3322,7 @@ impl WasmBridge {
                                 Some(should_focus),
                                 Some(client_id),
                                 None,
+                                None,
                             )));
                             if is_shared {
                                 vec![(plugin_id, None)]
