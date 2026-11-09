@@ -47,7 +47,12 @@ pub(crate) fn socket_dir_override(opts: &CliArgs) -> Option<&std::path::Path> {
 }
 
 fn main() {
-    configure_logger();
+    if let Err(e) = configure_logger() {
+        // continue without file logging rather than crash: eg. the tmp dir
+        // being on a full tmpfs (EDQUOT) or otherwise unwritable shouldn't
+        // prevent zellij from starting
+        eprintln!("Failed to set up zellij log file: {}", e);
+    }
     create_config_and_cache_folders();
     let opts = CliArgs::parse_for_distribution();
     if let Some(socket_dir) = socket_dir_override(&opts) {
