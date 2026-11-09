@@ -3685,7 +3685,11 @@ impl Grid {
             return Some(resume.accumulated.clone());
         }
         copied.reverse();
-        let Some(piece) = self
+        // The oldest row of this quantum is copied[0]. A continuation there
+        // is the middle of a logical line; the serializer still emits a
+        // leading break because this slice starts at index 0.
+        let oldest_is_continuation = copied.first().is_some_and(|row| !row.is_canonical);
+        let Some(mut piece) = self
             .output_buffer
             .serialize(copied.as_slice(), self.osc8_hyperlinks, None)
             .ok()
@@ -3693,6 +3697,11 @@ impl Grid {
             resume.done = true;
             return None;
         };
+        if oldest_is_continuation {
+            if let Some(rest) = piece.strip_prefix("\n\r") {
+                piece = rest.to_string();
+            }
+        }
         if resume.accumulated.is_empty() {
             resume.accumulated = piece;
         } else {
