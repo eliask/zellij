@@ -118,11 +118,43 @@ fn plugin_asset_path(plugin_name: &str) -> PathBuf {
 }
 
 fn newest_plugin_source_time() -> Option<std::time::SystemTime> {
-    let root = crate::project_root();
-    ["default-plugins", "zellij-tile", "zellij-tile-utils"]
-        .iter()
-        .filter_map(|dir| newest_file_time(&root.join(dir)))
-        .max()
+    newest_plugin_source_time_in(&crate::project_root())
+}
+
+fn newest_plugin_source_time_in(root: &Path) -> Option<std::time::SystemTime> {
+    // `zellij-utils/assets` holds generated wasm and prost output. Those files are
+    // not inputs: the newest wasm would make every other cached plugin look stale.
+    let mut newest = [
+        "default-plugins",
+        "zellij-tile",
+        "zellij-tile-utils",
+        "zellij-utils/src",
+    ]
+    .iter()
+    .filter_map(|dir| newest_file_time(&root.join(dir)))
+    .max();
+    for file in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        "zellij-utils/Cargo.toml",
+    ] {
+        if let Ok(modified) = std::fs::metadata(root.join(file)).and_then(|m| m.modified()) {
+            newest = Some(newest.map_or(modified, |current| current.max(modified)));
+        }
+    }
+    newest
+}
+
+fn cached_plugin_asset_is_stale(
+    asset_modified: Option<std::time::SystemTime>,
+    newest_source: Option<std::time::SystemTime>,
+) -> bool {
+    match (asset_modified, newest_source) {
+        (Some(asset_modified), Some(newest_source)) => asset_modified < newest_source,
+        // Missing asset (clean checkout) or unreadable inputs: rebuild.
+        _ => true,
+    }
 }
 
 fn newest_file_time(dir: &Path) -> Option<std::time::SystemTime> {
@@ -174,10 +206,7 @@ pub fn ensure_plugin_assets(sh: &Shell) -> anyhow::Result<()> {
                     let asset_time = std::fs::metadata(plugin_asset_path(artifact_name))
                         .and_then(|m| m.modified())
                         .ok();
-                    match (asset_time, newest_source) {
-                        (Some(asset_time), Some(newest_source)) => asset_time < newest_source,
-                        _ => true,
-                    }
+                    cached_plugin_asset_is_stale(asset_time, newest_source)
                 })
         });
 
@@ -340,4 +369,191 @@ fn move_plugin_to_assets(sh: &Shell, plugin_name: &str) -> anyhow::Result<()> {
     let from = plugin.as_path();
     let to = asset_name.as_path();
     sh.copy_file(from, to).with_context(err_context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    const SOURCE_INPUTS: &[&str] = &[
+        "default-plugins/status-bar/src/main.rs",
+        "zellij-tile/src/lib.rs",
+        "zellij-tile-utils/src/lib.rs",
+        "zellij-utils/src/plugin_api/event.proto",
+    ];
+    const BUILD_INPUTS: &[&str] = &[
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        "zellij-utils/Cargo.toml",
+    ];
+    const PLUGIN_ASSETS: &[&str] = &[
+        "zellij-utils/assets/plugins/status-bar.wasm",
+        "zellij-utils/assets/plugins/tab-bar.wasm",
+    ];
+
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "zellij-plugin-inputs-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let files = SOURCE_INPUTS
+                .iter()
+                .chain(BUILD_INPUTS)
+                .chain(PLUGIN_ASSETS)
+                .copied()
+                .chain([
+                    "zellij-utils/assets/prost/generated_plugin_api.rs",
+                    "default-plugins/status-bar/target/debug/libstatus_bar.rlib",
+                ]);
+            for file in files {
+                let path = root.join(file);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+                std::fs::write(&path, b"x").expect("write");
+            }
+            Self { root }
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.root.join(relative)
+        }
+
+        fn stamp(&self, relative: &str, secs: u64) {
+            set_mtime(&self.path(relative), secs);
+        }
+
+        fn stamp_all(&self, files: &[&str], secs: u64) {
+            for file in files {
+                self.stamp(file, secs);
+            }
+        }
+
+        fn fresh_tree(&self) {
+            self.stamp_all(SOURCE_INPUTS, 1_000);
+            self.stamp_all(BUILD_INPUTS, 1_000);
+            self.stamp_all(PLUGIN_ASSETS, 2_000);
+        }
+
+        fn assets_are_stale(&self) -> bool {
+            let newest = newest_plugin_source_time_in(&self.root);
+            PLUGIN_ASSETS.iter().any(|asset| {
+                let asset_time = std::fs::metadata(self.path(asset))
+                    .and_then(|metadata| metadata.modified())
+                    .ok();
+                cached_plugin_asset_is_stale(asset_time, newest)
+            })
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+            .expect("set mtime");
+    }
+
+    #[test]
+    fn plugin_asset_source_change_invalidates() {
+        let fixture = Fixture::new("source");
+        fixture.fresh_tree();
+        assert!(
+            !fixture.assets_are_stale(),
+            "assets newer than every input should be cached"
+        );
+
+        fixture.stamp("zellij-utils/src/plugin_api/event.proto", 3_000);
+        assert!(
+            fixture.assets_are_stale(),
+            "a zellij-utils source change must invalidate cached plugins"
+        );
+
+        fixture.stamp("zellij-utils/src/plugin_api/event.proto", 1_000);
+        fixture.stamp("default-plugins/status-bar/src/main.rs", 3_000);
+        assert!(
+            fixture.assets_are_stale(),
+            "a default-plugin source change must still invalidate cached plugins"
+        );
+    }
+
+    #[test]
+    fn plugin_asset_build_input_invalidates() {
+        for input in BUILD_INPUTS {
+            let fixture = Fixture::new(&format!("build-{}", input.replace('/', "-")));
+            fixture.fresh_tree();
+            fixture.stamp(input, 3_000);
+            assert!(
+                fixture.assets_are_stale(),
+                "{input} is a plugin build input and must invalidate cached assets"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_asset_generated_output_does_not_invalidate() {
+        let fixture = Fixture::new("generated");
+        fixture.fresh_tree();
+        fixture.stamp("zellij-utils/assets/plugins/tab-bar.wasm", 5_000);
+        fixture.stamp("zellij-utils/assets/prost/generated_plugin_api.rs", 6_000);
+        fixture.stamp(
+            "default-plugins/status-bar/target/debug/libstatus_bar.rlib",
+            7_000,
+        );
+
+        let newest = newest_plugin_source_time_in(&fixture.root).expect("inputs exist");
+        let older_wasm = fixture
+            .path("zellij-utils/assets/plugins/status-bar.wasm")
+            .metadata()
+            .expect("wasm")
+            .modified()
+            .expect("mtime");
+        let newer_wasm = fixture
+            .path("zellij-utils/assets/plugins/tab-bar.wasm")
+            .metadata()
+            .expect("wasm")
+            .modified()
+            .expect("mtime");
+        assert!(newest < newer_wasm, "generated wasm must not be an input");
+        assert!(
+            newest < older_wasm,
+            "source time must stay behind both cached assets"
+        );
+        assert!(
+            !fixture.assets_are_stale(),
+            "touching generated output must not rebuild cached plugins"
+        );
+    }
+
+    #[test]
+    fn plugin_asset_missing_on_clean_checkout_rebuilds() {
+        let fixture = Fixture::new("clean");
+        fixture.fresh_tree();
+        for asset in PLUGIN_ASSETS {
+            std::fs::remove_file(fixture.path(asset)).expect("remove asset");
+        }
+        let newest = newest_plugin_source_time_in(&fixture.root);
+        assert!(newest.is_some(), "sources exist on a clean checkout");
+        assert!(
+            cached_plugin_asset_is_stale(None, newest),
+            "missing wasm assets must be rebuilt"
+        );
+        assert!(
+            fixture.assets_are_stale(),
+            "a checkout without plugin assets must rebuild"
+        );
+    }
 }
