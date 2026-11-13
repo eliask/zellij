@@ -564,6 +564,26 @@ where
     }
 }
 
+/// Decode a client message from an already-buffered frame body.
+///
+/// The handshake path reads the length prefix itself and refuses an oversized
+/// claim before allocating the body. This function does not look at a length
+/// prefix and does not change how later frames on an established connection
+/// are read.
+pub fn decode_client_to_server_frame(
+    buf: &[u8],
+) -> std::result::Result<ClientToServerMsg, IpcReceiveError> {
+    let proto_msg =
+        ProtoClientToServerMsg::decode(buf).map_err(|_| IpcReceiveError::Undecodable)?;
+    proto_msg.try_into().map_err(|error| {
+        warn!(
+            "Error converting protobuf to ClientToServerMsg: {:?}",
+            error
+        );
+        IpcReceiveError::Undecodable
+    })
+}
+
 // Protobuf wire format utilities
 fn read_protobuf_message<T: Message + Default>(
     reader: &mut impl Read,
@@ -684,4 +704,19 @@ pub async fn async_send_kill_and_await(path: &std::path::Path) -> io::Result<()>
     })
     .await
     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+}
+
+#[cfg(test)]
+mod handshake_frame_decode_tests {
+    use super::{decode_client_to_server_frame, ClientToServerMsg, ProtoClientToServerMsg};
+    use prost::Message;
+
+    #[test]
+    fn decode_client_to_server_frame_accepts_a_small_body_and_rejects_garbage() {
+        let proto: ProtoClientToServerMsg = ClientToServerMsg::ConnStatus.into();
+        let bytes = proto.encode_to_vec();
+        let decoded = decode_client_to_server_frame(&bytes).unwrap();
+        assert!(matches!(decoded, ClientToServerMsg::ConnStatus));
+        assert!(decode_client_to_server_frame(&[0xff, 0xff, 0x00]).is_err());
+    }
 }

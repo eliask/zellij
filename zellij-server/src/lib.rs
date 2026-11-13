@@ -16,6 +16,7 @@ pub mod attention;
 pub mod background_jobs;
 mod desktop_app;
 pub use desktop_app::{set_app_starter, AppStarter};
+mod connection_admission;
 mod global_async_runtime;
 mod logging_pipe;
 mod mobile_web;
@@ -3313,17 +3314,38 @@ fn handle_new_connection(
     session_state: Arc<RwLock<SessionState>>,
     os_input: Box<dyn ServerOsApi>,
     to_server: SenderWithContext<ServerInstruction>,
-    stream: interprocess::local_socket::Stream,
+    mut stream: interprocess::local_socket::Stream,
+    permit: connection_admission::PreHandshakePermit,
     #[cfg(windows)] reply_stream: interprocess::local_socket::Stream,
 ) -> Result<()> {
-    let mut receiver: IpcReceiverWithContext<ClientToServerMsg> =
-        IpcReceiverWithContext::new(stream);
+    use interprocess::local_socket::traits::Stream as _;
 
-    let _ = receiver.set_read_timeout(Some(PRE_HANDSHAKE_READ_TIMEOUT));
-    let first_instruction = match receiver.try_recv_client_msg() {
-        Ok((instruction, _err_ctx)) => instruction,
+    // Charge this peer until its first frame is decoded or the socket ends.
+    // The generic reader would allocate the body from the length prefix first.
+    let _ = stream.set_recv_timeout(Some(PRE_HANDSHAKE_READ_TIMEOUT));
+    let first_frame = match connection_admission::read_capped_frame(
+        &mut stream,
+        connection_admission::HANDSHAKE_FRAME_BYTES,
+    ) {
+        Ok(frame) => frame,
+        Err(connection_admission::CappedFrameError::Oversized { claimed }) => {
+            log::warn!(
+                "Rejecting connection: handshake claims {claimed} bytes (cap {})",
+                connection_admission::HANDSHAKE_FRAME_BYTES
+            );
+            return Ok(());
+        },
+        Err(connection_admission::CappedFrameError::Disconnected) => return Ok(()),
+    };
+    let first_instruction = match zellij_utils::ipc::decode_client_to_server_frame(&first_frame) {
+        Ok(instruction) => instruction,
         Err(_) => return Ok(()),
     };
+    // The first client message is decoded. Later frames on this socket are
+    // not pre-handshake, so this peer must not keep the ceiling.
+    permit.release_after_first_message();
+
+    let receiver: IpcReceiverWithContext<ClientToServerMsg> = IpcReceiverWithContext::new(stream);
     let _ = receiver.set_read_timeout(None);
 
     match first_instruction {
@@ -3818,28 +3840,39 @@ pub fn start_server_impl(
                 #[cfg(unix)]
                 drop(set_permissions(&socket_path, 0o1700));
 
+                let admission = connection_admission::PreHandshakeLimiter::production();
                 let route = |stream: interprocess::local_socket::Stream,
                              #[cfg(windows)] reply_stream: interprocess::local_socket::Stream| {
                     let os_input = os_input.clone();
                     let session_data = session_data.clone();
                     let session_state = session_state.clone();
                     let to_server = to_server.clone();
-                    let spawn_result = thread::Builder::new()
-                        .name("server_router".to_string())
-                        .spawn(move || {
+                    match admission.spawn_router(
+                        || thread::Builder::new().name("server_router".to_string()),
+                        move |permit| {
                             handle_new_connection(
                                 session_data,
                                 session_state,
                                 os_input,
                                 to_server,
                                 stream,
+                                permit,
                                 #[cfg(windows)]
                                 reply_stream,
                             )
-                            .fatal()
-                        });
-                    if let Err(err) = spawn_result {
-                        log::error!("Failed to spawn router thread: {:?}", err);
+                            .fatal();
+                        },
+                    ) {
+                        Ok(()) => {},
+                        Err(connection_admission::RouterSpawnError::CeilingReached) => {
+                            log::warn!(
+                                "Refusing connection: {} pre-handshake routers already in flight",
+                                admission.in_flight()
+                            );
+                        },
+                        Err(connection_admission::RouterSpawnError::Spawn(err)) => {
+                            log::error!("Failed to spawn router thread: {:?}", err);
+                        },
                     }
                 };
 
