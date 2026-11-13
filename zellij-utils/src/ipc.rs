@@ -12,7 +12,7 @@ use std::{
     fmt::{Display, Error, Formatter},
     io::{self, Read, Write},
     marker::PhantomData,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 // Protobuf imports
@@ -629,58 +629,616 @@ pub fn recv_protobuf_server_to_client(
     receiver.try_recv_server_msg().ok()
 }
 
-/// Asynchronously send `ClientToServerMsg::KillSession` to the peer at `path`
-/// and wait until the peer's existing shutdown path replies (or its socket
-/// closes). Either of those outcomes confirms the kill landed; the caller
-/// wraps this in `tokio::time::timeout` to bound the wait against a wedged
-/// peer.
+/// Cap for a health-probe or kill-reply frame. `Connected` and `Exit` are tiny.
+/// This does not change the unbounded read used by an established IPC session.
+pub(crate) const PROBE_MAX_FRAME_BYTES: usize = 64 * 1024;
+
+/// What `async_send_kill_and_await` actually observed.
 ///
-/// On Unix the local socket is bidirectional, so the same async stream is
-/// used for both send and receive. On Windows the named pipe is half-duplex
-/// and the existing sync `ipc_connect` / `ipc_connect_reply` flow is
-/// dispatched onto a blocking task.
+/// Process death is a separate fact. This enum never claims the server
+/// process has exited; [`KillReply::ShutdownAcknowledged`] only means a
+/// `ServerToClientMsg::Exit` frame was decoded. `KillSession` sends
+/// `ExitReason::Normal` (`zellij-server` `ServerInstruction::KillSession`);
+/// any `Exit` variant counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillReply {
+    /// A length-prefixed `ServerToClientMsg::Exit` was decoded.
+    ShutdownAcknowledged,
+    /// The kill request was written, but the reply was not a decoded Exit
+    /// (EOF, short read, oversized length, decode failure, timeout, unexpected
+    /// message, or a later I/O error).
+    OutcomeUnknown,
+}
+
 #[cfg(unix)]
-pub async fn async_send_kill_and_await(path: &std::path::Path) -> io::Result<()> {
-    use interprocess::local_socket::traits::tokio::Stream as _;
-    use interprocess::local_socket::{prelude::*, GenericFilePath};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+fn remaining_until(deadline: Instant) -> io::Result<Duration> {
+    // Sub-millisecond values round to a zero `timeval`, and Linux treats
+    // `SO_RCVTIMEO`/`SO_SNDTIMEO` of zero as "block forever".
+    match deadline.checked_duration_since(Instant::now()) {
+        Some(remaining) if remaining >= Duration::from_millis(1) => Ok(remaining),
+        _ => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "deadline exhausted",
+        )),
+    }
+}
 
-    let fs_name = path.to_fs_name::<GenericFilePath>()?;
-    let mut stream: interprocess::local_socket::tokio::Stream =
-        interprocess::local_socket::tokio::Stream::connect(fs_name).await?;
+fn decode_server_frame(buf: &[u8]) -> io::Result<ServerToClientMsg> {
+    let proto = ProtoServerToClientMsg::decode(buf)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    ServerToClientMsg::try_from(proto)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+}
 
-    let proto_msg: ProtoClientToServerMsg = crate::ipc::ClientToServerMsg::KillSession.into();
-    let encoded = proto_msg.encode_to_vec();
-    let len_bytes = (encoded.len() as u32).to_le_bytes();
-
-    stream.write_all(&len_bytes).await?;
-    stream.write_all(&encoded).await?;
-    // Best-effort flush; failing here doesn't mean the kill failed.
-    let _ = stream.flush().await;
-
-    // The peer's shutdown path sends `ServerToClientMsg::Exit { Normal }`
-    // (zellij-server/src/lib.rs ServerInstruction::KillSession) over this
-    // same socket before exiting; if it dies without ACKing, the stream
-    // closes. Either outcome -- a successful 4-byte length-prefix read or a
-    // read error/EOF -- confirms the kill is no longer in flight.
-    let mut len_buf = [0u8; 4];
-    let _ = stream.read_exact(&mut len_buf).await;
+#[cfg(unix)]
+fn reject_probe_frame(len: usize) -> io::Result<()> {
+    if len > PROBE_MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame exceeds the probe cap",
+        ));
+    }
     Ok(())
 }
 
+/// Socket timeouts are inactivity timers. Callers that need one absolute
+/// deadline must refresh them before every syscall.
+#[cfg(unix)]
+pub(crate) trait DeadlineIo {
+    fn refresh_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn refresh_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn wait_readable(&self, deadline: Instant) -> io::Result<()> {
+        let _ = deadline;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl DeadlineIo for LocalSocketStream {
+    fn refresh_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        use interprocess::local_socket::traits::Stream;
+        self.set_recv_timeout(timeout)
+    }
+    fn refresh_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        use interprocess::local_socket::traits::Stream;
+        self.set_send_timeout(timeout)
+    }
+    fn wait_readable(&self, deadline: Instant) -> io::Result<()> {
+        use nix::errno::Errno;
+        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+        use std::os::fd::AsFd;
+
+        let interprocess::local_socket::Stream::UdSocket(stream) = self;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "deadline exhausted",
+                ));
+            }
+            let poll_timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX);
+            let mut fds = [PollFd::new(stream.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, poll_timeout) {
+                Err(Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "deadline exhausted",
+                    ))
+                },
+                Ok(_) => return Ok(()),
+            }
+        }
+    }
+}
+
+/// Errors that mean "the peer is not ready yet", not "the probe is done".
+///
+/// macOS `poll` reports `POLLHUP` with `SO_ERROR == 0` for a unix socket that
+/// has connected and is sitting in the accept queue. A write or read can then
+/// return `WouldBlock`, `TimedOut`, `NotConnected`, an immediate EOF, or
+/// `BrokenPipe` / `ConnectionReset` / `ConnectionAborted` until `accept` runs.
+/// Retrying stops at the caller's deadline and does not open a new socket.
+#[cfg(unix)]
+fn peer_not_ready(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    ) {
+        return true;
+    }
+    // macOS has returned a transient `EPROTOTYPE` for a write to a unix
+    // socket whose peer is not fully established. The deadline bounds the retry.
+    #[cfg(target_vendor = "apple")]
+    if err.raw_os_error() == Some(nix::errno::Errno::EPROTOTYPE as i32) {
+        return true;
+    }
+    // macOS has returned EINVAL while a just-connected Unix socket was not yet
+    // ready for the probe read. Retrying is bounded by the caller's deadline.
+    #[cfg(target_vendor = "apple")]
+    if err.kind() == io::ErrorKind::InvalidInput {
+        return true;
+    }
+    false
+}
+
+/// Wait a millisecond, or less when the deadline is closer. A kernel `EAGAIN`
+/// must not spin. The wait never extends the deadline.
+#[cfg(unix)]
+fn pause_until_peer_ready(deadline: Instant) -> io::Result<()> {
+    let remaining = remaining_until(deadline)?;
+    std::thread::sleep(Duration::from_millis(1).min(remaining));
+    Ok(())
+}
+
+/// `read_exact` against one absolute deadline. The socket timeout is refreshed
+/// from `deadline` before each `read`. Bytes already stored stay stored.
+/// Zero remaining time returns [`io::ErrorKind::TimedOut`] without another
+/// blocking call.
+#[cfg(unix)]
+pub(crate) fn read_exact_until_deadline<R>(
+    reader: &mut R,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()>
+where
+    R: Read + DeadlineIo,
+{
+    let mut filled = 0;
+    let mut traced = false;
+    while filled < buf.len() {
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let remaining = remaining_until(deadline)?;
+            reader.refresh_read_timeout(Some(remaining))?;
+        }
+        #[cfg(target_vendor = "apple")]
+        remaining_until(deadline)?;
+        reader.wait_readable(deadline)?;
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => {
+                trace_probe_retry_once(
+                    &mut traced,
+                    "read",
+                    filled,
+                    buf.len(),
+                    &io::Error::new(io::ErrorKind::UnexpectedEof, "read returned zero"),
+                );
+                pause_until_peer_ready(deadline)?;
+            },
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if peer_not_ready(&err) => {
+                trace_probe_retry_once(&mut traced, "read", filled, buf.len(), &err);
+                pause_until_peer_ready(deadline)?;
+            },
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn trace_probe_retry_once(
+    traced: &mut bool,
+    stage: &str,
+    completed: usize,
+    total: usize,
+    error: &io::Error,
+) {
+    if *traced {
+        return;
+    }
+    *traced = true;
+    log::debug!("probe {stage} first retry at {completed}/{total} bytes: {error:?}");
+    #[cfg(test)]
+    eprintln!("probe {stage} first retry at {completed}/{total} bytes: {error:?}");
+}
+
+/// `write_all` against one absolute deadline. The socket timeout is refreshed
+/// from `deadline` before each `write`. A short write keeps the bytes already
+/// counted and retries only the tail. Zero remaining time returns
+/// [`io::ErrorKind::TimedOut`] without another blocking call.
+#[cfg(unix)]
+pub(crate) fn write_all_until_deadline<W>(
+    writer: &mut W,
+    buf: &[u8],
+    deadline: Instant,
+) -> io::Result<()>
+where
+    W: Write + DeadlineIo,
+{
+    let mut written = 0;
+    let mut traced = false;
+    while written < buf.len() {
+        let remaining = remaining_until(deadline)?;
+        writer.refresh_write_timeout(Some(remaining))?;
+        match writer.write(&buf[written..]) {
+            Ok(0) => {
+                trace_probe_retry_once(
+                    &mut traced,
+                    "write",
+                    written,
+                    buf.len(),
+                    &io::Error::new(io::ErrorKind::WriteZero, "write returned zero"),
+                );
+                pause_until_peer_ready(deadline)?;
+            },
+            Ok(n) => written += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if peer_not_ready(&err) => {
+                trace_probe_retry_once(&mut traced, "write", written, buf.len(), &err);
+                pause_until_peer_ready(deadline)?;
+            },
+            Err(err) => return Err(err),
+        }
+    }
+    loop {
+        let remaining = remaining_until(deadline)?;
+        writer.refresh_write_timeout(Some(remaining))?;
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if peer_not_ready(&err) => {
+                trace_probe_retry_once(&mut traced, "flush", written, buf.len(), &err);
+                pause_until_peer_ready(deadline)?;
+            },
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn encode_client_frame(msg: ClientToServerMsg) -> io::Result<Vec<u8>> {
+    let proto: ProtoClientToServerMsg = msg.into();
+    let encoded = proto.encode_to_vec();
+    reject_probe_frame(encoded.len())?;
+    let len = u32::try_from(encoded.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame length exceeds u32"))?;
+    let mut frame = Vec::with_capacity(4 + encoded.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&encoded);
+    Ok(frame)
+}
+
+/// Read one length-prefixed server frame, refusing to allocate above `max_frame`.
+#[cfg(unix)]
+pub(crate) fn read_server_frame_until_deadline<R>(
+    reader: &mut R,
+    deadline: Instant,
+    max_frame: usize,
+) -> io::Result<ServerToClientMsg>
+where
+    R: Read + DeadlineIo,
+{
+    let mut len_bytes = [0u8; 4];
+    read_exact_until_deadline(reader, &mut len_bytes, deadline)?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > max_frame {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame exceeds the allowed cap",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    read_exact_until_deadline(reader, &mut buf, deadline)?;
+    decode_server_frame(&buf)
+}
+
 #[cfg(windows)]
-pub async fn async_send_kill_and_await(path: &std::path::Path) -> io::Result<()> {
+fn read_server_frame_capped<R: Read>(
+    reader: &mut R,
+    max_frame: usize,
+) -> io::Result<ServerToClientMsg> {
+    let mut len_bytes = [0u8; 4];
+    reader.read_exact(&mut len_bytes)?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > max_frame {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame exceeds the allowed cap",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf)?;
+    decode_server_frame(&buf)
+}
+
+#[cfg(all(test, unix))]
+mod probe_io_retry {
+    use super::{read_exact_until_deadline, write_all_until_deadline, DeadlineIo};
+    use std::io::{self, Read, Write};
+    use std::time::{Duration, Instant};
+
+    struct Scripted {
+        reads: Vec<io::Result<usize>>,
+        writes: Vec<io::Result<usize>>,
+        payload: Vec<u8>,
+    }
+
+    impl DeadlineIo for Scripted {
+        fn refresh_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+        fn refresh_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.reads.is_empty() {
+                let n = self.payload.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.payload[..n]);
+                self.payload.drain(..n);
+                return Ok(n);
+            }
+            match self.reads.remove(0) {
+                Ok(0) => Ok(0),
+                Ok(n) => {
+                    let n = n.min(buf.len()).min(self.payload.len());
+                    buf[..n].copy_from_slice(&self.payload[..n]);
+                    self.payload.drain(..n);
+                    Ok(n)
+                },
+                Err(err) => Err(err),
+            }
+        }
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.writes.is_empty() {
+                return Ok(buf.len());
+            }
+            self.writes.remove(0)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_early_eof_and_would_block_are_retried_until_the_peer_answers() {
+        let mut reader = Scripted {
+            reads: vec![
+                Ok(0),
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "waiting for accept",
+                )),
+            ],
+            writes: vec![],
+            payload: b"ok".to_vec(),
+        };
+        let mut buf = [0u8; 2];
+        read_exact_until_deadline(
+            &mut reader,
+            &mut buf,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("the reply arrives after the pre-accept errors");
+        assert_eq!(&buf, b"ok");
+    }
+
+    #[test]
+    fn a_peer_that_stays_reset_stops_at_the_deadline() {
+        struct AlwaysReset;
+
+        impl DeadlineIo for AlwaysReset {
+            fn refresh_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+                Ok(())
+            }
+            fn refresh_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Write for AlwaysReset {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "peer stays reset",
+                ))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let started = Instant::now();
+        let err = write_all_until_deadline(
+            &mut AlwaysReset,
+            b"ping",
+            started + Duration::from_millis(40),
+        )
+        .expect_err("a peer that stays reset must not succeed");
+        let elapsed = started.elapsed();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "reset retry ran past the deadline: {elapsed:?}"
+        );
+    }
+}
+
+/// Send `ClientToServerMsg::KillSession` and wait up to `budget` for a decoded
+/// [`ServerToClientMsg::Exit`].
+///
+/// Returns [`Err`] if the request is not written (connect or write failure,
+/// including the deadline expiring first). After a successful write, EOF, a
+/// short read, an oversized frame, a decode failure, a timeout, or any
+/// non-Exit message is [`KillReply::OutcomeUnknown`] — not success.
+///
+/// On Unix the local socket is bidirectional, so the same stream is used for
+/// both send and receive. The budget is one absolute deadline over connect,
+/// the kill write, and the reply frame. A trickle of bytes cannot extend it.
+///
+/// On Windows the named pipe is half-duplex and this runs on `spawn_blocking`.
+/// The reply is decoded when the read completes. A blocked synchronous pipe
+/// call is not cancelled here: named pipes have no read timeout, and retiring
+/// that blocked call belongs to the Windows cancellation path.
+#[cfg(unix)]
+pub async fn async_send_kill_and_await(
+    path: &std::path::Path,
+    budget: Duration,
+) -> io::Result<KillReply> {
+    use interprocess::local_socket::traits::tokio::Stream as _;
+    use interprocess::local_socket::{prelude::*, GenericFilePath};
+    use tokio::io::AsyncWriteExt;
+
+    if budget.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "no time to send kill",
+        ));
+    }
+    let deadline = Instant::now() + budget;
+    let fs_name = path.to_fs_name::<GenericFilePath>()?;
+    let connect_budget = remaining_until(deadline)?;
+    let mut stream: interprocess::local_socket::tokio::Stream =
+        match tokio::time::timeout(connect_budget, async {
+            interprocess::local_socket::tokio::Stream::connect(fs_name).await
+        })
+        .await
+        {
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "kill connect timed out",
+                ));
+            },
+            Ok(result) => result?,
+        };
+
+    let proto_msg: ProtoClientToServerMsg = ClientToServerMsg::KillSession.into();
+    let encoded = proto_msg.encode_to_vec();
+    reject_probe_frame(encoded.len())?;
+    let len = u32::try_from(encoded.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame length exceeds u32"))?;
+    let mut frame = Vec::with_capacity(4 + encoded.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&encoded);
+    write_all_async_until_deadline(&mut stream, &frame, deadline).await?;
+    let _ = stream.flush().await;
+
+    match read_exit_reply(&mut stream, deadline).await {
+        Ok(ServerToClientMsg::Exit { .. }) => Ok(KillReply::ShutdownAcknowledged),
+        Ok(_) | Err(_) => Ok(KillReply::OutcomeUnknown),
+    }
+}
+
+#[cfg(unix)]
+async fn write_all_async_until_deadline(
+    stream: &mut interprocess::local_socket::tokio::Stream,
+    buf: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut written = 0;
+    while written < buf.len() {
+        let remaining = remaining_until(deadline)?;
+        match tokio::time::timeout(remaining, stream.write(&buf[written..])).await {
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "kill write deadline exhausted",
+                ));
+            },
+            Ok(Err(err)) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Ok(Err(err)) => return Err(err),
+            Ok(Ok(0)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "kill write returned 0",
+                ));
+            },
+            Ok(Ok(n)) => written += n,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn read_exact_async_until_deadline(
+    stream: &mut interprocess::local_socket::tokio::Stream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut filled = 0;
+    while filled < buf.len() {
+        let remaining = remaining_until(deadline)?;
+        match tokio::time::timeout(remaining, stream.read(&mut buf[filled..])).await {
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "kill read deadline exhausted",
+                ));
+            },
+            Ok(Err(err)) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Ok(Err(err)) => return Err(err),
+            Ok(Ok(0)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short read before the kill deadline",
+                ));
+            },
+            Ok(Ok(n)) => filled += n,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn read_exit_reply(
+    stream: &mut interprocess::local_socket::tokio::Stream,
+    deadline: Instant,
+) -> io::Result<ServerToClientMsg> {
+    let mut len_bytes = [0u8; 4];
+    read_exact_async_until_deadline(stream, &mut len_bytes, deadline).await?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > PROBE_MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kill reply exceeds the probe cap",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    read_exact_async_until_deadline(stream, &mut buf, deadline).await?;
+    decode_server_frame(&buf)
+}
+
+#[cfg(windows)]
+pub async fn async_send_kill_and_await(
+    path: &std::path::Path,
+    budget: Duration,
+) -> io::Result<KillReply> {
+    if budget.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "no time to send kill",
+        ));
+    }
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let (stream, reply_stream) = crate::pipe_pairs::connect_pair(&path)?;
+        let (stream, mut reply_stream) = crate::pipe_pairs::connect_pair(&path)?;
         let mut sender = IpcSenderWithContext::<ClientToServerMsg>::new(stream);
         sender
             .send_client_msg(ClientToServerMsg::KillSession)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let mut receiver: IpcReceiverWithContext<ServerToClientMsg> =
-            IpcReceiverWithContext::new(reply_stream);
-        let _ = receiver.recv_server_msg();
-        Ok::<(), io::Error>(())
+        match read_server_frame_capped(&mut reply_stream, PROBE_MAX_FRAME_BYTES) {
+            Ok(ServerToClientMsg::Exit { .. }) => Ok(KillReply::ShutdownAcknowledged),
+            _ => Ok(KillReply::OutcomeUnknown),
+        }
     })
     .await
     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?

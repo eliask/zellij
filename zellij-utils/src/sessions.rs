@@ -1,3 +1,6 @@
+#[cfg(windows)]
+use crate::ipc::IpcReceiverWithContext;
+use crate::session_index::{self, SessionIndex};
 use crate::{
     consts::{
         is_ipc_socket, session_info_folder_for_session, session_layout_cache_file_name,
@@ -6,8 +9,7 @@ use crate::{
     data::SessionInfo,
     envs,
     input::layout::Layout,
-    ipc::{ClientToServerMsg, IpcReceiverWithContext, IpcSenderWithContext, ServerToClientMsg},
-    session_index::{self, SessionIndex},
+    ipc::{ClientToServerMsg, IpcSenderWithContext, ServerToClientMsg},
 };
 use anyhow;
 use humantime::format_duration;
@@ -236,36 +238,237 @@ pub fn get_sessions_sorted_by_mtime() -> anyhow::Result<Vec<String>> {
     }
 }
 
+/// How long one session socket may take to answer a probe. The budget is one
+/// absolute deadline over connect, the request write, and the whole reply
+/// frame. It is not restarted when a few bytes arrive.
+#[cfg(not(windows))]
+const SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on sockets probed at once, so a directory of wedged sockets
+/// does not start one thread per entry.
+#[cfg(all(unix, test))]
+const MAX_CONCURRENT_SESSION_PROBES: usize = 8;
+
+/// Result of probing one session socket.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionProbeResult {
+    /// The server answered `Connected`.
+    Responsive,
+    /// A socket exists but liveness could not be established (timeout,
+    /// unexpected reply, oversized frame, or the shared deadline was already
+    /// spent). Must not be unlinked.
+    Unknown,
+    /// Proven gone: no socket, or the connection was refused.
+    Absent,
+}
+
+#[cfg(all(unix, test))]
+#[derive(Clone, Copy)]
+enum ObservedSlot {
+    Responsive,
+    Unknown,
+}
+
+#[cfg(all(unix, test))]
+struct SessionObservationPayload<T> {
+    responsive: Vec<(String, T)>,
+    unknown: Vec<(String, T)>,
+}
+
+/// Probe candidates concurrently. Each probe receives the time still left on
+/// the shared deadline, so a trickle of bytes on one socket cannot keep the
+/// scan alive and a later socket is not given a fresh budget.
+#[cfg(all(unix, test))]
+fn observe_sessions_with<T, F>(
+    candidates: Vec<(String, String, T)>,
+    deadline: Duration,
+    probe: F,
+) -> SessionObservationPayload<T>
+where
+    T: Clone + Send + Sync,
+    F: Fn(&str, Duration) -> SessionProbeResult + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    let mut observation = SessionObservationPayload {
+        responsive: Vec::new(),
+        unknown: Vec::new(),
+    };
+    if candidates.is_empty() {
+        return observation;
+    }
+    if candidates.len() == 1 {
+        let (id, name, payload) = candidates.into_iter().next().unwrap();
+        match probe(&id, deadline) {
+            SessionProbeResult::Responsive => observation.responsive.push((name, payload)),
+            SessionProbeResult::Unknown => observation.unknown.push((name, payload)),
+            SessionProbeResult::Absent => {},
+        }
+        return observation;
+    }
+    let results: Vec<Mutex<Option<(ObservedSlot, String, T)>>> =
+        candidates.iter().map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let started = Instant::now();
+    let workers = candidates.len().min(MAX_CONCURRENT_SESSION_PROBES);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some((id, name, _)) = candidates.get(index) else {
+                    break;
+                };
+                let remaining = deadline.saturating_sub(started.elapsed());
+                let outcome = if remaining.is_zero() {
+                    SessionProbeResult::Unknown
+                } else {
+                    probe(id, remaining)
+                };
+                let slot = match outcome {
+                    SessionProbeResult::Responsive => Some(ObservedSlot::Responsive),
+                    SessionProbeResult::Unknown => Some(ObservedSlot::Unknown),
+                    SessionProbeResult::Absent => None,
+                };
+                if let Some(slot) = slot {
+                    let payload = candidates[index].2.clone();
+                    *results[index]
+                        .lock()
+                        .expect("session probe result lock poisoned") =
+                        Some((slot, name.clone(), payload));
+                }
+            });
+        }
+    });
+    for slot in results {
+        if let Some((kind, name, payload)) = slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            match kind {
+                ObservedSlot::Responsive => observation.responsive.push((name, payload)),
+                ObservedSlot::Unknown => observation.unknown.push((name, payload)),
+            }
+        }
+    }
+    observation
+}
+
 /// Probe a session socket to check if a server is alive.
 ///
 /// On Unix, connects and sends a `ConnStatus` message to verify the server responds.
 /// On Windows, reads the server PID from the marker file and checks process liveness.
 #[cfg(unix)]
 fn assert_socket(name: &str) -> bool {
-    use crate::consts::ipc_connect;
-    let path = &*ZELLIJ_SOCK_DIR.join(name);
-    match ipc_connect(path) {
-        Ok(stream) => {
-            // a wedged server accepts connections but never replies; without a
-            // read timeout `zellij ls` would block forever on recv below
-            {
-                use interprocess::local_socket::prelude::*;
-                let _ = stream.set_recv_timeout(Some(std::time::Duration::from_secs(5)));
+    let path = ZELLIJ_SOCK_DIR.join(name);
+    match assert_socket_path(&path, SESSION_PROBE_TIMEOUT) {
+        SessionProbeResult::Responsive => true,
+        SessionProbeResult::Absent => {
+            // A refused connection leaves a stale socket file. Keep that
+            // cleanup. A timeout or a bad reply is Unknown and is not unlinked.
+            if path.exists() {
+                drop(fs::remove_file(&path));
             }
-            let mut sender: IpcSenderWithContext<ClientToServerMsg> =
-                IpcSenderWithContext::new(stream);
-            let _ = sender.send_client_msg(ClientToServerMsg::ConnStatus);
-            let mut receiver: IpcReceiverWithContext<ServerToClientMsg> = sender.get_receiver();
-            match receiver.recv_server_msg() {
-                Some((ServerToClientMsg::Connected, _)) => true,
-                None | Some((_, _)) => false,
-            }
-        },
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-            drop(fs::remove_file(path));
             false
         },
-        Err(_) => false,
+        SessionProbeResult::Unknown => false,
+    }
+}
+
+/// Probe the socket at `path` with one absolute deadline covering connect, the
+/// `ConnStatus` write, and the whole reply frame.
+///
+/// A socket read timeout is an inactivity timer, so it is refreshed from that
+/// deadline before every read and write. Timeout, short read, hang-up, an
+/// oversized length prefix, and any message other than `Connected` are
+/// [`SessionProbeResult::Unknown`]. Refused and missing paths are
+/// [`SessionProbeResult::Absent`]. This function does not unlink the path.
+#[cfg(unix)]
+fn assert_socket_path(path: &Path, timeout: Duration) -> SessionProbeResult {
+    let started = std::time::Instant::now();
+    match probe_socket_path_detailed(path, timeout) {
+        Ok(result) => result,
+        Err(failure) => {
+            log::debug!(
+                "session probe {} failed during {} after {:?}: {:?}",
+                path.display(),
+                failure.stage,
+                started.elapsed(),
+                failure.error
+            );
+            #[cfg(test)]
+            eprintln!(
+                "session probe {} failed during {} after {:?}: {:?}",
+                path.display(),
+                failure.stage,
+                started.elapsed(),
+                failure.error
+            );
+            SessionProbeResult::Unknown
+        },
+    }
+}
+
+#[cfg(unix)]
+struct SessionProbeFailure {
+    stage: &'static str,
+    error: io::Error,
+}
+
+#[cfg(unix)]
+fn probe_socket_path_detailed(
+    path: &Path,
+    timeout: Duration,
+) -> Result<SessionProbeResult, SessionProbeFailure> {
+    use crate::consts::ipc_connect_with_timeout;
+    use crate::ipc::{
+        encode_client_frame, read_server_frame_until_deadline, write_all_until_deadline,
+        PROBE_MAX_FRAME_BYTES,
+    };
+    use std::time::Instant;
+
+    if timeout.is_zero() {
+        return Ok(SessionProbeResult::Unknown);
+    }
+    let deadline = Instant::now() + timeout;
+    let mut stream = match ipc_connect_with_timeout(path, timeout) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            return Ok(SessionProbeResult::Absent)
+        },
+        Err(error) => {
+            return Err(SessionProbeFailure {
+                stage: "connect",
+                error,
+            })
+        },
+    };
+    let frame = encode_client_frame(ClientToServerMsg::ConnStatus).map_err(|error| {
+        SessionProbeFailure {
+            stage: "encode request",
+            error,
+        }
+    })?;
+    write_all_until_deadline(&mut stream, &frame, deadline).map_err(|error| {
+        SessionProbeFailure {
+            stage: "write request",
+            error,
+        }
+    })?;
+    let response = read_server_frame_until_deadline(&mut stream, deadline, PROBE_MAX_FRAME_BYTES)
+        .map_err(|error| SessionProbeFailure {
+        stage: "read/decode reply",
+        error,
+    })?;
+    match response {
+        ServerToClientMsg::Connected => Ok(SessionProbeResult::Responsive),
+        _ => Err(SessionProbeFailure {
+            stage: "validate reply",
+            error: io::Error::new(io::ErrorKind::InvalidData, "expected Connected reply"),
+        }),
     }
 }
 
@@ -417,7 +620,9 @@ pub fn send_kill_session(path: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(not(windows))]
 pub fn send_kill_session(path: &std::path::Path) -> std::io::Result<()> {
-    let stream = crate::consts::ipc_connect(path)?;
+    // Bound the connect. The kill frame itself is small; the plugin path
+    // waits for a decoded Exit under the same kind of deadline.
+    let stream = crate::consts::ipc_connect_with_timeout(path, SESSION_PROBE_TIMEOUT)?;
     let _ = IpcSenderWithContext::<ClientToServerMsg>::new(stream)
         .send_client_msg(ClientToServerMsg::KillSession);
     Ok(())
@@ -1068,3 +1273,7 @@ mod session_folder_name_tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "probe_deadline.rs"]
+mod probe_deadline;
