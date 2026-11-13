@@ -88,7 +88,14 @@ impl SessionManager for RealSessionManager {
         first_message: ClientToServerMsg,
     ) {
         if !session_exists {
-            spawn_new_session(session_name, os_input.clone(), zellij_ipc_pipe);
+            if let Err(err) = spawn_new_session(session_name, os_input.clone(), zellij_ipc_pipe) {
+                // Lost a post-claim race: another server may own the socket now — attach instead.
+                log::warn!(
+                    "Failed to spawn session {:?}: {}; attempting to attach to an existing owner",
+                    session_name,
+                    err
+                );
+            }
         }
         os_input.connect_to_server(&zellij_ipc_pipe);
         os_input.send_to_server(first_message);

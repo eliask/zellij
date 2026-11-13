@@ -236,14 +236,92 @@ pub fn get_sessions_sorted_by_mtime() -> anyhow::Result<Vec<String>> {
     }
 }
 
+/// Classification of a Windows `OpenProcess` result for a session marker PID.
+///
+/// A successful handle only means some process currently has that PID, not that it is the
+/// recorded server. Access denied and every other failure stay unknown. Only a clear
+/// no-such-PID error is death, and only that authorises the socket claim to remove a marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsPidLiveness {
+    /// `OpenProcess` returned a handle. Identity with the recorded server is not proven.
+    AliveUnverified,
+    /// Process is gone (`ERROR_INVALID_PARAMETER` after a null handle).
+    Dead,
+    /// Inspection failed without proving death.
+    Unknown,
+}
+
+/// `ERROR_ACCESS_DENIED` from Win32.
+pub const WINDOWS_ERROR_ACCESS_DENIED: u32 = 5;
+/// `ERROR_INVALID_PARAMETER` from Win32 — documented for `OpenProcess` when the PID does not exist.
+pub const WINDOWS_ERROR_INVALID_PARAMETER: u32 = 87;
+
+/// Pure classifier for the Windows marker check. `last_error` matters only when
+/// `handle_is_null` is true. Access denied is not death.
+pub fn classify_windows_open_process(handle_is_null: bool, last_error: u32) -> WindowsPidLiveness {
+    if !handle_is_null {
+        return WindowsPidLiveness::AliveUnverified;
+    }
+    match last_error {
+        WINDOWS_ERROR_INVALID_PARAMETER => WindowsPidLiveness::Dead,
+        WINDOWS_ERROR_ACCESS_DENIED => WindowsPidLiveness::Unknown,
+        _ => WindowsPidLiveness::Unknown,
+    }
+}
+
+/// Liveness of a Windows session marker, for reclaim. Missing or unreadable markers are
+/// [`WindowsPidLiveness::Unknown`] so a claim cannot treat them as dead.
+pub fn liveness_of_session_marker(path: &Path) -> WindowsPidLiveness {
+    #[cfg(windows)]
+    {
+        let pid_str = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(_) => return WindowsPidLiveness::Unknown,
+        };
+        return match pid_str.trim().parse() {
+            Ok(pid) => windows_open_process_liveness(pid),
+            Err(_) => WindowsPidLiveness::Unknown,
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        WindowsPidLiveness::Unknown
+    }
+}
+
+#[cfg(windows)]
+fn windows_open_process_liveness(pid: u32) -> WindowsPidLiveness {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let (handle_is_null, last_error) = unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            (true, GetLastError())
+        } else {
+            CloseHandle(handle);
+            (false, 0)
+        }
+    };
+    classify_windows_open_process(handle_is_null, last_error)
+}
+
 /// Probe a session socket to check if a server is alive.
 ///
 /// On Unix, connects and sends a `ConnStatus` message to verify the server responds.
 /// On Windows, reads the server PID from the marker file and checks process liveness.
+///
+/// Observation never unlinks the path. Stale-path reclamation belongs to the session socket
+/// claim held by the creator or binder.
 #[cfg(unix)]
 fn assert_socket(name: &str) -> bool {
+    observe_session_socket(&ZELLIJ_SOCK_DIR.join(name))
+}
+
+#[cfg(unix)]
+fn observe_session_socket(path: &Path) -> bool {
     use crate::consts::ipc_connect;
-    let path = &*ZELLIJ_SOCK_DIR.join(name);
     match ipc_connect(path) {
         Ok(stream) => {
             // a wedged server accepts connections but never replies; without a
@@ -261,51 +339,19 @@ fn assert_socket(name: &str) -> bool {
                 None | Some((_, _)) => false,
             }
         },
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-            drop(fs::remove_file(path));
-            false
-        },
+        // Refused and missing paths are not live, but listing must not delete them.
         Err(_) => false,
     }
 }
 
 /// On Windows, reads the server PID from the marker file and checks whether
-/// the process is still alive via `OpenProcess`. Cleans up stale marker files.
+/// the process is still alive via `OpenProcess`. Does not delete the marker.
 #[cfg(windows)]
 fn assert_socket(name: &str) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-
-    let path = &*ZELLIJ_SOCK_DIR.join(name);
-    let pid_str = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => {
-            drop(fs::remove_file(path));
-            return false;
-        },
-    };
-    let pid: u32 = match pid_str.trim().parse() {
-        Ok(p) => p,
-        Err(_) => {
-            // Marker file exists but has no valid PID (e.g. empty from old version).
-            // Treat as stale.
-            drop(fs::remove_file(path));
-            return false;
-        },
-    };
-    let alive = unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            false
-        } else {
-            CloseHandle(handle);
-            true
-        }
-    };
-    if !alive {
-        drop(fs::remove_file(path));
-    }
-    alive
+    matches!(
+        liveness_of_session_marker(&*ZELLIJ_SOCK_DIR.join(name)),
+        WindowsPidLiveness::AliveUnverified
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -969,6 +1015,58 @@ mod session_id_tests {
             id
         );
         assert_ne!(id, generate_session_id());
+    }
+}
+
+#[cfg(test)]
+mod windows_pid_liveness_tests {
+    use super::*;
+
+    #[test]
+    fn access_denied_and_other_failures_are_not_death() {
+        assert_eq!(
+            classify_windows_open_process(false, 0),
+            WindowsPidLiveness::AliveUnverified
+        );
+        assert_eq!(
+            classify_windows_open_process(true, WINDOWS_ERROR_INVALID_PARAMETER),
+            WindowsPidLiveness::Dead
+        );
+        assert_eq!(
+            classify_windows_open_process(true, WINDOWS_ERROR_ACCESS_DENIED),
+            WindowsPidLiveness::Unknown
+        );
+        assert_eq!(
+            classify_windows_open_process(true, 0),
+            WindowsPidLiveness::Unknown
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod socket_observation_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn a_refused_socket_is_not_unlinked_by_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale-session");
+        {
+            let _listener = UnixListener::bind(&path).unwrap();
+        }
+        assert!(
+            path.exists(),
+            "dropping the listener must leave the pathname"
+        );
+        assert!(
+            !observe_session_socket(&path),
+            "a refused socket is not a live session"
+        );
+        assert!(
+            path.exists(),
+            "ordinary probing must not reclaim a refused socket without a claim"
+        );
     }
 }
 

@@ -3,6 +3,7 @@ use crate::web_client::control_message::{SetConfigPayload, WebServerToWebClientC
 use crate::web_client::host_query_seed::build_host_query_seed_msgs;
 use crate::web_client::session_management::{
     build_initial_connection, create_first_message, create_ipc_pipe,
+    decide_session_create_or_attach, SessionEnsureAction,
 };
 use crate::web_client::types::{
     take_pending_welcome_session, ClientConnectionBus, ConnectionTable, PendingWelcomeSessions,
@@ -125,14 +126,32 @@ pub fn zellij_server_listener(
                         return;
                     }
 
-                    let should_create_new_session = !session_exists;
-                    let first_message = create_first_message(is_read_only, config_file_path.clone(), client_attributes.clone(), config_options.clone(), should_create_new_session, &session_name, initial_layout, switch_context, focus);
+                    // Register (or resolve) the socket path before taking the claim, so two
+                    // creators of the same name contend for one path rather than two ids.
                     let zellij_ipc_pipe = create_ipc_pipe(&session_name, session_exists);
+                    let should_create_new_session = if session_exists {
+                        false
+                    } else {
+                        match decide_session_create_or_attach(&session_name, &zellij_ipc_pipe) {
+                            Ok(SessionEnsureAction::Create) => true,
+                            Ok(SessionEnsureAction::Attach) => false,
+                            Err(error) => {
+                                log::error!(
+                                    "Could not claim session {:?} for creation: {}; refusing to replace it",
+                                    session_name,
+                                    error
+                                );
+                                client_connection_bus.close_connection();
+                                return;
+                            },
+                        }
+                    };
+                    let first_message = create_first_message(is_read_only, config_file_path.clone(), client_attributes.clone(), config_options.clone(), should_create_new_session, &session_name, initial_layout, switch_context, focus);
 
                     session_manager.spawn_session_if_needed(
                         &session_name,
                         os_input.clone(),
-                        session_exists,
+                        !should_create_new_session,
                         &zellij_ipc_pipe,
                         first_message,
                     );
