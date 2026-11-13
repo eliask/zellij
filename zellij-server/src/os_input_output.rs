@@ -38,6 +38,21 @@ use std::{
 
 pub use async_trait::async_trait;
 
+/// The endpoint was replaced before a stamped write reached it. The writer
+/// keeps the queued bytes until the matching `AdoptRun` settles the queue,
+/// instead of treating the mismatch as a fatal write error.
+/// Nothing produces this error until run ownership checks the descriptor.
+#[derive(Debug)]
+pub(crate) struct TerminalRunChangedBeforeWrite;
+
+impl std::fmt::Display for TerminalRunChangedBeforeWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "terminal run changed before the write")
+    }
+}
+
+impl std::error::Error for TerminalRunChangedBeforeWrite {}
+
 /// Check whether a candidate path refers to an executable file, considering
 /// PATHEXT extensions on Windows (e.g. `.exe`, `.cmd`).
 ///
@@ -388,6 +403,24 @@ pub trait ServerOsApi: Send + Sync {
     }
     /// Write bytes to the standard input of the virtual terminal referred to by `terminal_id`.
     fn write_to_tty_stdin(&self, terminal_id: u32, buf: &[u8]) -> Result<usize>;
+    /// Write `buf` for the run stamped on the queued write.
+    ///
+    /// `generation` is recorded so a later run-ownership change can refuse a
+    /// stale descriptor. Nothing on this branch compares it yet. The default
+    /// ignores it so test doubles keep compiling. A hard error reports how
+    /// many bytes of this call already reached the terminal.
+    fn write_to_tty_stdin_for_run_with_progress(
+        &self,
+        terminal_id: u32,
+        generation: Option<u64>,
+        buf: &[u8],
+    ) -> (usize, Result<()>) {
+        let _ = generation;
+        match self.write_to_tty_stdin(terminal_id, buf) {
+            Ok(written) => (written, Ok(())),
+            Err(error) => (0, Err(error)),
+        }
+    }
     /// Wait until all output written to the terminal has been transmitted.
     fn tcdrain(&self, terminal_id: u32) -> Result<()>;
     /// Terminate the process with process ID `pid`. (SIGHUP)
@@ -496,6 +529,15 @@ impl ServerOsApi for ServerOsInputOutput {
     }
     fn write_to_tty_stdin(&self, terminal_id: u32, buf: &[u8]) -> Result<usize> {
         self.pty_backend.write_to_tty_stdin(terminal_id, buf)
+    }
+    fn write_to_tty_stdin_for_run_with_progress(
+        &self,
+        terminal_id: u32,
+        _generation: Option<u64>,
+        buf: &[u8],
+    ) -> (usize, Result<()>) {
+        self.pty_backend
+            .write_to_tty_stdin_with_progress(terminal_id, buf)
     }
     fn tcdrain(&self, terminal_id: u32) -> Result<()> {
         self.pty_backend.tcdrain(terminal_id)

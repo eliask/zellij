@@ -17846,10 +17846,134 @@ pub fn cli_rename_active_pane_then_interactive_esc_restores() {
 fn install_pty_writer_capture(
     tab: &mut Tab,
 ) -> Receiver<(PtyWriteInstruction, zellij_utils::errors::ErrorContext)> {
+    install_budgeted_pty_writer(
+        tab,
+        std::sync::Arc::new(crate::pty_ingress::PtyIngressBudget::new()),
+    )
+}
+
+fn install_budgeted_pty_writer(
+    tab: &mut Tab,
+    budget: std::sync::Arc<crate::pty_ingress::PtyIngressBudget>,
+) -> Receiver<(PtyWriteInstruction, zellij_utils::errors::ErrorContext)> {
     let (tx, rx) = unbounded();
     tab.senders
         .replace_to_pty_writer(SenderWithContext::new(tx));
+    tab.senders.set_pty_write_budget(budget);
     rx
+}
+
+fn pty_write_bytes(instruction: &PtyWriteInstruction) -> Option<(u32, &[u8])> {
+    match instruction {
+        PtyWriteInstruction::Write(write) => Some((write.terminal_id(), write.bytes())),
+        _ => None,
+    }
+}
+
+#[test]
+fn rejected_bracketed_paste_does_not_submit_a_begin_marker_alone() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut tab = create_new_tab(size, true);
+    let pane_id = PaneId::Terminal(1);
+    tab.handle_pty_bytes(1, b"\x1b[?2004h".to_vec()).unwrap();
+    let budget = std::sync::Arc::new(crate::pty_ingress::PtyIngressBudget::new());
+    let rx = install_budgeted_pty_writer(&mut tab, std::sync::Arc::clone(&budget));
+    let body = b"hello".to_vec();
+    let begin = b"\x1b[200~";
+    let end = b"\x1b[201~";
+
+    tab.paste_to_pane_id(body.clone(), pane_id, None).unwrap();
+    let admitted: Vec<_> = drain_pty_writer(&rx)
+        .iter()
+        .filter_map(pty_write_bytes)
+        .map(|(terminal_id, bytes)| (terminal_id, bytes.to_vec()))
+        .collect();
+    assert_eq!(admitted.len(), 1, "a paste is one write, got {admitted:?}");
+    assert_eq!(admitted[0].0, 1);
+    let mut expected = begin.to_vec();
+    expected.extend_from_slice(&body);
+    expected.extend_from_slice(end);
+    assert_eq!(admitted[0].1, expected);
+    assert_eq!(
+        budget.terminal_reserved(1),
+        0,
+        "dropping the write releases it"
+    );
+
+    let begin_only = begin.len();
+    budget
+        .try_reserve(1, crate::pty_ingress::PER_TERMINAL_LIMIT - begin_only)
+        .unwrap();
+    let (completion, mut receiver) = completion_and_receiver();
+    let error = tab
+        .paste_to_pane_id(body, pane_id, Some(completion))
+        .expect_err("the combined paste does not fit");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("rejected"),
+        "the caller sees the admission failure: {error}"
+    );
+    let queued: Vec<_> = drain_pty_writer(&rx)
+        .iter()
+        .filter_map(pty_write_bytes)
+        .map(|(terminal_id, bytes)| (terminal_id, bytes.to_vec()))
+        .collect();
+    assert!(
+        queued.is_empty(),
+        "rejection must not leave a begin marker queued, got {queued:?}"
+    );
+    assert_eq!(
+        budget.terminal_reserved(1),
+        crate::pty_ingress::PER_TERMINAL_LIMIT - begin_only
+    );
+    let result = receiver
+        .try_recv()
+        .expect("the paste completion is published");
+    assert_eq!(result.exit_status, Some(1));
+    let message = result.error_message.expect("admission error is recorded");
+    assert!(message.contains("rejected"), "{message}");
+}
+
+#[test]
+fn synchronized_input_continues_after_a_pane_rejects() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut tab = create_new_tab(size, true);
+    new_tiled_pane_in_tab(&mut tab, 2);
+    tab.toggle_sync_panes_is_active();
+    assert_eq!(
+        tab.get_static_and_floating_pane_ids().first().copied(),
+        Some(PaneId::Terminal(1)),
+        "the rejected pane has to be first or this does not prove later panes still run"
+    );
+    let budget = std::sync::Arc::new(crate::pty_ingress::PtyIngressBudget::new());
+    budget
+        .try_reserve(1, crate::pty_ingress::PER_TERMINAL_LIMIT)
+        .unwrap();
+    let rx = install_budgeted_pty_writer(&mut tab, budget);
+    let error = tab
+        .write_to_terminals_on_current_tab(&None, b"x".to_vec(), false, 1)
+        .expect_err("a rejected recipient fails the fan-out");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("rejected"),
+        "the caller sees the admission failure: {error}"
+    );
+    let writes: Vec<_> = drain_pty_writer(&rx)
+        .iter()
+        .filter_map(pty_write_bytes)
+        .map(|(terminal_id, bytes)| (terminal_id, bytes.to_vec()))
+        .collect();
+    assert_eq!(
+        writes,
+        vec![(2, b"x".to_vec())],
+        "the healthy pane still receives the byte"
+    );
 }
 
 fn drain_pty_writer(
@@ -17878,9 +18002,9 @@ pub fn scroll_terminal_up_forwards_sgr_when_pane_tracks_mouse() {
     let writes = drain_pty_writer(&rx);
     assert!(!writes.is_empty(), "expected at least one pty write");
     match &writes[0] {
-        PtyWriteInstruction::Write(bytes, terminal_id, _) => {
-            assert_eq!(*terminal_id, 1);
-            let s = String::from_utf8_lossy(bytes);
+        PtyWriteInstruction::Write(write) => {
+            assert_eq!(write.terminal_id(), 1);
+            let s = String::from_utf8_lossy(write.bytes());
             assert!(
                 s.starts_with("\u{1b}[<64;"),
                 "expected SGR wheel-up (button 64) prefix, got {s:?}"
@@ -17906,9 +18030,9 @@ pub fn scroll_terminal_down_forwards_sgr_when_pane_tracks_mouse() {
     let writes = drain_pty_writer(&rx);
     assert!(!writes.is_empty(), "expected at least one pty write");
     match &writes[0] {
-        PtyWriteInstruction::Write(bytes, terminal_id, _) => {
-            assert_eq!(*terminal_id, 1);
-            let s = String::from_utf8_lossy(bytes);
+        PtyWriteInstruction::Write(write) => {
+            assert_eq!(write.terminal_id(), 1);
+            let s = String::from_utf8_lossy(write.bytes());
             assert!(
                 s.starts_with("\u{1b}[<65;"),
                 "expected SGR wheel-down (button 65) prefix, got {s:?}"
@@ -17933,9 +18057,9 @@ pub fn scroll_terminal_up_emits_arrow_up_in_alt_mode_without_mouse() {
     let writes = drain_pty_writer(&rx);
     assert!(!writes.is_empty(), "expected at least one pty write");
     match &writes[0] {
-        PtyWriteInstruction::Write(bytes, terminal_id, _) => {
-            assert_eq!(*terminal_id, 1);
-            assert_eq!(bytes.as_slice(), b"\x1b[A");
+        PtyWriteInstruction::Write(write) => {
+            assert_eq!(write.terminal_id(), 1);
+            assert_eq!(write.bytes(), b"\x1b[A");
         },
         other => panic!("expected PtyWriteInstruction::Write, got {other:?}"),
     }
@@ -17956,9 +18080,9 @@ pub fn scroll_terminal_down_emits_arrow_down_in_alt_mode_without_mouse() {
     let writes = drain_pty_writer(&rx);
     assert!(!writes.is_empty(), "expected at least one pty write");
     match &writes[0] {
-        PtyWriteInstruction::Write(bytes, terminal_id, _) => {
-            assert_eq!(*terminal_id, 1);
-            assert_eq!(bytes.as_slice(), b"\x1b[B");
+        PtyWriteInstruction::Write(write) => {
+            assert_eq!(write.terminal_id(), 1);
+            assert_eq!(write.bytes(), b"\x1b[B");
         },
         other => panic!("expected PtyWriteInstruction::Write, got {other:?}"),
     }
@@ -18298,7 +18422,12 @@ fn create_tab_with_receivers_without_layout(
         to_pty: Some(SenderWithContext::new(to_pty)),
         to_plugin: Some(SenderWithContext::new(to_plugin)),
         to_server: Some(SenderWithContext::new(to_server)),
-        to_pty_writer: Some(SenderWithContext::new(to_pty_writer)),
+        to_pty_writer: Some(crate::thread_bus::PtyWriteSender::new(
+            SenderWithContext::new(to_pty_writer),
+            Some(std::sync::Arc::new(
+                crate::pty_ingress::PtyIngressBudget::new(),
+            )),
+        )),
         to_background_jobs: Some(SenderWithContext::new(to_background_jobs)),
         should_silently_fail,
     };
@@ -21202,8 +21331,8 @@ pub fn a_click_reaches_a_program_that_asked_for_the_mouse() {
     assert!(
         writes.iter().any(|write| matches!(
             write,
-            PtyWriteInstruction::Write(bytes, _, _)
-                if String::from_utf8_lossy(bytes).starts_with("\u{1b}[<0;")
+            PtyWriteInstruction::Write(write)
+                if String::from_utf8_lossy(write.bytes()).starts_with("\u{1b}[<0;")
         )),
         "expected the click to be forwarded, got {writes:?}"
     );
@@ -21227,8 +21356,8 @@ pub fn a_shift_click_bypasses_a_program_that_asked_for_the_mouse() {
     assert!(
         !writes.iter().any(|write| matches!(
             write,
-            PtyWriteInstruction::Write(bytes, _, _)
-                if String::from_utf8_lossy(bytes).starts_with("\u{1b}[<")
+            PtyWriteInstruction::Write(write)
+                if String::from_utf8_lossy(write.bytes()).starts_with("\u{1b}[<")
         )),
         "shift must hold the click back from the program so the terminal can use it, got {writes:?}"
     );
@@ -21258,8 +21387,8 @@ pub fn a_shift_right_click_opens_the_context_menu_instead_of_going_to_the_progra
     assert!(
         !writes.iter().any(|write| matches!(
             write,
-            PtyWriteInstruction::Write(bytes, _, _)
-                if String::from_utf8_lossy(bytes).starts_with("\u{1b}[<")
+            PtyWriteInstruction::Write(write)
+                if String::from_utf8_lossy(write.bytes()).starts_with("\u{1b}[<")
         )),
         "shift must hold the right click back from the program, got {writes:?}"
     );
@@ -21314,8 +21443,8 @@ fn written_strings(
     drain_pty_writer(rx)
         .into_iter()
         .filter_map(|instruction| match instruction {
-            PtyWriteInstruction::Write(bytes, _, _) => {
-                Some(String::from_utf8_lossy(&bytes).into_owned())
+            PtyWriteInstruction::Write(write) => {
+                Some(String::from_utf8_lossy(write.bytes()).into_owned())
             },
             _ => None,
         })

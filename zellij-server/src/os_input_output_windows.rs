@@ -632,6 +632,46 @@ impl WindowsPtyBackend {
         }
     }
 
+    pub fn write_to_tty_stdin_with_progress(
+        &self,
+        terminal_id: u32,
+        buf: &[u8],
+    ) -> (usize, Result<()>) {
+        let err_context = || format!("failed to write to stdin of terminal {}", terminal_id);
+
+        let terminals = match self.terminals.lock().to_anyhow().with_context(err_context) {
+            Ok(terminals) => terminals,
+            Err(error) => return (0, Err(error)),
+        };
+        match terminals.get(&terminal_id) {
+            Some(Some(term)) => {
+                let mut written: u32 = 0;
+                let ok = unsafe {
+                    WriteFile(
+                        term.input_write_handle,
+                        buf.as_ptr(),
+                        buf.len() as u32,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    (
+                        written as usize,
+                        Err(io::Error::last_os_error()).with_context(err_context),
+                    )
+                } else {
+                    (written as usize, Ok(()))
+                }
+            },
+            _ => (
+                0,
+                Err(anyhow!("no ConPTY terminal found for id {}", terminal_id))
+                    .with_context(err_context),
+            ),
+        }
+    }
+
     pub fn tcdrain(&self, terminal_id: u32) -> Result<()> {
         let err_context = || format!("failed to drain terminal {}", terminal_id);
 

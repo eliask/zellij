@@ -333,6 +333,34 @@ fn try_write_to_fd(fd: RawFd, buf: &[u8]) -> Result<usize> {
     Ok(written)
 }
 
+/// Same drain as [`try_write_to_fd`], but a hard error keeps the prefix that
+/// already reached the fd. One call issues at most
+/// [`MAX_WRITE_SYSCALLS_PER_CALL`] write(2)s so a consumer that takes a few
+/// bytes per call cannot turn one turn into hundreds of syscalls.
+fn try_write_reporting_partial(
+    fd: RawFd,
+    buf: &[u8],
+) -> std::result::Result<usize, (usize, nix::errno::Errno)> {
+    let mut written = 0;
+    let mut syscalls = 0;
+    while written < buf.len() && syscalls < MAX_WRITE_SYSCALLS_PER_CALL {
+        syscalls += 1;
+        match unistd::write(unsafe { BorrowedFd::borrow_raw(fd) }, &buf[written..]) {
+            Ok(0) => break,
+            Ok(n) => written += n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EAGAIN) => break,
+            Err(e) => return Err((written, e)),
+        }
+    }
+    Ok(written)
+}
+
+/// Upper bound on write(2) calls made by one progress write. Together with
+/// the pty writer's per-turn call limit this bounds the syscalls a terminal
+/// can spend in one turn.
+const MAX_WRITE_SYSCALLS_PER_CALL: usize = 4;
+
 impl UnixPtyBackend {
     pub fn new() -> Result<Self, io::Error> {
         let current_termios = termios::tcgetattr(io::stdin()).ok();
@@ -430,6 +458,38 @@ impl UnixPtyBackend {
         };
 
         try_write_to_fd(fd, buf).with_context(err_context)
+    }
+
+    pub fn write_to_tty_stdin_with_progress(
+        &self,
+        terminal_id: u32,
+        buf: &[u8],
+    ) -> (usize, Result<()>) {
+        let err_context = || format!("failed to write to stdin of TTY ID {}", terminal_id);
+
+        let fd = match self
+            .terminal_id_to_raw_fd
+            .lock()
+            .to_anyhow()
+            .with_context(err_context)
+        {
+            Ok(terminals) => match terminals.get(&terminal_id) {
+                Some(Some(fd)) => *fd,
+                _ => {
+                    return (
+                        0,
+                        Err(anyhow!("could not find raw file descriptor"))
+                            .with_context(err_context),
+                    );
+                },
+            },
+            Err(error) => return (0, Err(error)),
+        };
+
+        match try_write_reporting_partial(fd, buf) {
+            Ok(written) => (written, Ok(())),
+            Err((written, errno)) => (written, Err::<(), _>(errno).with_context(err_context)),
+        }
     }
 
     pub fn tcdrain(&self, terminal_id: u32) -> Result<()> {

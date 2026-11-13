@@ -217,7 +217,7 @@ fn full_write_completes_immediately() {
     run_pty_writer(
         bus,
         sender,
-        vec![PtyWriteInstruction::Write(b"hello world".to_vec(), 1, None)],
+        vec![PtyWriteInstruction::write(b"hello world".to_vec(), 1, None)],
     );
 
     let written = mock_clone.get_written_bytes(1);
@@ -235,7 +235,7 @@ fn partial_write_is_buffered_and_drained() {
     run_pty_writer(
         bus,
         sender,
-        vec![PtyWriteInstruction::Write(b"abcdefghij".to_vec(), 1, None)],
+        vec![PtyWriteInstruction::write(b"abcdefghij".to_vec(), 1, None)],
     );
 
     let written = mock_clone.get_written_bytes(1);
@@ -259,8 +259,8 @@ fn eagain_on_one_terminal_does_not_block_another() {
         bus,
         sender,
         vec![
-            PtyWriteInstruction::Write(b"stuck data".to_vec(), 1, None),
-            PtyWriteInstruction::Write(b"good data".to_vec(), 2, None),
+            PtyWriteInstruction::write(b"stuck data".to_vec(), 1, None),
+            PtyWriteInstruction::write(b"good data".to_vec(), 2, None),
         ],
     );
 
@@ -284,9 +284,9 @@ fn writes_to_same_terminal_preserve_order() {
         bus,
         sender,
         vec![
-            PtyWriteInstruction::Write(b"AAAA".to_vec(), 1, None),
-            PtyWriteInstruction::Write(b"BBBB".to_vec(), 1, None),
-            PtyWriteInstruction::Write(b"CCCC".to_vec(), 1, None),
+            PtyWriteInstruction::write(b"AAAA".to_vec(), 1, None),
+            PtyWriteInstruction::write(b"BBBB".to_vec(), 1, None),
+            PtyWriteInstruction::write(b"CCCC".to_vec(), 1, None),
         ],
     );
 
@@ -310,11 +310,11 @@ fn memory_cap_drops_buffer_when_exceeded() {
     let chunk_size = 1024 * 1024; // 1 MB
     let mut instructions = Vec::new();
     for _ in 0..(MAX_PENDING_BYTES / chunk_size + 1) {
-        instructions.push(PtyWriteInstruction::Write(vec![0x42; chunk_size], 1, None));
+        instructions.push(PtyWriteInstruction::write(vec![0x42; chunk_size], 1, None));
     }
     // After the cap is exceeded, send a write to terminal 2 to verify
     // the writer thread is still functional
-    instructions.push(PtyWriteInstruction::Write(b"still alive".to_vec(), 2, None));
+    instructions.push(PtyWriteInstruction::write(b"still alive".to_vec(), 2, None));
     mock_clone.set_behavior(2, WriteBehavior::AcceptAll);
 
     run_pty_writer(bus, sender, instructions);
@@ -338,9 +338,9 @@ fn write_error_clears_terminal_queue() {
         bus,
         sender,
         vec![
-            PtyWriteInstruction::Write(b"will fail".to_vec(), 1, None),
-            PtyWriteInstruction::Write(b"also queued".to_vec(), 1, None),
-            PtyWriteInstruction::Write(b"should work".to_vec(), 2, None),
+            PtyWriteInstruction::write(b"will fail".to_vec(), 1, None),
+            PtyWriteInstruction::write(b"also queued".to_vec(), 1, None),
+            PtyWriteInstruction::write(b"should work".to_vec(), 2, None),
         ],
     );
 

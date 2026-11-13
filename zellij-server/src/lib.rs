@@ -25,6 +25,7 @@ mod pane_groups;
 pub mod pane_mirror;
 mod plugins;
 mod pty;
+mod pty_ingress;
 mod pty_writer;
 mod route;
 mod screen;
@@ -1181,7 +1182,7 @@ impl SessionMetaData {
                     let frame = zellij_utils::nested_session::encode_frame(
                         &zellij_utils::nested_session::NestedSessionMessage::FocusLost,
                     );
-                    let _ = self.senders.send_to_pty_writer(PtyWriteInstruction::Write(
+                    let _ = self.senders.send_to_pty_writer(PtyWriteInstruction::write(
                         frame,
                         terminal_id,
                         None,
@@ -5380,7 +5381,7 @@ pub fn start_server_impl(
                                             &zellij_utils::nested_session::NestedSessionMessage::FocusLost,
                                         );
                                         let _ = session_data.senders.send_to_pty_writer(
-                                            PtyWriteInstruction::Write(frame, terminal_id, None),
+                                            PtyWriteInstruction::write(frame, terminal_id, None),
                                         );
                                     }
                                 }
@@ -5400,7 +5401,7 @@ pub fn start_server_impl(
                                         },
                                     );
                                     let _ = session_data.senders.send_to_pty_writer(
-                                        PtyWriteInstruction::Write(frame, terminal_id, None),
+                                        PtyWriteInstruction::write(frame, terminal_id, None),
                                     );
                                 }
                             }
@@ -5537,22 +5538,27 @@ fn init_session(
     let default_keybinds: SharedKeybinds = Arc::new(config.keybinds.to_keybinds_vec());
     let live_view_captures = crate::pane_mirror::SharedLiveViewCaptures::default();
     let applied_env = AppliedEnv::at_startup(config.env.inner());
+    let pty_ingress = Arc::new(pty_ingress::PtyIngressBudget::new());
 
     let pty_thread = thread::Builder::new()
         .name("pty".to_string())
         .spawn({
             let layout = layout.clone();
+            let mut pty_bus = Bus::new(
+                vec![pty_receiver],
+                Some(&to_screen_bounded),
+                None,
+                Some(&to_plugin),
+                Some(&to_server),
+                Some(&to_pty_writer),
+                Some(&to_background_jobs),
+                Some(os_input.clone()),
+            );
+            pty_bus
+                .senders
+                .set_pty_write_budget(Arc::clone(&pty_ingress));
             let pty = Pty::new(
-                Bus::new(
-                    vec![pty_receiver],
-                    Some(&to_screen_bounded),
-                    None,
-                    Some(&to_plugin),
-                    Some(&to_server),
-                    Some(&to_pty_writer),
-                    Some(&to_background_jobs),
-                    Some(os_input.clone()),
-                ),
+                pty_bus,
                 cli_assets.is_debug,
                 config_options.scrollback_editor.clone(),
                 config_options.post_command_discovery_hook.clone(),
@@ -5567,7 +5573,7 @@ fn init_session(
     let screen_thread = thread::Builder::new()
         .name("screen".to_string())
         .spawn({
-            let screen_bus = Bus::new(
+            let mut screen_bus = Bus::new(
                 vec![screen_receiver, bounded_screen_receiver],
                 Some(&to_screen), // there are certain occasions (eg. caching) where the screen
                 // needs to send messages to itself
@@ -5579,6 +5585,9 @@ fn init_session(
                 Some(os_input.clone()),
             )
             .with_priority(screen_priority_receiver, &to_screen_priority);
+            screen_bus
+                .senders
+                .set_pty_write_budget(Arc::clone(&pty_ingress));
             let max_panes = cli_assets.max_panes;
 
             let client_attributes_clone = client_attributes.clone();
@@ -5613,7 +5622,7 @@ fn init_session(
     let plugin_thread = thread::Builder::new()
         .name("wasm".to_string())
         .spawn({
-            let plugin_bus = Bus::new(
+            let mut plugin_bus = Bus::new(
                 vec![plugin_receiver],
                 Some(&to_screen_bounded),
                 Some(&to_pty),
@@ -5623,6 +5632,9 @@ fn init_session(
                 Some(&to_background_jobs),
                 None,
             );
+            plugin_bus
+                .senders
+                .set_pty_write_budget(Arc::clone(&pty_ingress));
             let engine = get_engine();
 
             let layout = layout.clone();
@@ -5660,7 +5672,7 @@ fn init_session(
     let pty_writer_thread = thread::Builder::new()
         .name("pty_writer".to_string())
         .spawn({
-            let pty_writer_bus = Bus::new(
+            let mut pty_writer_bus = Bus::new(
                 vec![pty_writer_receiver],
                 Some(&to_screen),
                 Some(&to_pty),
@@ -5670,6 +5682,9 @@ fn init_session(
                 Some(&to_background_jobs),
                 Some(os_input.clone()),
             );
+            pty_writer_bus
+                .senders
+                .set_pty_write_budget(Arc::clone(&pty_ingress));
             || pty_writer_main(pty_writer_bus).fatal()
         })
         .unwrap();
@@ -5679,7 +5694,7 @@ fn init_session(
         .name("background_jobs".to_string())
         .spawn({
             let live_sessions = live_sessions.clone();
-            let background_jobs_bus = Bus::new(
+            let mut background_jobs_bus = Bus::new(
                 vec![background_jobs_receiver],
                 Some(&to_screen),
                 Some(&to_pty),
@@ -5689,6 +5704,9 @@ fn init_session(
                 None,
                 Some(os_input.clone()),
             );
+            background_jobs_bus
+                .senders
+                .set_pty_write_budget(Arc::clone(&pty_ingress));
             let web_server_base_url = web_server_base_url(
                 web_server_ip,
                 web_server_port,
@@ -5756,7 +5774,10 @@ fn init_session(
             to_screen_priority: Some(to_screen_priority),
             to_pty: Some(to_pty),
             to_plugin: Some(to_plugin),
-            to_pty_writer: Some(to_pty_writer),
+            to_pty_writer: Some(crate::thread_bus::PtyWriteSender::new(
+                to_pty_writer,
+                Some(pty_ingress),
+            )),
             to_background_jobs: Some(to_background_jobs),
             to_server: Some(to_server),
             should_silently_fail: false,

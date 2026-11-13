@@ -826,7 +826,10 @@ impl MockScreen {
                 to_screen: Some(to_screen.clone()),
                 to_pty: Some(to_pty.clone()),
                 to_plugin: Some(to_plugin.clone()),
-                to_pty_writer: Some(to_pty_writer.clone()),
+                to_pty_writer: Some(crate::thread_bus::PtyWriteSender::new(
+                    to_pty_writer.clone(),
+                    None,
+                )),
                 to_background_jobs: Some(to_background_jobs.clone()),
                 to_server: Some(to_server.clone()),
                 should_silently_fail: true,
@@ -953,14 +956,10 @@ macro_rules! log_actions_in_thread {
                     let (event, _err_ctx) = $receiver
                         .recv()
                         .expect("failed to receive event on channel");
-                    match event {
-                        $exit_event => {
-                            log.lock().unwrap().push(event.clone());
-                            break;
-                        },
-                        _ => {
-                            log.lock().unwrap().push(event.clone());
-                        },
+                    let is_exit = matches!(&event, $exit_event);
+                    log.lock().unwrap().push(event);
+                    if is_exit {
+                        break;
                     }
                 }
             })
@@ -2759,8 +2758,7 @@ pub fn send_cli_send_keys_action_to_screen() {
     let received_write_instructions: Vec<_> = received_pty_instructions
         .lock()
         .unwrap()
-        .clone()
-        .into_iter()
+        .drain(..)
         .filter(|i| matches!(i, PtyWriteInstruction::Write(..)))
         .collect();
     // here we assert only the write instructions to make sure they arrived properly and in
@@ -2795,8 +2793,7 @@ pub fn send_cli_ctrl_c_reaches_pty_writer() {
     let received_write_instructions: Vec<_> = received_pty_instructions
         .lock()
         .unwrap()
-        .clone()
-        .into_iter()
+        .drain(..)
         .filter(|i| matches!(i, PtyWriteInstruction::Write(..)))
         .collect();
     assert_snapshot!(format!("{:#?}", received_write_instructions));
@@ -2829,8 +2826,7 @@ pub fn send_cli_ctrl_w_reaches_pty_writer() {
     let received_write_instructions: Vec<_> = received_pty_instructions
         .lock()
         .unwrap()
-        .clone()
-        .into_iter()
+        .drain(..)
         .filter(|i| matches!(i, PtyWriteInstruction::Write(..)))
         .collect();
     assert_snapshot!(format!("{:#?}", received_write_instructions));
@@ -3658,8 +3654,7 @@ pub fn send_cli_toggle_active_tab_sync_action() {
     let received_write_instructions: Vec<_> = received_pty_instructions
         .lock()
         .unwrap()
-        .clone()
-        .into_iter()
+        .drain(..)
         .filter(|i| matches!(i, PtyWriteInstruction::Write(..)))
         .collect();
     // here we should have 2 Write instructions, one for each pane
@@ -9242,8 +9237,8 @@ impl ForwardCapture {
     fn drain_pty_writes(&self) -> Vec<(Vec<u8>, u32)> {
         let mut out = Vec::new();
         while let Ok((instr, _ctx)) = self.pty_writer_rx.try_recv() {
-            if let PtyWriteInstruction::Write(bytes, terminal_id, _) = instr {
-                out.push((bytes, terminal_id));
+            if let PtyWriteInstruction::Write(write) = instr {
+                out.push((write.bytes().to_vec(), write.terminal_id()));
             }
         }
         out
@@ -9270,7 +9265,10 @@ fn create_new_screen_with_forward_capture(size: Size) -> (Screen, ForwardCapture
 
     let mut bus: Bus<ScreenInstruction> = Bus::empty();
     bus.senders.to_server = Some(SenderWithContext::new(server_tx));
-    bus.senders.to_pty_writer = Some(SenderWithContext::new(pty_writer_tx));
+    bus.senders.to_pty_writer = Some(crate::thread_bus::PtyWriteSender::new(
+        SenderWithContext::new(pty_writer_tx),
+        None,
+    ));
     let fake_os_input = FakeInputOutput::default();
     bus.os_input = Some(Box::new(fake_os_input));
 
@@ -10138,8 +10136,8 @@ impl ThemeCapture {
     fn drain_pty_writes(&self) -> Vec<(Vec<u8>, u32)> {
         let mut out = Vec::new();
         while let Ok((instr, _ctx)) = self.pty_writer_rx.try_recv() {
-            if let PtyWriteInstruction::Write(bytes, terminal_id, _) = instr {
-                out.push((bytes, terminal_id));
+            if let PtyWriteInstruction::Write(write) = instr {
+                out.push((write.bytes().to_vec(), write.terminal_id()));
             }
         }
         out
@@ -10280,7 +10278,10 @@ fn create_new_screen_with_theme_capture(size: Size) -> (Screen, ThemeCapture) {
 
     let mut bus: Bus<ScreenInstruction> = Bus::empty();
     bus.senders.to_plugin = Some(SenderWithContext::new(plugin_tx));
-    bus.senders.to_pty_writer = Some(SenderWithContext::new(pty_writer_tx));
+    bus.senders.to_pty_writer = Some(crate::thread_bus::PtyWriteSender::new(
+        SenderWithContext::new(pty_writer_tx),
+        None,
+    ));
     let fake_os_input = FakeInputOutput::default();
     bus.os_input = Some(Box::new(fake_os_input));
 
@@ -11668,7 +11669,11 @@ pub fn nested_guest_announce_gets_announce_ack_with_ancestry() {
         .unwrap()
         .iter()
         .find_map(|instruction| match instruction {
-            PtyWriteInstruction::Write(bytes, 0, None) => decode_nested_frame(bytes),
+            PtyWriteInstruction::Write(write)
+                if write.terminal_id() == 0 && write.completion().is_none() =>
+            {
+                decode_nested_frame(write.bytes())
+            },
             _ => None,
         })
         .expect("an announce_ack frame written to the guest pane");
@@ -11723,7 +11728,11 @@ pub fn nested_guest_announce_in_never_mode_still_completes_handshake() {
         .unwrap()
         .iter()
         .find_map(|instruction| match instruction {
-            PtyWriteInstruction::Write(bytes, 0, None) => decode_nested_frame(bytes),
+            PtyWriteInstruction::Write(write)
+                if write.terminal_id() == 0 && write.completion().is_none() =>
+            {
+                decode_nested_frame(write.bytes())
+            },
             _ => None,
         })
         .expect("an announce_ack frame written to the guest pane even in never mode");
@@ -11781,10 +11790,14 @@ pub fn nested_guest_bye_stops_liveness_pings() {
         .unwrap()
         .iter()
         .filter(|instruction| match instruction {
-            PtyWriteInstruction::Write(bytes, 0, None) => matches!(
-                decode_nested_frame(bytes),
-                Some(zellij_utils::nested_session::NestedSessionMessage::Ping)
-            ),
+            PtyWriteInstruction::Write(write)
+                if write.terminal_id() == 0 && write.completion().is_none() =>
+            {
+                matches!(
+                    decode_nested_frame(write.bytes()),
+                    Some(zellij_utils::nested_session::NestedSessionMessage::Ping)
+                )
+            },
             _ => false,
         })
         .count();
@@ -14747,7 +14760,10 @@ mod nested_hint_reporting {
                 create_new_screen_with_capture(size, true, true, true, true);
             let (to_pty_writer, pty_writer_receiver): ChannelWithContext<PtyWriteInstruction> =
                 channels::unbounded();
-            screen.bus.senders.to_pty_writer = Some(SenderWithContext::new(to_pty_writer));
+            screen.bus.senders.to_pty_writer = Some(crate::thread_bus::PtyWriteSender::new(
+                SenderWithContext::new(to_pty_writer),
+                None,
+            ));
             let (to_plugin, plugin_receiver): ChannelWithContext<PluginInstruction> =
                 channels::unbounded();
             screen.bus.senders.to_plugin = Some(SenderWithContext::new(to_plugin));
@@ -14806,7 +14822,11 @@ mod nested_hint_reporting {
             self.pty_writer_receiver
                 .try_iter()
                 .filter_map(|(instruction, _)| match instruction {
-                    PtyWriteInstruction::Write(bytes, 1, None) => decode_nested_frame(&bytes),
+                    PtyWriteInstruction::Write(write)
+                        if write.terminal_id() == 1 && write.completion().is_none() =>
+                    {
+                        decode_nested_frame(write.bytes())
+                    },
                     _ => None,
                 })
                 .collect()
@@ -17067,7 +17087,9 @@ impl MockScreenWithPrompt {
         self.pty_writer_receiver
             .try_iter()
             .filter_map(|(instruction, _)| match instruction {
-                PtyWriteInstruction::Write(bytes, terminal_id, _) => Some((bytes, terminal_id)),
+                PtyWriteInstruction::Write(write) => {
+                    Some((write.bytes().to_vec(), write.terminal_id()))
+                },
                 _ => None,
             })
             .collect()

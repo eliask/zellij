@@ -4210,7 +4210,7 @@ impl Screen {
             let _ = self
                 .bus
                 .senders
-                .send_to_pty_writer(PtyWriteInstruction::Write(reply_bytes, terminal_id, None));
+                .send_to_pty_writer(PtyWriteInstruction::write(reply_bytes, terminal_id, None));
             log::debug!(
                 "ResumePaneAfterForward: pane {:?} not in any tab, fell back to direct PTY write",
                 pane_id
@@ -4437,7 +4437,7 @@ impl Screen {
         let _ = self
             .bus
             .senders
-            .send_to_pty_writer(PtyWriteInstruction::Write(
+            .send_to_pty_writer(PtyWriteInstruction::write(
                 nested_session::encode_frame(&NestedSessionMessage::RequestGuestKeybinds {
                     request_id,
                 }),
@@ -4746,7 +4746,7 @@ impl Screen {
         let _ = self
             .bus
             .senders
-            .send_to_pty_writer(PtyWriteInstruction::Write(
+            .send_to_pty_writer(PtyWriteInstruction::write(
                 nested_session::encode_frame(&announce_ack),
                 terminal_id,
                 None,
@@ -4821,7 +4821,7 @@ impl Screen {
             let _ = self
                 .bus
                 .senders
-                .send_to_pty_writer(PtyWriteInstruction::Write(
+                .send_to_pty_writer(PtyWriteInstruction::write(
                     nested_session::encode_frame(&NestedSessionMessage::FocusGained {
                         from_direction: None,
                     }),
@@ -5440,7 +5440,7 @@ impl Screen {
             let _ = self
                 .bus
                 .senders
-                .send_to_pty_writer(PtyWriteInstruction::Write(frame.clone(), terminal_id, None));
+                .send_to_pty_writer(PtyWriteInstruction::write(frame.clone(), terminal_id, None));
         }
     }
 
@@ -5511,7 +5511,7 @@ impl Screen {
             let _ = self
                 .bus
                 .senders
-                .send_to_pty_writer(PtyWriteInstruction::Write(frame.clone(), terminal_id, None));
+                .send_to_pty_writer(PtyWriteInstruction::write(frame.clone(), terminal_id, None));
         }
     }
 
@@ -5605,7 +5605,7 @@ impl Screen {
             let _ = self
                 .bus
                 .senders
-                .send_to_pty_writer(PtyWriteInstruction::Write(
+                .send_to_pty_writer(PtyWriteInstruction::write(
                     nested_session::encode_frame(&message),
                     terminal_id,
                     None,
@@ -5744,7 +5744,7 @@ impl Screen {
                     let _ = self
                         .bus
                         .senders
-                        .send_to_pty_writer(PtyWriteInstruction::Write(
+                        .send_to_pty_writer(PtyWriteInstruction::write(
                             nested_session::encode_frame(&NestedSessionMessage::Ping),
                             terminal_id,
                             None,
@@ -9719,7 +9719,7 @@ impl Screen {
             let _ = self
                 .bus
                 .senders
-                .send_to_pty_writer(PtyWriteInstruction::Write(bytes, terminal_id, None));
+                .send_to_pty_writer(PtyWriteInstruction::write(bytes, terminal_id, None));
         }
 
         self.render(None)?;
@@ -11463,8 +11463,8 @@ pub(crate) fn screen_thread_main(
                 raw_bytes,
                 is_kitty_keyboard_protocol,
                 client_id,
-                _completion_tx, // the action ends here, dropping this will release anything
-                                // waiting for it
+                mut completion_tx, // the action ends here, dropping this will release anything
+                                   // waiting for it
             ) => {
                 screen.record_client_input(client_id);
                 if let Some(plugin_id) = keybind_intercepts.get(&client_id) {
@@ -11560,8 +11560,15 @@ pub(crate) fn screen_thread_main(
                                                 client_id,
                                             ),
                                         };
-                                        if let Ok(true) = write_result {
-                                            state_changed = true;
+                                        match write_result {
+                                            Ok(true) => state_changed = true,
+                                            Ok(false) => {},
+                                            Err(error) => {
+                                                mark_action_as_failed(
+                                                    &mut completion_tx,
+                                                    &format!("failed to write input: {error:#}"),
+                                                );
+                                            },
                                         }
                                     },
                                 }
@@ -14855,30 +14862,52 @@ pub(crate) fn screen_thread_main(
                 }
                 screen.render(None)?;
             },
-            ScreenInstruction::WriteToPaneId(bytes, pane_id, _completion) => {
+            ScreenInstruction::WriteToPaneId(bytes, pane_id, mut completion) => {
+                let mut found = false;
+                let mut write_error = None;
                 let all_tabs = screen.get_tabs_mut();
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
+                        found = true;
                         if tab.is_pane_requesting_permissions(pane_id) {
                             break;
                         }
-                        tab.write_to_pane_id(&None, bytes, false, pane_id, None, None)
-                            .non_fatal();
+                        if let Err(error) =
+                            tab.write_to_pane_id(&None, bytes, false, pane_id, None, None)
+                        {
+                            write_error = Some(format!("{error:#}"));
+                        }
                         break;
                     }
                 }
+                if let Some(message) = write_error {
+                    mark_action_as_failed(&mut completion, &message);
+                } else if !found {
+                    mark_action_as_failed(
+                        &mut completion,
+                        &format!("failed to find pane with id {pane_id:?}"),
+                    );
+                }
                 screen.render(None)?;
             },
-            ScreenInstruction::Paste(bytes, pane_id, client_id, _completion) => {
+            ScreenInstruction::Paste(bytes, pane_id, client_id, mut completion) => {
                 match pane_id {
                     Some(pane_id) => {
+                        let mut found = false;
                         let all_tabs = screen.get_tabs_mut();
                         for tab in all_tabs.values_mut() {
                             if tab.has_pane_with_pid(&pane_id) {
-                                tab.paste_to_pane_id(bytes, pane_id, _completion)
+                                found = true;
+                                tab.paste_to_pane_id(bytes, pane_id, completion.take())
                                     .non_fatal();
                                 break;
                             }
+                        }
+                        if !found {
+                            mark_action_as_failed(
+                                &mut completion,
+                                &format!("failed to find pane with id {pane_id:?}"),
+                            );
                         }
                     },
                     None => {
@@ -14887,7 +14916,7 @@ pub(crate) fn screen_thread_main(
                             screen,
                             client_id,
                             |tab: &mut Tab, _client_id: ClientId| {
-                                tab.paste_to_active_terminal(bytes, client_id, _completion)
+                                tab.paste_to_active_terminal(bytes, client_id, completion)
                                     .non_fatal();
                             }
                         );
