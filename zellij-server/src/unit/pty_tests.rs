@@ -495,39 +495,67 @@ fn osc7_then_poll_skips_terminal() {
 }
 
 fn session_with_terminal_pane(terminal_id: u32) -> SessionLayoutMetadata {
+    session_with_panes(vec![(terminal_id, None)], vec![])
+}
+
+fn session_with_terminal_pane_run(terminal_id: u32, run: Option<Run>) -> SessionLayoutMetadata {
+    session_with_panes(vec![(terminal_id, run)], vec![])
+}
+
+fn session_with_floating_pane_run(terminal_id: u32, run: Option<Run>) -> SessionLayoutMetadata {
+    session_with_panes(vec![], vec![(terminal_id, run)])
+}
+
+fn session_with_panes(
+    tiled: Vec<(u32, Option<Run>)>,
+    floating: Vec<(u32, Option<Run>)>,
+) -> SessionLayoutMetadata {
+    let pane = |terminal_id, run| {
+        crate::session_layout_metadata::PaneLayoutMetadata::new(
+            PaneId::Terminal(terminal_id),
+            zellij_utils::pane_size::PaneGeom::default(),
+            false,
+            run,
+            None,
+            false,
+            None,
+            vec![],
+            None,
+            None,
+            Default::default(),
+        )
+    };
     let mut meta = SessionLayoutMetadata::default();
-    let pane = crate::session_layout_metadata::PaneLayoutMetadata::new(
-        PaneId::Terminal(terminal_id),
-        zellij_utils::pane_size::PaneGeom::default(),
+    meta.add_tab(
+        "tab1".to_string(),
+        true,
         false,
-        None,
-        None,
-        false,
-        None,
-        vec![],
-        None,
-        None,
-        Default::default(),
+        tiled.into_iter().map(|(id, run)| pane(id, run)).collect(),
+        floating
+            .into_iter()
+            .map(|(id, run)| pane(id, run))
+            .collect(),
     );
-    meta.add_tab("tab1".to_string(), true, false, vec![pane], vec![]);
     meta
 }
 
 fn serialized_run_and_cwd(pty: &mut Pty, terminal_id: u32) -> (Option<Run>, Option<PathBuf>) {
-    let mut meta = session_with_terminal_pane(terminal_id);
+    serialized_metadata(pty, session_with_terminal_pane(terminal_id))
+}
+
+fn serialized_metadata(
+    pty: &mut Pty,
+    mut meta: SessionLayoutMetadata,
+) -> (Option<Run>, Option<PathBuf>) {
     pty.populate_session_layout_metadata(&mut meta);
     let manifest: session_serialization::GlobalLayoutManifest = meta.into();
     let global_cwd = manifest.global_cwd;
-    let pane = manifest
-        .tabs
-        .into_iter()
-        .next()
-        .unwrap()
-        .1
-        .tiled_panes
-        .into_iter()
-        .next()
-        .unwrap();
+    let tab = manifest.tabs.into_iter().next().unwrap().1;
+    let pane = if tab.tiled_panes.is_empty() {
+        tab.floating_panes.into_iter().next().unwrap()
+    } else {
+        tab.tiled_panes.into_iter().next().unwrap()
+    };
     let cwd = match (global_cwd, pane.cwd) {
         (Some(global_cwd), Some(cwd)) => Some(global_cwd.join(cwd)),
         (None, cwd) => cwd,
@@ -646,4 +674,167 @@ fn resurrect_command_for_unknown_terminal_is_rejected() {
 
     assert!(result.is_err());
     assert!(pty.resurrect_commands.is_empty());
+}
+
+fn held_command(command: &str, args: Vec<&str>, cwd: &str) -> Option<Run> {
+    let mut run_command = RunCommand::new(PathBuf::from(command));
+    run_command.args = args.into_iter().map(|arg| arg.to_string()).collect();
+    run_command.hold_on_close = true;
+    run_command.cwd = Some(PathBuf::from(cwd));
+    Some(Run::Command(run_command))
+}
+
+#[test]
+fn deliberate_launch_intent_is_not_replaced_by_observed_foreground() {
+    // A layout/command pane carries Run::Command. Neither the foreground
+    // child nor the exec'd process image may become the restart command.
+    // The live working directory is still recorded.
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_foreground_cmd(
+        child_pid,
+        vec!["ssh".into(), "user@host".into(), "interactive".into()],
+    );
+    mock.set_cmd(child_pid, vec!["/nix/store/nvim".into()]);
+    mock.set_cwd(child_pid, PathBuf::from("/tmp/project"));
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+
+    let (run, cwd) = serialized_metadata(
+        &mut pty,
+        session_with_terminal_pane_run(1, run_command("opencode", vec!["-s", "ses_abc"])),
+    );
+    assert_eq!(run, run_command("opencode", vec!["-s", "ses_abc"]));
+    assert_eq!(cwd, Some(PathBuf::from("/tmp/project")));
+}
+
+#[test]
+fn shell_pane_without_launch_intent_still_serializes_observed_foreground() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_foreground_cmd(child_pid, vec!["htop".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+
+    let (run, _cwd) = serialized_run_and_cwd(&mut pty, 1);
+    assert_eq!(run, run_command("htop", vec![]));
+}
+
+#[test]
+fn floating_launch_intent_is_not_replaced_by_an_interactive_child() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_foreground_cmd(child_pid, vec!["git".into(), "status".into()]);
+    mock.set_cwd(child_pid, PathBuf::from("/tmp/repo"));
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+
+    let (run, cwd) = serialized_metadata(
+        &mut pty,
+        session_with_floating_pane_run(1, run_command("lazygit", vec![])),
+    );
+    assert_eq!(run, run_command("lazygit", vec![]));
+    assert_eq!(cwd, Some(PathBuf::from("/tmp/repo")));
+}
+
+#[test]
+fn held_pane_keeps_launch_intent_without_a_live_process() {
+    // The command has exited and the pane is held, so there is no child pid
+    // to observe. A foreground recorded for some other pid must not replace
+    // the command, its arguments, its hold flag, or its cwd.
+    let mock = MockOsApi::new();
+    mock.set_foreground_cmd(9, vec!["cc1".into()]);
+    mock.set_cmd(9, vec!["cc1".into()]);
+    mock.set_cwd(9, PathBuf::from("/tmp/other"));
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+
+    let (run, observed_cwd) = serialized_metadata(
+        &mut pty,
+        session_with_terminal_pane_run(1, held_command("make", vec!["test"], "/tmp/build")),
+    );
+    assert_eq!(run, held_command("make", vec!["test"], "/tmp/build"));
+    assert_eq!(
+        observed_cwd, None,
+        "a held pane with no live process has no observed cwd to save"
+    );
+}
+
+#[test]
+fn explicit_resurrect_command_overrides_deliberate_launch_intent() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_foreground_cmd(child_pid, vec!["ssh".into()]);
+    mock.set_cwd(child_pid, PathBuf::from("/tmp/detected"));
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+    pty.set_resurrect_command(
+        1,
+        Some(resurrect_command(
+            "opencode",
+            vec!["--resume"],
+            Some("/tmp/resume"),
+        )),
+    )
+    .unwrap();
+
+    let (run, cwd) = serialized_metadata(
+        &mut pty,
+        session_with_terminal_pane_run(1, run_command("fish", vec!["-liC", "nvim"])),
+    );
+    assert_eq!(run, run_command("opencode", vec!["--resume"]));
+    assert_eq!(cwd, Some(PathBuf::from("/tmp/resume")));
+}
+
+#[test]
+fn clearing_resurrect_command_restores_deliberate_launch_intent() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_foreground_cmd(child_pid, vec!["ssh".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+    pty.set_resurrect_command(1, Some(resurrect_command("opencode", vec![], None)))
+        .unwrap();
+    pty.set_resurrect_command(1, None).unwrap();
+
+    let (run, _cwd) = serialized_metadata(
+        &mut pty,
+        session_with_terminal_pane_run(1, run_command("fish", vec!["-liC", "nvim"])),
+    );
+    assert_eq!(run, run_command("fish", vec!["-liC", "nvim"]));
+}
+
+#[test]
+fn deliberate_launch_intent_and_cwd_round_trip_through_layout() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_foreground_cmd(child_pid, vec!["ssh".into(), "host".into()]);
+    mock.set_cmd(child_pid, vec!["/nix/store/nvim".into()]);
+    mock.set_cwd(child_pid, PathBuf::from("/tmp/project"));
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+
+    let mut meta =
+        session_with_terminal_pane_run(1, run_command("opencode", vec!["-s", "ses_abc"]));
+    pty.populate_session_layout_metadata(&mut meta);
+    let manifest: session_serialization::GlobalLayoutManifest = meta.into();
+    let (kdl, _contents) = session_serialization::serialize_session_layout(manifest).unwrap();
+    assert!(!kdl.contains("ssh"), "{kdl}");
+    assert!(!kdl.contains("nvim"), "{kdl}");
+    let layout = Layout::from_kdl(&kdl, Some("layout".to_owned()), None, None)
+        .unwrap_or_else(|err| panic!("failed to parse serialized layout: {err:?}\n{kdl}"));
+    let run = layout
+        .tabs()
+        .into_iter()
+        .next()
+        .and_then(|(_, tiled, _)| tiled.children.into_iter().next())
+        .and_then(|pane| pane.run)
+        .unwrap_or_else(|| panic!("serialized pane has no command\n{kdl}"));
+    match run {
+        Run::Command(command) => {
+            assert_eq!(command.command, PathBuf::from("opencode"));
+            assert_eq!(command.args, vec!["-s".to_owned(), "ses_abc".to_owned()]);
+            assert_eq!(command.cwd, Some(PathBuf::from("/tmp/project")));
+        },
+        other => panic!("expected a command pane, got {other:?}\n{kdl}"),
+    }
 }
