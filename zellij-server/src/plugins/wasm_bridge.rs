@@ -2299,28 +2299,37 @@ impl WasmBridge {
 
         let mut running_plugin = running_plugin.lock().unwrap();
 
-        let permissions = if status == PermissionStatus::Granted {
-            permissions
-        } else {
-            vec![]
-        };
+        // A denial leaves earlier grants in place and is not cached, so the plugin can ask again.
+        if status != PermissionStatus::Granted {
+            return Ok(());
+        }
 
+        let mut runtime_permissions = {
+            running_plugin
+                .store
+                .data()
+                .permissions
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default()
+        };
+        runtime_permissions.extend(permissions.iter().cloned());
         running_plugin
             .store
             .data_mut()
-            .set_permissions(HashSet::from_iter(permissions.clone()));
+            .set_permissions(runtime_permissions);
 
         if running_plugin.store.data().plugin.is_builtin() {
             return Ok(());
         }
 
-        let mut permission_cache = PermissionCache::from_path_or_default(cache_path);
-        permission_cache.cache(
-            running_plugin.store.data().plugin.location.to_string(),
-            permissions,
-        );
-
-        permission_cache.write_to_file().with_context(err_context)
+        // Fresh-read, merge, and publish under one lock. Two writers must not drop each other's grants,
+        // and the publish itself must not leave a reader looking at an empty file.
+        let permission_cache_key = running_plugin.store.data().plugin.location.to_string();
+        PermissionCache::grant_and_persist(cache_path, permission_cache_key, permissions)
+            .with_context(err_context)?;
+        Ok(())
     }
     pub fn cache_plugin_events(&mut self, plugin_id: PluginId) {
         if self.shared_instance_of(plugin_id).is_some() {
@@ -3814,3 +3823,7 @@ mod hover_merge_tests;
 #[cfg(test)]
 #[path = "unit/startup_tests.rs"]
 mod startup_tests;
+
+#[cfg(test)]
+#[path = "unit/permission_cache_tests.rs"]
+mod permission_cache_tests;
