@@ -586,6 +586,9 @@ pub trait Pane {
     fn is_requesting_permissions(&self) -> bool {
         false
     }
+    fn has_client_instance(&self, _client_id: ClientId) -> bool {
+        true
+    }
     fn render(
         &mut self,
         client_id: Option<ClientId>,
@@ -5497,10 +5500,57 @@ impl Tab {
         pane_id: PaneId,
         completion: Option<NotificationEnd>,
     ) -> Result<()> {
+        // `None` is the explicitly clientless plugin audience.
+        self.paste_to_pane_id_for_client(bytes, pane_id, None, completion)
+    }
+
+    fn paste_to_pane_id_for_client(
+        &mut self,
+        bytes: Vec<u8>,
+        pane_id: PaneId,
+        client_id: Option<ClientId>,
+        mut completion: Option<NotificationEnd>,
+    ) -> Result<()> {
+        // Paste is data, not a permission decision. A one-byte "y" or "n"
+        // body must not be read as the answer to a prompt.
+        if self.is_pane_requesting_permissions(pane_id) {
+            let message = format!(
+                "failed to paste into pane with id {pane_id:?}: the pane is requesting permissions"
+            );
+            if let Some(completion) = completion.as_mut() {
+                completion.set_error_message(message.clone());
+                completion.set_exit_status(2);
+            }
+            return Err(anyhow!(message));
+        }
+        let bytes = without_paste_markers(bytes);
         let bracketed_paste_begin = vec![27, 91, 50, 48, 48, 126];
         let bracketed_paste_end = vec![27, 91, 50, 48, 49, 126];
-        let bytes = without_paste_markers(bytes);
-
+        if matches!(pane_id, PaneId::Plugin(_)) {
+            // A selection consumes the next input. Clear it before the begin
+            // marker, or the paste body is delivered as keys.
+            if let Some(pane) = self.get_pane_with_id_mut(pane_id) {
+                pane.reset_selection(client_id);
+            }
+            self.write_to_pane_id(
+                &None,
+                bracketed_paste_begin,
+                false,
+                pane_id,
+                client_id,
+                None,
+            )?;
+            self.write_to_pane_id(&None, bytes, false, pane_id, client_id, None)?;
+            self.write_to_pane_id(
+                &None,
+                bracketed_paste_end,
+                false,
+                pane_id,
+                client_id,
+                completion,
+            )?;
+            return Ok(());
+        }
         self.write_to_pane_id(&None, bracketed_paste_begin, false, pane_id, None, None)?;
         self.write_to_pane_id(&None, bytes, false, pane_id, None, None)?;
         self.write_to_pane_id(&None, bracketed_paste_end, false, pane_id, None, completion)?;
@@ -5582,9 +5632,14 @@ impl Tab {
             .with_context(err_context)?;
         self.local_input.insert(active_pane_id);
         self.typed_into.insert(active_pane_id);
-        self.paste_to_pane_id(bytes, active_pane_id, completion)
+        self.paste_to_pane_id_for_client(bytes, active_pane_id, Some(client_id), completion)
     }
 
+    /// Write input to an explicitly addressed pane.
+    ///
+    /// For a plugin pane, `client_id` is the audience. `None` addresses every
+    /// instance. A client with no instance of that pane falls back to `None`
+    /// instead of dropping the input.
     pub fn write_to_pane_id(
         &mut self,
         key_with_modifier: &Option<KeyWithModifier>,
@@ -5728,18 +5783,25 @@ impl Tab {
                 client_id,
             ) {
                 Some(AdjustedInput::WriteKeyToPlugin(key_with_modifier)) => {
+                    // A control client may have no grid for this plugin. The
+                    // pane is then the audience; keeping the unknown client
+                    // would drop the key.
+                    let plugin_client_id =
+                        client_id.filter(|client_id| active_pane.has_client_instance(*client_id));
                     self.senders
                         .send_to_plugin(PluginInstruction::Update(vec![(
                             Some(pid),
-                            client_id,
+                            plugin_client_id,
                             Event::Key(key_with_modifier),
                         )]))
                         .with_context(err_context)?;
                 },
                 Some(AdjustedInput::WriteBytesToTerminal(adjusted_input)) => {
+                    let plugin_client_id =
+                        client_id.filter(|client_id| active_pane.has_client_instance(*client_id));
                     let mut plugin_updates = vec![];
                     for key in parse_keys(&adjusted_input) {
-                        plugin_updates.push((Some(pid), client_id, Event::Key(key)));
+                        plugin_updates.push((Some(pid), plugin_client_id, Event::Key(key)));
                     }
                     self.senders
                         .send_to_plugin(PluginInstruction::Update(plugin_updates))

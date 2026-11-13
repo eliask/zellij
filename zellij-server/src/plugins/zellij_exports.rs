@@ -5403,6 +5403,7 @@ fn write_to_pane_id(env: &PluginEnv, bytes: Vec<u8>, pane_id: PaneId) {
     let send_result = env.senders.send_to_screen(ScreenInstruction::WriteToPaneId(
         bytes,
         pane_id,
+        Some(acting_client(env)),
         Some(NotificationEnd::new(completion_tx)),
     ));
     if send_result.is_ok() {
@@ -5417,6 +5418,7 @@ fn write_chars_to_pane_id(env: &PluginEnv, chars: String, pane_id: PaneId) {
     let send_result = env.senders.send_to_screen(ScreenInstruction::WriteToPaneId(
         bytes,
         pane_id,
+        Some(acting_client(env)),
         Some(NotificationEnd::new(completion_tx)),
     ));
     if send_result.is_ok() {

@@ -904,7 +904,7 @@ pub enum ScreenInstruction {
     RerunCommandPane(u32, Option<NotificationEnd>), // u32 - terminal pane id
     ResizePaneWithId(ResizeStrategy, PaneId),
     EditScrollbackForPaneWithId(PaneId, Option<NotificationEnd>),
-    WriteToPaneId(Vec<u8>, PaneId, Option<NotificationEnd>),
+    WriteToPaneId(Vec<u8>, PaneId, Option<ClientId>, Option<NotificationEnd>),
     Paste(Vec<u8>, Option<PaneId>, ClientId, Option<NotificationEnd>),
     SetPaneColor(
         PaneId,
@@ -14855,14 +14855,20 @@ pub(crate) fn screen_thread_main(
                 }
                 screen.render(None)?;
             },
-            ScreenInstruction::WriteToPaneId(bytes, pane_id, _completion) => {
+            ScreenInstruction::WriteToPaneId(bytes, pane_id, client_id, _completion) => {
                 let all_tabs = screen.get_tabs_mut();
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
                         if tab.is_pane_requesting_permissions(pane_id) {
                             break;
                         }
-                        tab.write_to_pane_id(&None, bytes, false, pane_id, None, None)
+                        // Terminal writes stay clientless. A plugin keeps the
+                        // client when that client has an instance.
+                        let plugin_client_id = match pane_id {
+                            PaneId::Plugin(_) => client_id,
+                            PaneId::Terminal(_) => None,
+                        };
+                        tab.write_to_pane_id(&None, bytes, false, pane_id, plugin_client_id, None)
                             .non_fatal();
                         break;
                     }

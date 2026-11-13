@@ -36,6 +36,210 @@ use zellij_utils::{
     ipc::{ClientToServerMsg, ServerToClientMsg},
 };
 
+// Plugin input keeps its client audience and is not a permission answer.
+mod input_scope_regressions {
+    use super::*;
+    use zellij_utils::data::{
+        BareKey, KeyWithModifier, PermissionStatus, PermissionType, PluginPermission,
+    };
+
+    fn plugin_tab() -> (Tab, Receiver<(PluginInstruction, ErrorContext)>) {
+        let (mut tab, receiver) =
+            create_new_tab_with_plugin_receiver(Size { rows: 24, cols: 80 }, true);
+        tab.new_no_preference_pane(
+            PaneId::Plugin(2),
+            None,
+            None,
+            false,
+            true,
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(tab.get_active_pane_id(1), Some(PaneId::Plugin(2)));
+        receiver.try_iter().for_each(drop);
+        (tab, receiver)
+    }
+
+    fn updates(
+        receiver: &Receiver<(PluginInstruction, ErrorContext)>,
+    ) -> Vec<(Option<u32>, Option<ClientId>, Event)> {
+        receiver
+            .try_iter()
+            .flat_map(|(instruction, _)| match instruction {
+                PluginInstruction::Update(events) => events,
+                _ => vec![],
+            })
+            .collect()
+    }
+
+    fn pasted(
+        receiver: &Receiver<(PluginInstruction, ErrorContext)>,
+    ) -> Vec<(Option<u32>, Option<ClientId>, String)> {
+        updates(receiver)
+            .into_iter()
+            .filter_map(|(pid, cid, event)| match event {
+                Event::PastedText(text) => Some((pid, cid, text)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn focused_plugin_paste_keeps_the_originating_client() {
+        let (mut tab, receiver) = plugin_tab();
+        tab.paste_to_active_terminal(b"scope".to_vec(), 1, None)
+            .unwrap();
+        assert_eq!(
+            pasted(&receiver),
+            vec![(Some(2), Some(1), "scope".to_owned())]
+        );
+    }
+
+    #[test]
+    fn explicitly_clientless_plugin_paste_keeps_its_existing_audience() {
+        let (mut tab, receiver) = plugin_tab();
+        tab.paste_to_pane_id(b"scope".to_vec(), PaneId::Plugin(2), None)
+            .unwrap();
+        assert_eq!(pasted(&receiver), vec![(Some(2), None, "scope".to_owned())]);
+    }
+
+    #[test]
+    fn targeted_plugin_paste_falls_back_to_the_clientless_audience() {
+        let (mut tab, receiver) = plugin_tab();
+        tab.paste_to_pane_id_for_client(b"scope".to_vec(), PaneId::Plugin(2), Some(99), None)
+            .unwrap();
+        assert_eq!(pasted(&receiver), vec![(Some(2), None, "scope".to_owned())]);
+    }
+
+    #[test]
+    fn two_clients_keep_distinct_plugin_audiences() {
+        let (mut tab, receiver) = plugin_tab();
+        tab.get_pane_with_id_mut(PaneId::Plugin(2))
+            .unwrap()
+            .handle_plugin_bytes(2, b"other client".to_vec());
+        receiver.try_iter().for_each(drop);
+        let enter = Some(KeyWithModifier::new(BareKey::Enter));
+        tab.write_to_pane_id(&enter, Vec::new(), true, PaneId::Plugin(2), Some(1), None)
+            .unwrap();
+        tab.write_to_pane_id(&enter, Vec::new(), true, PaneId::Plugin(2), Some(2), None)
+            .unwrap();
+        tab.paste_to_pane_id_for_client(b"one".to_vec(), PaneId::Plugin(2), Some(1), None)
+            .unwrap();
+        tab.paste_to_pane_id_for_client(b"two".to_vec(), PaneId::Plugin(2), Some(2), None)
+            .unwrap();
+        let events = updates(&receiver);
+        let keys: Vec<_> = events
+            .iter()
+            .filter_map(|(pid, client_id, event)| {
+                (*pid == Some(2) && matches!(event, Event::Key(_))).then_some(*client_id)
+            })
+            .collect();
+        let pasted: Vec<_> = events
+            .iter()
+            .filter_map(|(pid, client_id, event)| match event {
+                Event::PastedText(text) if *pid == Some(2) => Some((*client_id, text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec![Some(1), Some(2)]);
+        assert_eq!(pasted, vec![(Some(1), "one"), (Some(2), "two")]);
+    }
+
+    #[test]
+    fn targeted_plugin_input_falls_back_to_the_clientless_audience() {
+        let (mut tab, receiver) = plugin_tab();
+        let enter = Some(KeyWithModifier::new(BareKey::Enter));
+        tab.write_to_pane_id(&enter, Vec::new(), true, PaneId::Plugin(2), Some(1), None)
+            .unwrap();
+        tab.write_to_pane_id(&enter, Vec::new(), true, PaneId::Plugin(2), Some(99), None)
+            .unwrap();
+        let audiences: Vec<_> = updates(&receiver)
+            .into_iter()
+            .filter_map(|(pid, client_id, event)| {
+                (pid == Some(2) && matches!(event, Event::Key(_))).then_some(client_id)
+            })
+            .collect();
+        assert_eq!(
+            audiences,
+            vec![Some(1), None],
+            "a client with an instance stays targeted; a control client without one addresses the pane"
+        );
+    }
+
+    #[test]
+    fn paste_cannot_answer_a_permission_prompt_but_a_keypress_can() {
+        let (mut tab, receiver) = plugin_tab();
+        tab.get_pane_with_id_mut(PaneId::Plugin(2))
+            .unwrap()
+            .request_permissions_from_user(Some(PluginPermission {
+                name: "input-scope-fixture".to_owned(),
+                permissions: vec![PermissionType::FullHdAccess],
+            }));
+        receiver.try_iter().for_each(drop);
+        assert!(tab
+            .paste_to_pane_id(b"y".to_vec(), PaneId::Plugin(2), None)
+            .is_err());
+        assert!(tab
+            .paste_to_active_terminal(b"y".to_vec(), 1, None)
+            .is_err());
+        assert!(tab
+            .get_pane_with_id(PaneId::Plugin(2))
+            .unwrap()
+            .is_requesting_permissions());
+        assert!(!receiver.try_iter().any(|(instruction, _)| {
+            matches!(instruction, PluginInstruction::PermissionRequestResult(..))
+        }));
+        tab.write_to_pane_id(
+            &None,
+            b"y".to_vec(),
+            false,
+            PaneId::Plugin(2),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        assert!(receiver.try_iter().any(|(instruction, _)| {
+            matches!(
+                instruction,
+                PluginInstruction::PermissionRequestResult(
+                    2,
+                    Some(1),
+                    _,
+                    PermissionStatus::Granted,
+                    _,
+                )
+            )
+        }));
+    }
+
+    #[test]
+    fn selected_plugin_text_does_not_consume_the_paste_begin_marker() {
+        let (mut tab, receiver) = plugin_tab();
+        {
+            let pane = tab.get_pane_with_id_mut(PaneId::Plugin(2)).unwrap();
+            pane.handle_plugin_bytes(1, b"selected text".to_vec());
+            pane.set_mouse_selection_support(true);
+            pane.start_selection(&Position::new(0, 0), 1);
+            pane.end_selection(&Position::new(0, 3), 1);
+            assert!(pane.get_selected_text(1).is_some());
+        }
+        receiver.try_iter().for_each(drop);
+        tab.paste_to_active_terminal(b"scope".to_vec(), 1, None)
+            .unwrap();
+        let events = updates(&receiver);
+        assert!(events.iter().any(|(pid, cid, event)| {
+            *pid == Some(2)
+                && *cid == Some(1)
+                && matches!(event, Event::PastedText(text) if text == "scope")
+        }));
+        assert!(!events
+            .iter()
+            .any(|(_, _, event)| matches!(event, Event::Key(_))));
+    }
+}
+
 #[derive(Clone)]
 struct FakeInputOutput {}
 

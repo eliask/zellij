@@ -484,6 +484,7 @@ fn route_action_with_origin(
                 .send_to_screen(ScreenInstruction::WriteToPaneId(
                     bytes,
                     pane_id.into(),
+                    Some(client_id),
                     Some(NotificationEnd::new(completion_tx)),
                 ))
                 .with_context(err_context)?;
@@ -497,6 +498,7 @@ fn route_action_with_origin(
                 .send_to_screen(ScreenInstruction::WriteToPaneId(
                     bytes,
                     pane_id.into(),
+                    Some(client_id),
                     Some(NotificationEnd::new(completion_tx)),
                 ))
                 .with_context(err_context)?;
