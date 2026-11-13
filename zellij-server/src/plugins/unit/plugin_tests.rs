@@ -1086,6 +1086,7 @@ pub fn can_subscribe_to_hd_events() {
     let temp_folder = tempdir().unwrap(); // placed explicitly in the test scope because its
                                           // destructor removes the directory
     let plugin_host_folder = PathBuf::from(temp_folder.path());
+    let host_root = plugin_host_folder.clone();
     let cache_path = plugin_host_folder.join("permissions_test.kdl");
     let (plugin_thread_sender, screen_receiver, teardown) =
         create_plugin_thread(Some(plugin_host_folder), None);
@@ -1109,7 +1110,7 @@ pub fn can_subscribe_to_hd_events() {
         ScreenInstruction::PluginBytes,
         screen_receiver,
         2,
-        &PermissionType::ChangeApplicationState,
+        &PermissionType::FullHdAccess,
         cache_path,
         plugin_thread_sender,
         client_id
@@ -1135,6 +1136,13 @@ pub fn can_subscribe_to_hd_events() {
     ));
     // extra long time because we only start the fs watcher on plugin load
     std::thread::sleep(std::time::Duration::from_millis(5000));
+    // The fixture's watch request is permission-gated. Start the watcher for this
+    // load's host root directly; the gate itself is covered by host_authority tests.
+    let _ = plugin_thread_sender.send(PluginInstruction::WatchFilesystem {
+        plugin_id: 0,
+        host_root,
+    });
+    std::thread::sleep(std::time::Duration::from_millis(1000));
     std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -14178,6 +14186,178 @@ pub fn global_attention_update_hides_the_command_text_without_pane_read_permissi
     let event = Event::GlobalAttentionUpdate(global_attention_with_command_text());
     assert!(!redacted(&WITHOUT_PANE_READ, event.clone()).contains("hunter2"));
     assert!(redacted(&WITH_PANE_READ, event).contains("hunter2"));
+}
+
+fn filesystem_events() -> Vec<Event> {
+    let path = (PathBuf::from("/host/secret"), None);
+    vec![
+        Event::FileSystemCreate(vec![path.clone()]),
+        Event::FileSystemRead(vec![path.clone()]),
+        Event::FileSystemUpdate(vec![path.clone()]),
+        Event::FileSystemDelete(vec![path]),
+    ]
+}
+
+fn assert_command_needs(command: zellij_utils::data::PluginCommand, required: PermissionType) {
+    let granted = plugin_env_with_permissions(&[required.clone()]);
+    assert_eq!(
+        super::zellij_exports::check_command_permission(&granted, &command).0,
+        PermissionStatus::Granted,
+        "{:?} with {:?}",
+        command,
+        required
+    );
+    let denied = plugin_env_with_permissions(&[PermissionType::ReadApplicationState]);
+    if required != PermissionType::ReadApplicationState {
+        assert_eq!(
+            super::zellij_exports::check_command_permission(&denied, &command),
+            (PermissionStatus::Denied, Some(required.clone())),
+            "{:?} must not run with only ReadApplicationState",
+            command
+        );
+    }
+    let builtin = {
+        let mut env = plugin_env_with_permissions(&[]);
+        env.plugin.location =
+            RunPluginLocation::Zellij(zellij_utils::data::PluginTag::new("status-bar"));
+        env
+    };
+    assert_eq!(
+        super::zellij_exports::check_command_permission(&builtin, &command).0,
+        PermissionStatus::Granted,
+        "built-in plugins keep {:?}",
+        command
+    );
+}
+
+#[test]
+pub fn host_authority_command_and_preview_need_read_pane_contents() {
+    use zellij_utils::data::{PaneId, PluginCommand};
+    let commands = [
+        PluginCommand::GetPaneRunningCommand {
+            pane_id: PaneId::Terminal(1),
+        },
+        PluginCommand::GetSessionPreview {
+            name: "other".to_owned(),
+            tab_index: Some(0),
+            pane_id: Some((1, false)),
+            anchor: None,
+        },
+        PluginCommand::GetSavedSessionPreview("saved".to_owned()),
+    ];
+    for command in commands {
+        assert_command_needs(command, PermissionType::ReadPaneContents);
+    }
+}
+
+#[test]
+pub fn host_authority_focus_history_needs_change_application_state() {
+    use zellij_utils::data::PluginCommand;
+    for command in [
+        PluginCommand::FocusNextPane,
+        PluginCommand::FocusPreviousPane,
+        PluginCommand::FocusLastPane,
+    ] {
+        assert_command_needs(command, PermissionType::ChangeApplicationState);
+    }
+}
+
+#[test]
+pub fn host_authority_filesystem_needs_full_hd_access() {
+    assert_command_needs(
+        zellij_utils::data::PluginCommand::WatchFilesystem,
+        PermissionType::FullHdAccess,
+    );
+    let third_party = plugin_env_with_permissions(&[PermissionType::ReadApplicationState]);
+    let allowed = plugin_env_with_permissions(&[PermissionType::FullHdAccess]);
+    let mut builtin = plugin_env_with_permissions(&[]);
+    builtin.plugin.location =
+        RunPluginLocation::Zellij(zellij_utils::data::PluginTag::new("status-bar"));
+    for event in filesystem_events() {
+        assert_eq!(
+            super::wasm_bridge::check_event_permission(&third_party, &event),
+            (PermissionStatus::Denied, Some(PermissionType::FullHdAccess)),
+            "{:?}",
+            event
+        );
+        assert_eq!(
+            super::wasm_bridge::check_event_permission(&allowed, &event).0,
+            PermissionStatus::Granted,
+            "{:?}",
+            event
+        );
+        assert_eq!(
+            super::wasm_bridge::check_event_permission(&builtin, &event).0,
+            PermissionStatus::Granted,
+            "{:?}",
+            event
+        );
+    }
+    // A key event stays ungated. Filesystem gating must not become a blanket event deny.
+    let key = Event::Key(KeyWithModifier::new(BareKey::Enter));
+    assert_eq!(
+        super::wasm_bridge::check_event_permission(&third_party, &key).0,
+        PermissionStatus::Granted
+    );
+}
+
+#[test]
+pub fn host_authority_ungated_commands_stay_ungated() {
+    use zellij_utils::data::PluginCommand;
+    let bare = plugin_env_with_permissions(&[]);
+    for command in [
+        PluginCommand::Subscribe(Default::default()),
+        PluginCommand::Unsubscribe(Default::default()),
+        PluginCommand::GetPluginIds,
+        PluginCommand::GetZellijVersion,
+        PluginCommand::CloseSelf,
+        PluginCommand::HideSelf,
+        PluginCommand::RequestPluginPermissions(vec![]),
+        PluginCommand::ScanHostFolder(PathBuf::from("/host")),
+    ] {
+        assert_eq!(
+            super::zellij_exports::check_command_permission(&bare, &command),
+            (PermissionStatus::Granted, None),
+            "{:?} is not a new restriction",
+            command
+        );
+    }
+}
+
+#[test]
+pub fn host_authority_terminal_command_is_redacted_without_pane_read() {
+    let mut pane = zellij_utils::data::PaneInfo {
+        title: "visible-title".to_owned(),
+        terminal_command: Some("deploy --token hunter2".to_owned()),
+        ..Default::default()
+    };
+    let pane_update = Event::PaneUpdate(zellij_utils::data::PaneManifest {
+        panes: std::collections::HashMap::from([(0, vec![pane.clone()])]),
+    });
+    let hidden = redacted(&WITHOUT_PANE_READ, pane_update.clone());
+    assert!(!hidden.contains("hunter2"), "{}", hidden);
+    assert!(hidden.contains("visible-title"), "{}", hidden);
+    assert!(redacted(&WITH_PANE_READ, pane_update).contains("hunter2"));
+
+    pane.title = "session-visible-title".to_owned();
+    let mut session = zellij_utils::data::SessionInfo {
+        name: "current".to_owned(),
+        panes: zellij_utils::data::PaneManifest {
+            panes: std::collections::HashMap::from([(0, vec![pane])]),
+        },
+        ..Default::default()
+    };
+    let session_update = Event::SessionUpdate(vec![session.clone()], vec![]);
+    let hidden = redacted(&WITHOUT_PANE_READ, session_update.clone());
+    assert!(!hidden.contains("hunter2"), "{}", hidden);
+    assert!(hidden.contains("session-visible-title"), "{}", hidden);
+    assert!(redacted(&WITH_PANE_READ, session_update).contains("hunter2"));
+
+    let env = plugin_env_with_permissions(&WITHOUT_PANE_READ);
+    super::wasm_bridge::redact_session_info_for_plugin(&env, &mut session);
+    let rendered = format!("{:?}", session);
+    assert!(!rendered.contains("hunter2"), "{}", rendered);
+    assert!(rendered.contains("session-visible-title"), "{}", rendered);
 }
 
 struct FixtureRun {

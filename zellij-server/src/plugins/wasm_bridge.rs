@@ -291,7 +291,7 @@ pub struct WasmBridge {
     plugins_to_unload_once_loaded: HashSet<PluginId>,
     pending_plugin_reloads: HashSet<RunPlugin>,
     path_to_default_shell: PathBuf,
-    watcher: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
+    watchers: HashMap<PluginId, (PathBuf, Debouncer<RecommendedWatcher, RecommendedCache>)>,
     zellij_cwd: PathBuf,
     session_env_vars: std::collections::BTreeMap<String, String>,
     default_shell: Option<TerminalAction>,
@@ -341,7 +341,7 @@ impl WasmBridge {
         let connected_clients: Arc<Mutex<Vec<ClientId>>> = Arc::new(Mutex::new(vec![]));
         let plugin_cache: Arc<Mutex<HashMap<PathBuf, Module>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let watcher = None;
+        let watchers = HashMap::new();
         let downloader = Downloader::new(ZELLIJ_CACHE_DIR.to_path_buf());
         let max_threads = num_cpus::get().max(4).min(16);
         let plugin_executor = Arc::new(PinnedExecutor::new(
@@ -359,7 +359,7 @@ impl WasmBridge {
             plugin_map,
             plugin_executor,
             path_to_default_shell,
-            watcher,
+            watchers,
             next_plugin_id: 0,
             cached_events_for_pending_plugins: HashMap::new(),
             plugin_ids_waiting_for_permission_request: HashSet::new(),
@@ -655,6 +655,7 @@ impl WasmBridge {
     }
     pub fn unload_plugin(&mut self, pid: PluginId) -> Result<()> {
         info!("Bye from plugin {}", &pid);
+        self.stop_filesystem_watcher(pid);
         let _ = self
             .senders
             .send_to_screen(ScreenInstruction::ClearLiveViewsOfPlugin(pid));
@@ -1847,7 +1848,7 @@ impl WasmBridge {
         for plugin_id in &plugin_ids {
             drop(self.unload_plugin(*plugin_id));
         }
-        if let Some(watcher) = self.watcher.take() {
+        for (_, (_, watcher)) in self.watchers.drain() {
             watcher.stop_nonblocking();
         }
     }
@@ -2259,15 +2260,30 @@ impl WasmBridge {
         }
         Ok(())
     }
-    pub fn start_fs_watcher_if_not_started(&mut self) {
-        if self.watcher.is_none() {
-            self.watcher = match watch_filesystem(self.senders.clone(), &self.zellij_cwd) {
-                Ok(watcher) => Some(watcher),
-                Err(e) => {
-                    log::error!("Failed to watch filesystem: {:?}", e);
-                    None
-                },
-            };
+    fn stop_filesystem_watcher(&mut self, plugin_id: PluginId) {
+        if let Some((_, watcher)) = self.watchers.remove(&plugin_id) {
+            watcher.stop_nonblocking();
+        }
+    }
+    pub fn start_fs_watcher_if_not_started(&mut self, plugin_id: PluginId, host_root: PathBuf) {
+        if self
+            .watchers
+            .get(&plugin_id)
+            .map(|(root, _)| root == &host_root)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if let Some((_, old_watcher)) = self.watchers.remove(&plugin_id) {
+            old_watcher.stop_nonblocking();
+        }
+        match watch_filesystem(self.senders.clone(), plugin_id, &host_root) {
+            Ok(watcher) => {
+                self.watchers.insert(plugin_id, (host_root, watcher));
+            },
+            Err(e) => {
+                log::error!("Failed to watch filesystem: {:?}", e);
+            },
         }
     }
     pub fn cache_plugin_permissions(
@@ -3533,6 +3549,10 @@ pub fn check_event_permission(
         Event::WebServerStatus(..) => PermissionType::StartWebServer,
         Event::PaneRenderReport(..) => PermissionType::ReadPaneContents,
         Event::LiveViewStateChanged { .. } => PermissionType::ReadPaneContents,
+        Event::FileSystemCreate(..)
+        | Event::FileSystemRead(..)
+        | Event::FileSystemUpdate(..)
+        | Event::FileSystemDelete(..) => PermissionType::FullHdAccess,
         Event::UserAction(..) => PermissionType::InterceptInput,
         _ => return (PermissionStatus::Granted, None),
     };
@@ -3562,6 +3582,21 @@ fn can_read_command_text(plugin_env: &PluginEnv) -> bool {
 fn redact_pane_info(pane_info: &mut zellij_utils::data::PaneInfo) {
     pane_info.attention = std::mem::take(&mut pane_info.attention).without_command_text();
     pane_info.command_state = std::mem::take(&mut pane_info.command_state).without_command_text();
+    pane_info.terminal_command = None;
+}
+
+pub(crate) fn redact_session_info_for_plugin(
+    plugin_env: &PluginEnv,
+    session_info: &mut zellij_utils::data::SessionInfo,
+) {
+    if can_read_command_text(plugin_env) {
+        return;
+    }
+    for pane_infos in session_info.panes.panes.values_mut() {
+        for pane_info in pane_infos.iter_mut() {
+            redact_pane_info(pane_info);
+        }
+    }
 }
 
 pub fn redact_event_for_plugin(plugin_env: &PluginEnv, event: &mut Event) {

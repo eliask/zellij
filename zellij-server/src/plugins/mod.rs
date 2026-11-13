@@ -234,7 +234,10 @@ pub enum PluginInstruction {
     ConfigWasWrittenToDisk,
     ConfigChangesDropped(ClientId, Vec<SettingKey>),
     ConfigFileChangedSinceRead(ClientId),
-    WatchFilesystem,
+    WatchFilesystem {
+        plugin_id: PluginId,
+        host_root: PathBuf,
+    },
     ListClientsToPlugin(SessionLayoutMetadata, PluginId, ClientId),
     ChangePluginHostDir(PathBuf, PluginId, ClientId),
     WebServerStarted(String), // String -> the base url of the web server
@@ -337,7 +340,7 @@ impl From<&PluginInstruction> for PluginContext {
             PluginInstruction::CachePluginEvents { .. } => PluginContext::CachePluginEvents,
             PluginInstruction::MessageFromPlugin { .. } => PluginContext::MessageFromPlugin,
             PluginInstruction::UnblockCliPipes { .. } => PluginContext::UnblockCliPipes,
-            PluginInstruction::WatchFilesystem => PluginContext::WatchFilesystem,
+            PluginInstruction::WatchFilesystem { .. } => PluginContext::WatchFilesystem,
             PluginInstruction::KeybindPipe { .. } => PluginContext::KeybindPipe,
             PluginInstruction::DumpLayoutToPlugin { .. } => PluginContext::DumpLayoutToPlugin,
             PluginInstruction::Reconfigure { .. } => PluginContext::Reconfigure,
@@ -1560,8 +1563,11 @@ pub(crate) fn plugin_thread_main(
                     .update_plugins(updates, shutdown_send.clone())
                     .non_fatal();
             },
-            PluginInstruction::WatchFilesystem => {
-                wasm_bridge.start_fs_watcher_if_not_started();
+            PluginInstruction::WatchFilesystem {
+                plugin_id,
+                host_root,
+            } => {
+                wasm_bridge.start_fs_watcher_if_not_started(plugin_id, host_root);
             },
             PluginInstruction::ChangePluginHostDir(new_host_folder, plugin_id, client_id) => {
                 if let Ok(_) = wasm_bridge.change_plugin_host_dir(

@@ -4703,11 +4703,12 @@ fn delete_all_dead_sessions_and_reply(env: &PluginEnv) {
 }
 
 fn watch_filesystem(env: &PluginEnv) {
-    let _ = env
-        .senders
-        .to_plugin
-        .as_ref()
-        .map(|sender| sender.send(PluginInstruction::WatchFilesystem));
+    let _ = env.senders.to_plugin.as_ref().map(|sender| {
+        sender.send(PluginInstruction::WatchFilesystem {
+            plugin_id: env.plugin_id,
+            host_root: env.plugin_cwd.clone(),
+        })
+    });
 }
 
 // note this removes the requesting plugin
@@ -5543,10 +5544,13 @@ fn get_session_list(env: &PluginEnv) {
                     Some((env.plugin_id, env.client_id)),
                 ));
 
-            let snapshot = SessionListSnapshot {
+            let mut snapshot = SessionListSnapshot {
                 live_sessions: live_sessions_map.into_values().collect(),
                 resurrectable_sessions: resurrectable_sessions_map.into_iter().collect(),
             };
+            for session_info in &mut snapshot.live_sessions {
+                crate::plugins::wasm_bridge::redact_session_info_for_plugin(env, session_info);
+            }
             GetSessionListResponse::Ok(snapshot)
         },
         None => GetSessionListResponse::Err("Session-scan state not initialized".to_string()),
@@ -6758,6 +6762,8 @@ fn required_permission(command: &PluginCommand) -> Option<PermissionType> {
         | PluginCommand::Resize(..)
         | PluginCommand::ResizeWithDirection(..)
         | PluginCommand::FocusNextPane
+        | PluginCommand::FocusPreviousPane
+        | PluginCommand::FocusLastPane
         | PluginCommand::MoveFocus(..)
         | PluginCommand::MoveFocusOrTab(..)
         | PluginCommand::Detach
@@ -6873,6 +6879,7 @@ fn required_permission(command: &PluginCommand) -> Option<PermissionType> {
             PermissionType::OpenTerminalsOrPlugins
         },
         PluginCommand::RunContextMenuItem(..) => PermissionType::RunActionsAsUser,
+        PluginCommand::WatchFilesystem => PermissionType::FullHdAccess,
         PluginCommand::UnblockCliPipeInput(..)
         | PluginCommand::BlockCliPipeInput(..)
         | PluginCommand::CliPipeOutput(..)
@@ -6881,7 +6888,6 @@ fn required_permission(command: &PluginCommand) -> Option<PermissionType> {
         PluginCommand::ListClients
         | PluginCommand::DumpSessionLayout { .. }
         | PluginCommand::GetPanePid { .. }
-        | PluginCommand::GetPaneRunningCommand { .. }
         | PluginCommand::GetPaneCwd { .. }
         | PluginCommand::GenerateRandomName
         | PluginCommand::GetLayoutDir
@@ -6894,9 +6900,10 @@ fn required_permission(command: &PluginCommand) -> Option<PermissionType> {
         | PluginCommand::GetTabInfo(..)
         | PluginCommand::GetNestedSessionKeybinds(..)
         | PluginCommand::GetSessionList
-        | PluginCommand::GetSessionSuggestions { .. }
+        | PluginCommand::GetSessionSuggestions { .. } => PermissionType::ReadApplicationState,
+        PluginCommand::GetPaneRunningCommand { .. }
         | PluginCommand::GetSessionPreview { .. }
-        | PluginCommand::GetSavedSessionPreview(..) => PermissionType::ReadApplicationState,
+        | PluginCommand::GetSavedSessionPreview(..) => PermissionType::ReadPaneContents,
         PluginCommand::RebindKeys { .. }
         | PluginCommand::Reconfigure(..)
         | PluginCommand::ReadConfig
@@ -6935,7 +6942,30 @@ fn required_permission(command: &PluginCommand) -> Option<PermissionType> {
         },
         PluginCommand::OpenCommandPaneInNewTab(..) => PermissionType::RunCommands,
         PluginCommand::OpenEditorPaneInNewTab(..) => PermissionType::OpenFiles,
-        _ => return None,
+        // Closed set that stays ungated. A new PluginCommand must be named on a
+        // permission arm above; this is not a wildcard and must not become one.
+        PluginCommand::Subscribe(..)
+        | PluginCommand::Unsubscribe(..)
+        | PluginCommand::SetSelectable(..)
+        | PluginCommand::ShowCursor(..)
+        | PluginCommand::GetPluginIds
+        | PluginCommand::GetZellijVersion
+        | PluginCommand::SetTimeout(..)
+        | PluginCommand::PostMessageTo(..)
+        | PluginCommand::PostMessageToPlugin(..)
+        | PluginCommand::HideSelf
+        | PluginCommand::ShowSelf(..)
+        | PluginCommand::ReportPanic(..)
+        | PluginCommand::RequestPluginPermissions(..)
+        | PluginCommand::ScanHostFolder(..)
+        | PluginCommand::CloseSelf
+        | PluginCommand::SetSelfMouseSelectionSupport(..)
+        | PluginCommand::SetSelfCollapsed(..)
+        | PluginCommand::SetSelectableSlot(..)
+        | PluginCommand::HideSlot(..)
+        | PluginCommand::ShowSlot(..)
+        | PluginCommand::CloseSlot(..)
+        | PluginCommand::SetCollapsedSlot(..) => return None,
     };
     Some(permission)
 }
