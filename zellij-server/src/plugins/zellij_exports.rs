@@ -3356,6 +3356,14 @@ fn exec_cmd(env: &PluginEnv, mut command_line: Vec<String>) {
             env.name()
         )
     };
+    // `remove(0)` panics on an empty vector and the process panic hook exits the session.
+    if command_line.is_empty() {
+        log::error!(
+            "failed to execute command on host for plugin '{}': command cannot be empty",
+            env.name()
+        );
+        return;
+    }
     let command = command_line.remove(0);
 
     // Bail out if we're forbidden to run command
@@ -7050,4 +7058,126 @@ fn set_live_view_input(env: &PluginEnv, capture: bool) {
             client_id: acting_client(env),
             capture,
         });
+}
+
+#[cfg(test)]
+mod exec_cmd_tests {
+    use super::{exec_cmd, PluginEnv};
+    use std::collections::{BTreeMap, VecDeque};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use zellij_utils::data::{InputMode, PermissionType};
+    use zellij_utils::input::layout::{PluginUserConfiguration, RunPluginLocation};
+    use zellij_utils::input::plugins::PluginConfig;
+
+    fn plugin_env(plugin_cwd: PathBuf) -> PluginEnv {
+        let stdin_pipe = Arc::new(Mutex::new(VecDeque::new()));
+        let stdout_pipe = Arc::new(Mutex::new(VecDeque::new()));
+        let wasi_ctx = crate::plugins::plugin_loader::PluginLoader::create_wasi_ctx(
+            &plugin_cwd,
+            &plugin_cwd,
+            &plugin_cwd,
+            &plugin_cwd,
+            &"file:/tmp/exec-cmd.wasm".to_owned(),
+            21,
+            stdin_pipe.clone(),
+            stdout_pipe.clone(),
+        )
+        .expect("wasi context");
+        PluginEnv {
+            plugin_id: 21,
+            client_id: 1,
+            plugin: PluginConfig {
+                path: PathBuf::from("/tmp/exec-cmd.wasm"),
+                _allow_exec_host_cmd: false,
+                location: RunPluginLocation::File(PathBuf::from("/tmp/exec-cmd.wasm")),
+                initial_userspace_configuration: PluginUserConfiguration::new(BTreeMap::new()),
+                initial_cwd: None,
+            },
+            permissions: Arc::new(Mutex::new(Some(
+                [PermissionType::RunCommands].into_iter().collect(),
+            ))),
+            senders: crate::thread_bus::ThreadSenders {
+                should_silently_fail: true,
+                ..Default::default()
+            },
+            wasi_ctx,
+            plugin_own_data_dir: plugin_cwd.clone(),
+            plugin_own_cache_dir: plugin_cwd.clone(),
+            path_to_default_shell: plugin_cwd.clone(),
+            default_shell: None,
+            layout_dir: None,
+            plugin_cwd,
+            session_env_vars: BTreeMap::new(),
+            input_pipes_to_unblock: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            input_pipes_to_block: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            default_mode: InputMode::Normal,
+            subscriptions: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            stdin_pipe,
+            stdout_pipe,
+            keybinds: Arc::new(Default::default()),
+            intercepting_key_presses: false,
+            pending_popup_size: None,
+            store_limits: wasmi::StoreLimitsBuilder::new().build(),
+            shared: None,
+        }
+    }
+
+    fn marker_command(marker: &Path) -> Vec<String> {
+        #[cfg(unix)]
+        {
+            let touch = ["/usr/bin/touch", "/bin/touch"]
+                .into_iter()
+                .find(|path| Path::new(path).is_file())
+                .expect("touch is required to prove whether exec_cmd spawns");
+            vec![touch.to_owned(), marker.to_string_lossy().into_owned()]
+        }
+        #[cfg(windows)]
+        {
+            vec![
+                "cmd".to_owned(),
+                "/C".to_owned(),
+                format!("type nul > \"{}\"", marker.display()),
+            ]
+        }
+    }
+
+    fn marker_appears(marker: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline && !marker.exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        marker.exists()
+    }
+
+    #[test]
+    fn exec_cmd_empty_command_line_does_not_panic_and_denied_host_command_does_not_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = plugin_env(dir.path().to_path_buf());
+
+        // RunCommands is what lets a plugin reach this host function. The
+        // separate `_allow_exec_host_cmd` flag is what must still refuse a spawn.
+        env.plugin._allow_exec_host_cmd = true;
+        exec_cmd(&env, Vec::new());
+
+        env.plugin._allow_exec_host_cmd = false;
+        exec_cmd(&env, Vec::new());
+
+        let denied = dir.path().join("should-not-exist");
+        exec_cmd(&env, marker_command(&denied));
+        assert!(
+            !marker_appears(&denied, Duration::from_millis(500)),
+            "exec_cmd without _allow_exec_host_cmd must not spawn"
+        );
+
+        let permitted = dir.path().join("should-exist");
+        env.plugin._allow_exec_host_cmd = true;
+        exec_cmd(&env, marker_command(&permitted));
+        assert!(
+            marker_appears(&permitted, Duration::from_secs(2)),
+            "exec_cmd with _allow_exec_host_cmd must spawn"
+        );
+    }
 }
