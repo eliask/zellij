@@ -1,5 +1,7 @@
 use super::{crop_rgba, scale_rgba, KittyGrid, KittyPlacement, KittyVerticalAnchor};
-use crate::panes::kitty_graphics::parser::{DecodedImage, KittyCommand, KittyFormat};
+use crate::panes::kitty_graphics::parser::{
+    DecodedImage, KittyCommand, KittyError, KittyErrorCode, KittyFormat,
+};
 use crate::panes::kitty_graphics::store::KittyImageStore;
 use crate::panes::sixel::PixelRect;
 use std::cell::RefCell;
@@ -381,4 +383,318 @@ fn a_scaled_placement_emits_from_the_origin_of_its_cropped_variant() {
     assert_eq!(placement.emit_y, 0);
     assert_eq!(placement.source_rect.x, 8);
     assert_eq!(placement.source_rect.y, 10);
+}
+
+fn place_scaled(
+    grid: &mut KittyGrid,
+    pane_image_id: u32,
+    internal: super::super::store::InternalImageId,
+    placement_id: u32,
+    columns: u32,
+    rows: u32,
+    source_x: u32,
+    source_w: u32,
+) -> Result<super::super::store::ScaledImageKey, KittyError> {
+    let command = KittyCommand {
+        image_id: Some(pane_image_id),
+        placement_id: Some(placement_id),
+        columns,
+        rows,
+        source_x,
+        source_w,
+        ..Default::default()
+    };
+    // 8×16 pixel cells, small enough that a fitting destination stays in quota.
+    let cell = SizeInPixels {
+        width: 8,
+        height: 16,
+    };
+    grid.place(
+        pane_image_id,
+        internal,
+        &command,
+        (0, 0),
+        cell,
+        KittyVerticalAnchor {
+            canonical_line: 0,
+            offset_px_from_line_start: 0,
+        },
+    )?;
+    Ok(grid
+        .placements()
+        .iter()
+        .find(|placement| placement.placement_id == placement_id)
+        .and_then(|placement| placement.scaled_image())
+        .expect("a scaled placement"))
+}
+
+fn scaled_buffer(
+    grid: &KittyGrid,
+    internal: super::super::store::InternalImageId,
+    key: super::super::store::ScaledImageKey,
+) -> Option<(usize, usize)> {
+    let store = grid.kitty_image_store.borrow();
+    store
+        .scaled_variant(internal, key)
+        .map(|bytes| (bytes.as_ptr() as usize, bytes.len()))
+}
+
+#[test]
+fn repeated_place_at_the_same_cell_size_reuses_the_scaled_buffer() {
+    let mut grid = test_grid();
+    let (pane_image_id, internal) = transmitted(&mut grid, 1, 1);
+    // 4×2 cells at 8×16 px is 32×32.
+    let key = place_scaled(&mut grid, pane_image_id, internal, 1, 4, 2, 0, 0).expect("placed");
+    let (ptr, len) = scaled_buffer(&grid, internal, key).expect("cached scaled raster");
+    assert_eq!(len, 32 * 32 * 4);
+    assert_eq!(grid.kitty_image_store.borrow().scale_count(internal), 1);
+
+    place_scaled(&mut grid, pane_image_id, internal, 1, 4, 2, 0, 0).expect("replaced");
+    let (again_ptr, again_len) =
+        scaled_buffer(&grid, internal, key).expect("the cached raster is still there");
+    assert_eq!(
+        again_ptr, ptr,
+        "the second place must not allocate another scaled buffer"
+    );
+    assert_eq!(again_len, len);
+    assert_eq!(grid.kitty_image_store.borrow().scale_count(internal), 1);
+
+    let other =
+        place_scaled(&mut grid, pane_image_id, internal, 1, 5, 2, 0, 0).expect("other size");
+    assert_ne!(other.size, key.size);
+    assert_eq!(grid.kitty_image_store.borrow().scale_count(internal), 2);
+    let (still_ptr, _) = scaled_buffer(&grid, internal, key).expect("the first size stays cached");
+    assert_eq!(still_ptr, ptr);
+
+    place_scaled(&mut grid, pane_image_id, internal, 1, 4, 2, 0, 0).expect("restored");
+    let (restored_ptr, _) = scaled_buffer(&grid, internal, key).expect("the first size is reused");
+    assert_eq!(restored_ptr, ptr);
+    assert_eq!(grid.kitty_image_store.borrow().scale_count(internal), 2);
+}
+
+#[test]
+fn the_same_destination_size_with_a_different_source_is_scaled_again() {
+    let mut grid = test_grid();
+    let (pane_image_id, internal) = transmitted(&mut grid, 4, 1);
+    let first =
+        place_scaled(&mut grid, pane_image_id, internal, 1, 2, 1, 0, 2).expect("first crop");
+    let second =
+        place_scaled(&mut grid, pane_image_id, internal, 1, 2, 1, 2, 2).expect("second crop");
+    assert_eq!(first.size, second.size);
+    assert_ne!(first.source, second.source);
+    let (first_ptr, first_len) = scaled_buffer(&grid, internal, first).expect("first crop");
+    let (second_ptr, second_len) = scaled_buffer(&grid, internal, second).expect("second crop");
+    assert_eq!(first_len, second_len);
+    assert_ne!(first_ptr, second_ptr);
+    assert_eq!(grid.kitty_image_store.borrow().scale_count(internal), 2);
+}
+
+#[test]
+fn a_new_scaled_size_drops_the_least_recently_used_variant_past_the_cap() {
+    use super::super::store::MAX_SCALED_VARIANTS_PER_IMAGE;
+
+    let mut grid = test_grid();
+    let (pane_image_id, internal) = transmitted(&mut grid, 1, 1);
+    let mut keys = Vec::new();
+    for columns in 1..=MAX_SCALED_VARIANTS_PER_IMAGE as u32 {
+        keys.push(
+            place_scaled(&mut grid, pane_image_id, internal, 1, columns, 1, 0, 0)
+                .expect("a distinct size"),
+        );
+    }
+    assert_eq!(
+        grid.kitty_image_store.borrow().scale_count(internal),
+        MAX_SCALED_VARIANTS_PER_IMAGE as u64
+    );
+    for key in &keys {
+        assert!(grid
+            .kitty_image_store
+            .borrow()
+            .has_scaled_variant(internal, *key));
+    }
+
+    let extra =
+        place_scaled(&mut grid, pane_image_id, internal, 1, 100, 1, 0, 0).expect("past the cap");
+    assert!(
+        !grid
+            .kitty_image_store
+            .borrow()
+            .has_scaled_variant(internal, keys[0]),
+        "the least-recently-used size is the one dropped"
+    );
+    for key in keys.iter().skip(1) {
+        assert!(grid
+            .kitty_image_store
+            .borrow()
+            .has_scaled_variant(internal, *key));
+    }
+    assert!(grid
+        .kitty_image_store
+        .borrow()
+        .has_scaled_variant(internal, extra));
+
+    // Placing columns=2 again refreshes that variant, so the next new size
+    // drops columns=3 instead.
+    place_scaled(&mut grid, pane_image_id, internal, 1, 2, 1, 0, 0).expect("reuse");
+    assert_eq!(
+        grid.kitty_image_store.borrow().scale_count(internal),
+        MAX_SCALED_VARIANTS_PER_IMAGE as u64 + 1,
+        "reusing a stored size must not scale"
+    );
+    let another =
+        place_scaled(&mut grid, pane_image_id, internal, 1, 101, 1, 0, 0).expect("another size");
+    assert!(grid
+        .kitty_image_store
+        .borrow()
+        .has_scaled_variant(internal, keys[1]));
+    assert!(
+        !grid
+            .kitty_image_store
+            .borrow()
+            .has_scaled_variant(internal, keys[2]),
+        "the variant that was not reused is dropped"
+    );
+    assert!(grid
+        .kitty_image_store
+        .borrow()
+        .has_scaled_variant(internal, another));
+}
+
+#[test]
+fn placement_id_zero_is_a_new_placement_that_reuses_the_scaled_raster() {
+    let mut grid = test_grid();
+    let (pane_image_id, internal) = transmitted(&mut grid, 1, 1);
+    let first = place_scaled(&mut grid, pane_image_id, internal, 0, 4, 2, 0, 0).expect("first");
+    let (ptr, _) = scaled_buffer(&grid, internal, first).expect("cached");
+    place_scaled(&mut grid, pane_image_id, internal, 0, 4, 2, 0, 0).expect("second");
+    assert_eq!(grid.placements().len(), 2);
+    assert!(grid
+        .placements()
+        .iter()
+        .all(|placement| placement.placement_id == 0));
+    assert_ne!(
+        grid.placements()[0].placement_uid,
+        grid.placements()[1].placement_uid
+    );
+    let (again_ptr, _) = scaled_buffer(&grid, internal, first).expect("still cached");
+    assert_eq!(again_ptr, ptr);
+    assert_eq!(grid.kitty_image_store.borrow().scale_count(internal), 1);
+}
+
+#[test]
+fn a_cell_size_change_scales_one_shared_destination_once() {
+    let cell_size = Rc::new(RefCell::new(Some(SizeInPixels {
+        width: 10,
+        height: 20,
+    })));
+    let store = Rc::new(RefCell::new(KittyImageStore::default()));
+    let mut grid = KittyGrid::new(cell_size.clone(), store);
+    let (pane_image_id, internal) = transmitted(&mut grid, 4, 4);
+    let cell = SizeInPixels {
+        width: 10,
+        height: 20,
+    };
+    let anchor = KittyVerticalAnchor {
+        canonical_line: 0,
+        offset_px_from_line_start: 0,
+    };
+    let command = KittyCommand {
+        image_id: Some(pane_image_id),
+        columns: 2,
+        rows: 2,
+        ..Default::default()
+    };
+    grid.place(pane_image_id, internal, &command, (0, 0), cell, anchor)
+        .expect("first");
+    grid.place(pane_image_id, internal, &command, (0, 0), cell, anchor)
+        .expect("second");
+    assert_eq!(grid.placements().len(), 2);
+    let before = grid.kitty_image_store.borrow().scale_count(internal);
+    *cell_size.borrow_mut() = Some(SizeInPixels {
+        width: 20,
+        height: 40,
+    });
+    grid.character_cell_size_possibly_changed();
+    assert_eq!(grid.placements().len(), 2);
+    assert_eq!(
+        grid.kitty_image_store.borrow().scale_count(internal),
+        before + 1,
+        "two placements of one destination must share one regenerated raster"
+    );
+}
+
+fn refused_key(width: usize, height: usize) -> super::super::store::ScaledImageKey {
+    super::super::store::ScaledImageKey {
+        source: PixelRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        },
+        size: (width, height),
+    }
+}
+
+#[test]
+fn a_destination_the_store_cannot_retain_is_refused_before_scaling() {
+    let mut grid = test_grid();
+    let (pane_image_id, internal) = transmitted(&mut grid, 1, 1);
+    let retained = grid.kitty_image_store.borrow().total_bytes();
+    let max = grid
+        .kitty_image_store
+        .borrow()
+        .max_synchronous_scaled_bytes(internal);
+    // 640×320 cells at 8×16 px is 5120×5120 RGBA, about 100 MiB.
+    assert!(
+        5120 * 5120 * 4 > max,
+        "the review destination must be over the retained share ({max} bytes)"
+    );
+    let scales_before = grid.kitty_image_store.borrow().scale_count(internal);
+
+    for _ in 0..2 {
+        let error = place_scaled(&mut grid, pane_image_id, internal, 1, 640, 320, 0, 0)
+            .expect_err("a destination the store cannot retain");
+        assert_eq!(error.code, KittyErrorCode::Einval);
+    }
+    assert_eq!(
+        grid.kitty_image_store.borrow().scale_count(internal),
+        scales_before,
+        "the same refused key must not scale again"
+    );
+    assert!(grid
+        .kitty_image_store
+        .borrow()
+        .scale_was_refused(internal, refused_key(5120, 5120)));
+    assert!(grid
+        .kitty_image_store
+        .borrow()
+        .scaled_variant(internal, refused_key(5120, 5120))
+        .is_none());
+    assert_eq!(grid.kitty_image_store.borrow().total_bytes(), retained);
+    assert!(grid.placements().is_empty());
+
+    for columns in 637u32..=640 {
+        place_scaled(&mut grid, pane_image_id, internal, 1, columns, 320, 0, 0)
+            .expect_err("a cycling destination the store cannot retain");
+        place_scaled(&mut grid, pane_image_id, internal, 1, columns, 320, 0, 0)
+            .expect_err("the refused key is remembered");
+    }
+    assert_eq!(
+        grid.kitty_image_store.borrow().scale_count(internal),
+        scales_before
+    );
+    assert_eq!(grid.kitty_image_store.borrow().total_bytes(), retained);
+
+    // The refusal did not spend the quota: a destination inside the share still lands.
+    let key =
+        place_scaled(&mut grid, pane_image_id, internal, 1, 4, 2, 0, 0).expect("a small place");
+    assert_eq!(
+        scaled_buffer(&grid, internal, key).expect("cached").1,
+        32 * 32 * 4
+    );
+    assert!(grid.kitty_image_store.borrow().total_bytes() > retained);
+    assert_eq!(
+        grid.kitty_image_store.borrow().scale_count(internal),
+        scales_before + 1
+    );
 }

@@ -1,5 +1,7 @@
 use base64::engine::general_purpose::STANDARD as BASE64_ENCODER;
 use base64::engine::Engine as _;
+#[cfg(test)]
+use std::cell::Cell;
 use std::io::Write;
 
 use super::parser::{DecodedImage, KittyError, KittyErrorCode, KittyFormat};
@@ -7,6 +9,12 @@ use crate::panes::sixel::PixelRect;
 use std::collections::HashMap;
 
 pub const DEFAULT_KITTY_STORE_QUOTA_BYTES: usize = 335_544_320;
+/// Distinct scaled rasters kept for one image (one source rectangle at one
+/// destination pixel size each). Storing another past this drops the
+/// least-recently-used other variant of that image. The byte quota can drop
+/// variants sooner. Replacing a stored variant does not grow the set. A
+/// remembered refusal occupies a slot but is not a raster.
+pub(crate) const MAX_SCALED_VARIANTS_PER_IMAGE: usize = 4;
 
 pub type InternalImageId = u64;
 
@@ -21,7 +29,15 @@ pub struct KittyImage {
     pub rgba: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    pub scaled_variants: HashMap<ScaledImageKey, Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct ScaledVariant {
+    bytes: Vec<u8>,
+    lru_stamp: u64,
+    /// The destination was refused. `bytes` is empty; the entry only stops
+    /// the same key from being scaled again. It still occupies a variant slot.
+    refused: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -29,7 +45,12 @@ struct StoredImage {
     image: KittyImage,
     refcount: usize,
     lru_stamp: u64,
+    scaled_variants: HashMap<ScaledImageKey, ScaledVariant>,
     base64_cache: HashMap<(Option<ScaledImageKey>, bool), String>,
+    /// Successful `scale_rgba` calls for this image. Reusing a stored size
+    /// does not increment it.
+    #[cfg(test)]
+    scale_count: Cell<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,11 +119,13 @@ impl KittyImageStore {
                     rgba,
                     width,
                     height,
-                    scaled_variants: HashMap::new(),
                 },
                 refcount: 0,
                 lru_stamp,
+                scaled_variants: HashMap::new(),
                 base64_cache: HashMap::new(),
+                #[cfg(test)]
+                scale_count: Cell::new(0),
             },
         );
         self.total_bytes += size;
@@ -111,11 +134,100 @@ impl KittyImageStore {
     pub fn get(&self, id: InternalImageId) -> Option<&KittyImage> {
         self.images.get(&id).map(|stored| &stored.image)
     }
+    /// Pure cache lookup. A remembered refusal is not a stored raster.
+    pub fn has_scaled_variant(&self, id: InternalImageId, key: ScaledImageKey) -> bool {
+        self.images
+            .get(&id)
+            .and_then(|stored| stored.scaled_variants.get(&key))
+            .is_some_and(|variant| !variant.refused)
+    }
     pub fn scaled_variant(&self, id: InternalImageId, key: ScaledImageKey) -> Option<&[u8]> {
         self.images
             .get(&id)
-            .and_then(|stored| stored.image.scaled_variants.get(&key))
-            .map(|bytes| bytes.as_slice())
+            .and_then(|stored| stored.scaled_variants.get(&key))
+            .filter(|variant| !variant.refused)
+            .map(|variant| variant.bytes.as_slice())
+    }
+    pub(crate) fn scale_was_refused(&self, id: InternalImageId, key: ScaledImageKey) -> bool {
+        self.images
+            .get(&id)
+            .and_then(|stored| stored.scaled_variants.get(&key))
+            .is_some_and(|variant| variant.refused)
+    }
+    /// Quota share for one scaled raster: four of these, plus the base image, fit.
+    pub(crate) fn max_synchronous_scaled_bytes(&self, id: InternalImageId) -> usize {
+        let image_bytes = self
+            .images
+            .get(&id)
+            .map(|stored| stored.image.rgba.len())
+            .unwrap_or(0);
+        self.quota_bytes.saturating_sub(image_bytes) / MAX_SCALED_VARIANTS_PER_IMAGE
+    }
+    pub(crate) fn scaled_bytes_are_retainable(
+        &self,
+        id: InternalImageId,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .is_some_and(|bytes| bytes <= self.max_synchronous_scaled_bytes(id))
+    }
+    /// Remember a destination that must not be scaled. The marker is not a raster.
+    pub(crate) fn remember_refused_scale(&mut self, id: InternalImageId, key: ScaledImageKey) {
+        if self.scale_was_refused(id, key) || self.has_scaled_variant(id, key) {
+            self.touch_scaled_variant(id, key);
+            return;
+        }
+        let lru_stamp = self.bump_lru();
+        let inserted = self.images.get_mut(&id).is_some_and(|stored| {
+            stored.lru_stamp = lru_stamp;
+            stored.scaled_variants.insert(
+                key,
+                ScaledVariant {
+                    bytes: Vec::new(),
+                    lru_stamp,
+                    refused: true,
+                },
+            );
+            true
+        });
+        if inserted {
+            self.drop_scaled_variants_over_cap(id, key);
+        }
+    }
+    /// Mark a stored variant recently used without copying or rescaling it.
+    pub(crate) fn touch_scaled_variant(&mut self, id: InternalImageId, key: ScaledImageKey) {
+        let present = self
+            .images
+            .get(&id)
+            .is_some_and(|stored| stored.scaled_variants.contains_key(&key));
+        if !present {
+            return;
+        }
+        let stamp = self.bump_lru();
+        if let Some(stored) = self.images.get_mut(&id) {
+            stored.lru_stamp = stamp;
+            if let Some(variant) = stored.scaled_variants.get_mut(&key) {
+                variant.lru_stamp = stamp;
+            }
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn note_scale(&self, id: InternalImageId) {
+        if let Some(stored) = self.images.get(&id) {
+            stored
+                .scale_count
+                .set(stored.scale_count.get().saturating_add(1));
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn scale_count(&self, id: InternalImageId) -> u64 {
+        self.images
+            .get(&id)
+            .map(|stored| stored.scale_count.get())
+            .unwrap_or(0)
     }
     pub fn touch(&mut self, id: InternalImageId) {
         let lru_stamp = self.bump_lru();
@@ -158,8 +270,14 @@ impl KittyImageStore {
             return Some(cached.clone());
         }
         let bytes = match variant {
-            Some(key) => stored.image.scaled_variants.get(&key)?,
-            None => &stored.image.rgba,
+            Some(key) => {
+                let cached = stored.scaled_variants.get(&key)?;
+                if cached.refused {
+                    return None;
+                }
+                cached.bytes.as_slice()
+            },
+            None => stored.image.rgba.as_slice(),
         };
         let encoded = if compressed {
             let mut encoder = flate2::write::ZlibEncoder::new(
@@ -185,10 +303,16 @@ impl KittyImageStore {
             Some(stored) => {
                 let new_len = bytes.len();
                 let old_len = stored
-                    .image
                     .scaled_variants
-                    .insert(key, bytes)
-                    .map(|old| old.len())
+                    .insert(
+                        key,
+                        ScaledVariant {
+                            bytes,
+                            lru_stamp,
+                            refused: false,
+                        },
+                    )
+                    .map(|old| old.bytes.len())
                     .unwrap_or(0);
                 stored
                     .base64_cache
@@ -200,6 +324,7 @@ impl KittyImageStore {
         };
         if let Some((old_len, new_len)) = inserted {
             self.total_bytes = self.total_bytes - old_len + new_len;
+            self.drop_scaled_variants_over_cap(id, key);
             if self.total_bytes > self.quota_bytes {
                 self.evict_to_fit(0, Some(id));
             }
@@ -217,20 +342,59 @@ impl KittyImageStore {
         let existing = self
             .images
             .get(&id)
-            .and_then(|stored| stored.image.scaled_variants.get(&key))
-            .map(|variant| variant.len())
+            .and_then(|stored| stored.scaled_variants.get(&key))
+            .filter(|variant| !variant.refused)
+            .map(|variant| variant.bytes.len())
             .unwrap_or(0);
         let incoming = bytes.saturating_sub(existing);
         self.evict_to_fit(incoming, Some(id));
         self.total_bytes + incoming <= self.quota_bytes
     }
+    /// Drop least-recently-used variants of `id` other than `keep` until the
+    /// per-image cap holds. `keep` is the variant just stored.
+    fn drop_scaled_variants_over_cap(&mut self, id: InternalImageId, keep: ScaledImageKey) {
+        while self
+            .images
+            .get(&id)
+            .is_some_and(|stored| stored.scaled_variants.len() > MAX_SCALED_VARIANTS_PER_IMAGE)
+        {
+            let victim = self.images.get(&id).and_then(|stored| {
+                stored
+                    .scaled_variants
+                    .iter()
+                    .filter(|(key, _)| **key != keep)
+                    .min_by_key(|(_, variant)| variant.lru_stamp)
+                    .map(|(key, _)| *key)
+            });
+            let Some(victim) = victim else {
+                break;
+            };
+            self.discard_scaled_variant(id, victim);
+        }
+    }
+    fn discard_scaled_variant(&mut self, id: InternalImageId, key: ScaledImageKey) {
+        let freed = match self.images.get_mut(&id) {
+            Some(stored) => {
+                let freed = stored
+                    .scaled_variants
+                    .remove(&key)
+                    .map(|variant| variant.bytes.len())
+                    .unwrap_or(0);
+                stored
+                    .base64_cache
+                    .retain(|(cached_variant, _), _| *cached_variant != Some(key));
+                freed
+            },
+            None => 0,
+        };
+        self.total_bytes = self.total_bytes.saturating_sub(freed);
+    }
     pub fn clear_scaled_variants(&mut self, id: InternalImageId) {
         if let Some(stored) = self.images.get_mut(&id) {
             self.total_bytes -= stored
-                .image
                 .scaled_variants
                 .drain()
-                .map(|(_, bytes)| bytes.len())
+                .map(|(_, variant)| variant.bytes.len())
                 .sum::<usize>();
             stored
                 .base64_cache
@@ -253,10 +417,9 @@ impl KittyImageStore {
     fn stored_image_bytes(stored: &StoredImage) -> usize {
         stored.image.rgba.len()
             + stored
-                .image
                 .scaled_variants
                 .values()
-                .map(|bytes| bytes.len())
+                .map(|variant| variant.bytes.len())
                 .sum::<usize>()
     }
     fn remove_entry(&mut self, id: InternalImageId) {

@@ -169,3 +169,39 @@ fn rgb24_images_are_normalized_to_rgba_at_store_time() {
     );
     assert_eq!(store.total_bytes(), 16);
 }
+
+#[test]
+fn dropping_a_variant_past_the_cap_returns_its_bytes_to_the_quota() {
+    use super::MAX_SCALED_VARIANTS_PER_IMAGE;
+
+    let mut store = KittyImageStore::with_quota(1000);
+    let pinned = store.store_image(rgba_image(10, 10)).unwrap();
+    store.add_placement_ref(pinned);
+    let key = |n: usize| super::ScaledImageKey {
+        source: crate::panes::sixel::PixelRect::new(0, 0, 10, 10),
+        size: (n, 1),
+    };
+    for n in 1..=MAX_SCALED_VARIANTS_PER_IMAGE {
+        store.add_scaled_variant(pinned, key(n), vec![0; 100]);
+    }
+    assert_eq!(
+        store.total_bytes(),
+        400 + 100 * MAX_SCALED_VARIANTS_PER_IMAGE
+    );
+    store.add_scaled_variant(pinned, key(MAX_SCALED_VARIANTS_PER_IMAGE + 1), vec![0; 100]);
+    assert!(
+        !store.has_scaled_variant(pinned, key(1)),
+        "the oldest variant is dropped"
+    );
+    assert!(store.has_scaled_variant(pinned, key(MAX_SCALED_VARIANTS_PER_IMAGE + 1)));
+    assert_eq!(
+        store.total_bytes(),
+        400 + 100 * MAX_SCALED_VARIANTS_PER_IMAGE
+    );
+    // 200 bytes fit only because the dropped variant released its 100.
+    let admitted = store
+        .store_image(rgba_image(10, 5))
+        .expect("quota recovered");
+    assert!(store.get(admitted).is_some());
+    assert_eq!(store.total_bytes(), 1000);
+}

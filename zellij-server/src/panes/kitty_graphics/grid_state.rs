@@ -348,44 +348,83 @@ impl KittyGrid {
                 source: source_rect,
                 size: (dst_w, dst_h),
             };
-            let fits = dst_w
-                .checked_mul(dst_h)
-                .and_then(|pixels| pixels.checked_mul(4))
-                .map(|bytes| {
-                    self.kitty_image_store.borrow_mut().reserve_scaled_variant(
-                        internal,
-                        variant_key,
-                        bytes,
-                    )
-                })
-                .unwrap_or(false);
-            if !fits {
+            // Same source rectangle and destination pixel size: keep the
+            // stored raster. A different size or crop is scaled once below.
+            // At most `MAX_SCALED_VARIANTS_PER_IMAGE` variants are kept per
+            // image; a new one drops the least-recently-used other variant.
+            if self
+                .kitty_image_store
+                .borrow()
+                .scale_was_refused(internal, variant_key)
+            {
+                self.kitty_image_store
+                    .borrow_mut()
+                    .touch_scaled_variant(internal, variant_key);
                 return Err(einval(command, "placement too large"));
             }
-            let scaled_bytes = {
-                let store = self.kitty_image_store.borrow();
-                let image = store
-                    .get(internal)
-                    .ok_or_else(|| enoent(command, "unknown image id"))?;
-                let cropped = crop_rgba(
-                    &image.rgba,
-                    image_width,
-                    image_height,
-                    source_x,
-                    source_y,
-                    source_w,
-                    source_h,
+            let expected_len = dst_w
+                .checked_mul(dst_h)
+                .and_then(|pixels| pixels.checked_mul(4));
+            let already_scaled = expected_len.is_some_and(|expected_len| {
+                self.kitty_image_store
+                    .borrow()
+                    .scaled_variant(internal, variant_key)
+                    .is_some_and(|bytes| bytes.len() == expected_len)
+            });
+            if already_scaled {
+                self.kitty_image_store
+                    .borrow_mut()
+                    .touch_scaled_variant(internal, variant_key);
+            } else if !self
+                .kitty_image_store
+                .borrow()
+                .scaled_bytes_are_retainable(internal, dst_w, dst_h)
+            {
+                // The raster would not survive next to the other variants this
+                // image is allowed to keep. Refuse before allocating it.
+                self.kitty_image_store
+                    .borrow_mut()
+                    .remember_refused_scale(internal, variant_key);
+                return Err(einval(command, "placement too large"));
+            } else {
+                let fits = expected_len
+                    .map(|bytes| {
+                        self.kitty_image_store.borrow_mut().reserve_scaled_variant(
+                            internal,
+                            variant_key,
+                            bytes,
+                        )
+                    })
+                    .unwrap_or(false);
+                if !fits {
+                    return Err(einval(command, "placement too large"));
+                }
+                let scaled_bytes = {
+                    let store = self.kitty_image_store.borrow();
+                    let image = store
+                        .get(internal)
+                        .ok_or_else(|| enoent(command, "unknown image id"))?;
+                    let cropped = crop_rgba(
+                        &image.rgba,
+                        image_width,
+                        image_height,
+                        source_x,
+                        source_y,
+                        source_w,
+                        source_h,
+                    );
+                    scale_rgba(&cropped, source_w, source_h, dst_w, dst_h)
+                };
+                #[cfg(test)]
+                if !scaled_bytes.is_empty() {
+                    self.kitty_image_store.borrow().note_scale(internal);
+                }
+                self.kitty_image_store.borrow_mut().add_scaled_variant(
+                    internal,
+                    variant_key,
+                    scaled_bytes,
                 );
-                scale_rgba(&cropped, source_w, source_h, dst_w, dst_h)
-            };
-            self.kitty_image_store.borrow_mut().add_scaled_variant(
-                internal,
-                ScaledImageKey {
-                    source: source_rect,
-                    size: (dst_w, dst_h),
-                },
-                scaled_bytes,
-            );
+            }
         }
         let display_rect = PixelRect {
             x: cursor_px.0 + off_x,
@@ -888,7 +927,40 @@ impl KittyGrid {
                             .push((placement.internal_id, placement.scaled_image().unwrap()));
                     }
                 }
+                // A new cell size can push a scaled placement past the size
+                // the store can retain. Drop that placement instead of
+                // allocating a raster that cannot be kept.
+                let mut store = self.kitty_image_store.borrow_mut();
+                self.placements.retain(|placement| {
+                    let oversized = placement.scaled_px.is_some_and(|(width, height)| {
+                        !store.scaled_bytes_are_retainable(placement.internal_id, width, height)
+                    });
+                    if oversized {
+                        store.free(placement.internal_id);
+                    }
+                    !oversized
+                });
+                drop(store);
+                regenerations.retain(|(internal, key)| {
+                    self.kitty_image_store
+                        .borrow()
+                        .scaled_bytes_are_retainable(*internal, key.size.0, key.size.1)
+                });
                 for (internal, key) in regenerations {
+                    let expected_len = key
+                        .size
+                        .0
+                        .checked_mul(key.size.1)
+                        .and_then(|pixels| pixels.checked_mul(4));
+                    let already_scaled = expected_len.is_some_and(|expected_len| {
+                        self.kitty_image_store
+                            .borrow()
+                            .scaled_variant(internal, key)
+                            .is_some_and(|bytes| bytes.len() == expected_len)
+                    });
+                    if already_scaled {
+                        continue;
+                    }
                     let source_rect = key.source;
                     let scaled_bytes = {
                         let store = self.kitty_image_store.borrow();
@@ -914,7 +986,9 @@ impl KittyGrid {
                             None => None,
                         }
                     };
-                    if let Some(scaled_bytes) = scaled_bytes {
+                    if let Some(scaled_bytes) = scaled_bytes.filter(|bytes| !bytes.is_empty()) {
+                        #[cfg(test)]
+                        self.kitty_image_store.borrow().note_scale(internal);
                         self.kitty_image_store.borrow_mut().add_scaled_variant(
                             internal,
                             key,
