@@ -1,4 +1,4 @@
-use crate::plugins::plugin_worker::MessageToWorker;
+use crate::plugins::plugin_worker::PluginWorkerHandle;
 use crate::plugins::PluginId;
 use std::io::Write;
 use std::{
@@ -14,7 +14,6 @@ use wasmi_wasi::WasiCtx;
 
 use crate::{thread_bus::ThreadSenders, ClientId, SharedKeybinds};
 
-use tokio::sync::mpsc::UnboundedSender;
 use zellij_utils::{
     data::InputMode,
     data::{Event, EventType, RenderResponse, SlotKind},
@@ -33,7 +32,7 @@ pub type PluginKey = (PluginId, ClientId);
 pub type PluginAssets = (
     Arc<Mutex<RunningPlugin>>,
     Arc<Mutex<Subscriptions>>,
-    HashMap<String, UnboundedSender<MessageToWorker>>,
+    HashMap<String, PluginWorkerHandle>,
 );
 pub type RemovedPluginAssets = HashMap<PluginKey, PluginAssets>;
 
@@ -211,7 +210,7 @@ impl PluginMap {
         plugin_id: PluginId,
         client_id: ClientId,
         worker_name: &str,
-    ) -> Option<UnboundedSender<MessageToWorker>> {
+    ) -> Option<PluginWorkerHandle> {
         if let Some((_, _, workers)) = self.shared_assets.get(&plugin_id) {
             return workers.get(&format!("{}_worker", worker_name)).cloned();
         }
@@ -300,7 +299,7 @@ impl PluginMap {
         client_id: ClientId,
         running_plugin: Arc<Mutex<RunningPlugin>>,
         subscriptions: Arc<Mutex<Subscriptions>>,
-        running_workers: HashMap<String, UnboundedSender<MessageToWorker>>,
+        running_workers: HashMap<String, PluginWorkerHandle>,
     ) {
         self.plugin_assets.insert(
             (plugin_id, client_id),

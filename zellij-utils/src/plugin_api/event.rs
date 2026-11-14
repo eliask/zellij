@@ -391,6 +391,18 @@ impl TryFrom<ProtobufEvent> for Event {
                 },
                 _ => Err("Malformed payload for the file system update Event"),
             },
+            Some(ProtobufEventType::FileSystemUpdateIncomplete) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::FileListIncompletePayload(file_list_payload)) => {
+                    let file_paths = file_list_payload
+                        .paths
+                        .iter()
+                        .zip(file_list_payload.paths_metadata.iter())
+                        .map(|(p, m)| (PathBuf::from(p), m.into()))
+                        .collect();
+                    Ok(Event::FileSystemUpdateIncomplete(file_paths))
+                },
+                _ => Err("Malformed payload for the file system update incomplete Event"),
+            },
             Some(ProtobufEventType::FileSystemDelete) => match protobuf_event.payload {
                 Some(ProtobufEventPayload::FileListPayload(file_list_payload)) => {
                     let file_paths = file_list_payload
@@ -1245,6 +1257,22 @@ impl TryFrom<Event> for ProtobufEvent {
                 Ok(ProtobufEvent {
                     name: ProtobufEventType::FileSystemUpdate as i32,
                     payload: Some(event::Payload::FileListPayload(file_list_payload)),
+                })
+            },
+            Event::FileSystemUpdateIncomplete(event_paths) => {
+                let mut paths = vec![];
+                let mut paths_metadata = vec![];
+                for (path, path_metadata) in event_paths {
+                    paths.push(path.display().to_string());
+                    paths_metadata.push(path_metadata.into());
+                }
+                let file_list_payload = FileListIncompletePayload {
+                    paths,
+                    paths_metadata,
+                };
+                Ok(ProtobufEvent {
+                    name: ProtobufEventType::FileSystemUpdateIncomplete as i32,
+                    payload: Some(event::Payload::FileListIncompletePayload(file_list_payload)),
                 })
             },
             Event::FileSystemDelete(event_paths) => {
@@ -2926,6 +2954,7 @@ impl TryFrom<ProtobufEventType> for EventType {
             ProtobufEventType::FileSystemCreate => EventType::FileSystemCreate,
             ProtobufEventType::FileSystemRead => EventType::FileSystemRead,
             ProtobufEventType::FileSystemUpdate => EventType::FileSystemUpdate,
+            ProtobufEventType::FileSystemUpdateIncomplete => EventType::FileSystemUpdateIncomplete,
             ProtobufEventType::FileSystemDelete => EventType::FileSystemDelete,
             ProtobufEventType::PermissionRequestResult => EventType::PermissionRequestResult,
             ProtobufEventType::SessionUpdate => EventType::SessionUpdate,
@@ -3006,6 +3035,7 @@ impl TryFrom<EventType> for ProtobufEventType {
             EventType::FileSystemCreate => ProtobufEventType::FileSystemCreate,
             EventType::FileSystemRead => ProtobufEventType::FileSystemRead,
             EventType::FileSystemUpdate => ProtobufEventType::FileSystemUpdate,
+            EventType::FileSystemUpdateIncomplete => ProtobufEventType::FileSystemUpdateIncomplete,
             EventType::FileSystemDelete => ProtobufEventType::FileSystemDelete,
             EventType::PermissionRequestResult => ProtobufEventType::PermissionRequestResult,
             EventType::SessionUpdate => ProtobufEventType::SessionUpdate,
@@ -3628,6 +3658,43 @@ fn serialize_file_system_update_event() {
         file_system_event, deserialized_event,
         "Event properly serialized/deserialized without change"
     );
+}
+
+#[test]
+fn serialize_file_system_update_incomplete_event() {
+    use prost::Message;
+    let file_system_event = Event::FileSystemUpdateIncomplete(vec![
+        ("/host/partial".into(), None),
+        ("./relative_path".into(), Some(Default::default())),
+    ]);
+    let protobuf_event: ProtobufEvent = file_system_event.clone().try_into().unwrap();
+    assert_eq!(
+        protobuf_event.name,
+        ProtobufEventType::FileSystemUpdateIncomplete as i32
+    );
+    assert_eq!(ProtobufEventType::FileSystemUpdateIncomplete as i32, 74);
+    let serialized_protobuf_event = protobuf_event.encode_to_vec();
+    let deserialized_protobuf_event: ProtobufEvent =
+        Message::decode(serialized_protobuf_event.as_slice()).unwrap();
+    let deserialized_event: Event = deserialized_protobuf_event.try_into().unwrap();
+    assert_eq!(
+        file_system_event, deserialized_event,
+        "Event properly serialized/deserialized without change"
+    );
+    let (guest_event, _) = plugin_event_from_protobuf_bytes(&serialized_protobuf_event)
+        .expect("a current guest decodes an incomplete listing");
+    assert_eq!(guest_event, file_system_event);
+
+    let fitting = Event::FileSystemUpdate(vec![("/host/complete".into(), None)]);
+    let fitting_protobuf: ProtobufEvent = fitting.clone().try_into().unwrap();
+    assert_eq!(
+        fitting_protobuf.name,
+        ProtobufEventType::FileSystemUpdate as i32
+    );
+    let fitting_bytes = fitting_protobuf.encode_to_vec();
+    let (decoded_fitting, _) = plugin_event_from_protobuf_bytes(&fitting_bytes)
+        .expect("a fitting listing stays a complete FileSystemUpdate");
+    assert_eq!(decoded_fitting, fitting);
 }
 
 #[test]

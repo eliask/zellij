@@ -18,7 +18,6 @@ use crate::plugins::shared::{
 };
 use zellij_utils::prompt::PromptResult;
 
-use crate::plugins::plugin_worker::MessageToWorker;
 use crate::plugins::shared::SharedEventBatchEntry;
 use crate::plugins::watch_filesystem::watch_filesystem;
 use crate::plugins::zellij_exports::{wasi_read_string, wasi_write_object};
@@ -694,7 +693,7 @@ impl WasmBridge {
 
             // Send worker exit messages
             for (_worker_name, worker_sender) in workers {
-                drop(worker_sender.send(MessageToWorker::Exit));
+                worker_sender.retire();
             }
 
             self.plugin_executor.execute_plugin_unload(
@@ -1068,6 +1067,9 @@ impl WasmBridge {
                                         "render",
                                     )
                                     .and_then(|render| {
+                                        crate::plugins::shared::refuel_for_callback(
+                                            &mut running_plugin.store,
+                                        );
                                         render.call(
                                             &mut running_plugin.store,
                                             (new_rows as i32, new_columns as i32),
@@ -1613,7 +1615,7 @@ impl WasmBridge {
             );
 
             for (_worker_name, worker_sender) in workers {
-                drop(worker_sender.send(MessageToWorker::Exit));
+                worker_sender.retire();
             }
 
             self.plugin_executor.execute_for_plugin(plugin_id, {
@@ -2242,9 +2244,9 @@ impl WasmBridge {
         match worker {
             Some(worker) => {
                 for (message, payload) in messages.drain(..) {
-                    if let Err(e) = worker.send(MessageToWorker::Message(message, payload)) {
-                        log::error!("Failed to send message to worker: {:?}", e);
-                    }
+                    // A full queue rejects the message. It is not appended to the unbounded
+                    // cache, which is only for workers that are not running yet.
+                    let _ = worker.try_post(message, payload);
                 }
             },
             None => {
@@ -3662,6 +3664,7 @@ pub fn apply_event_to_plugin(
                         .with_context(err_context)?;
                     wasi_write_object(running_plugin.store.data(), &protobuf_event.encode_to_vec())
                         .with_context(err_context)?;
+                    crate::plugins::shared::refuel_for_callback(&mut running_plugin.store);
                     let should_render = update
                         .call(&mut running_plugin.store, ())
                         .with_context(err_context)?;
@@ -3680,6 +3683,9 @@ pub fn apply_event_to_plugin(
                         let rendered_bytes = instance
                             .get_typed_func::<(i32, i32), ()>(&mut running_plugin.store, "render")
                             .and_then(|render| {
+                                crate::plugins::shared::refuel_for_callback(
+                                    &mut running_plugin.store,
+                                );
                                 render
                                     .call(&mut running_plugin.store, (rows as i32, columns as i32))
                             })
@@ -3762,6 +3768,7 @@ pub fn apply_before_close_event_to_plugin(
         .with_context(err_context)?;
     wasi_write_object(running_plugin.store.data(), &protobuf_event.encode_to_vec())
         .with_context(err_context)?;
+    crate::plugins::shared::refuel_for_callback(&mut running_plugin.store);
     let _should_render = update
         .call(&mut running_plugin.store, ())
         .with_context(err_context)?;

@@ -39,6 +39,7 @@ impl ZellijPlugin for State {
             EventType::CustomMessage,
             EventType::Timer,
             EventType::FileSystemUpdate,
+            EventType::FileSystemUpdateIncomplete,
             EventType::HostFolderChanged,
             EventType::PermissionRequestResult,
         ]);
@@ -65,7 +66,7 @@ impl ZellijPlugin for State {
     fn update(&mut self, event: Event) -> bool {
         let mut should_render = false;
         match event {
-            Event::FileSystemUpdate(paths) => {
+            Event::FileSystemUpdate(paths) | Event::FileSystemUpdateIncomplete(paths) => {
                 self.update_files(paths);
                 should_render = true;
             },

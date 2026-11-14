@@ -111,13 +111,9 @@ pub fn watch_filesystem(
                     ));
                 }
                 if !update_paths.is_empty() {
-                    updates.push((
-                        None,
-                        None,
-                        Event::FileSystemUpdate(
-                            update_paths.into_iter().map(|p| (p, None)).collect(),
-                        ),
-                    ));
+                    let entries = update_paths.into_iter().map(|p| (p, None)).collect();
+                    let event = super::plugin_loader::filesystem_listing_event(entries, false);
+                    updates.push((None, None, event));
                 }
                 if !delete_paths.is_empty() {
                     updates.push((

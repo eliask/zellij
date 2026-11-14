@@ -6430,7 +6430,9 @@ fn reload_config_file(session_data: &Arc<RwLock<Option<SessionMetaData>>>) {
 
 pub fn get_engine() -> Engine {
     log::info!("Loading plugins using Wasmi interpreter");
-    Engine::default()
+    let mut config = wasmi::Config::default();
+    config.consume_fuel(true);
+    Engine::new(&config)
 }
 
 // TODO: move elsewhere

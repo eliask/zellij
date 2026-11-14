@@ -3,7 +3,7 @@ use crate::background_jobs::BackgroundJob;
 use crate::plugins::pipes::{pipes_to_block_or_unblock, PipeStateChange};
 use crate::plugins::plugin_loader::PluginLoader;
 use crate::plugins::plugin_map::{PluginMap, RunningPlugin, SharedSlot, Subscriptions};
-use crate::plugins::plugin_worker::MessageToWorker;
+
 use crate::plugins::wasm_bridge::{
     check_event_permission, handle_plugin_crash, handle_plugin_loading_failure,
     handle_plugin_successful_loading, subscription_event_type, LoadingContext, PluginCache,
@@ -104,6 +104,39 @@ pub fn wasm_module_exports_function(bytes: &[u8], name: &str) -> bool {
     false
 }
 
+/// Fuel budget granted to each WASM plugin callback. A runaway or
+/// nonterminating callback exhausts it and traps instead of holding
+/// its executor thread forever. Engines without fuel metering (test
+/// fixtures) ignore the refuel.
+pub const PLUGIN_CALLBACK_FUEL_BUDGET: u64 = 1_000_000_000;
+
+/// Whether a callback failed because it ran out of its fuel budget, as opposed to an ordinary
+/// failure. Contexts around the trap do not hide it.
+pub fn is_out_of_fuel(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<wasmi::Error>()
+            .and_then(|wasm_error| wasm_error.as_trap_code())
+            == Some(wasmi::TrapCode::OutOfFuel)
+    })
+}
+
+pub fn refuel_for_callback<T>(store: &mut wasmi::Store<T>) {
+    let _ = store.set_fuel(PLUGIN_CALLBACK_FUEL_BUDGET);
+}
+
+/// Instantiate a plugin module with a fresh callback budget. A new store
+/// starts with no fuel, so a module with a WebAssembly start section
+/// would otherwise trap during instantiation on a metering engine.
+pub fn instantiate_metered<T>(
+    linker: &wasmi::Linker<T>,
+    store: &mut wasmi::Store<T>,
+    module: &wasmi::Module,
+) -> std::result::Result<wasmi::Instance, wasmi::Error> {
+    refuel_for_callback(store);
+    linker.instantiate_and_start(store, module)
+}
+
 fn set_call_context(
     running_plugin: &mut RunningPlugin,
     slot_id: Option<PluginId>,
@@ -122,6 +155,7 @@ fn clear_call_context(running_plugin: &mut RunningPlugin) {
 }
 
 fn call_with_i32(running_plugin: &mut RunningPlugin, name: &str, value: i32) -> Result<()> {
+    refuel_for_callback(&mut running_plugin.store);
     let instance = running_plugin.instance.clone();
     instance
         .get_typed_func::<i32, ()>(&mut running_plugin.store, name)
@@ -131,6 +165,7 @@ fn call_with_i32(running_plugin: &mut RunningPlugin, name: &str, value: i32) -> 
 }
 
 fn call_without_args(running_plugin: &mut RunningPlugin, name: &str) -> Result<()> {
+    refuel_for_callback(&mut running_plugin.store);
     let instance = running_plugin.instance.clone();
     instance
         .get_typed_func::<(), ()>(&mut running_plugin.store, name)
@@ -140,6 +175,7 @@ fn call_without_args(running_plugin: &mut RunningPlugin, name: &str) -> Result<(
 }
 
 fn call_returning_i32(running_plugin: &mut RunningPlugin, name: &str) -> Result<i32> {
+    refuel_for_callback(&mut running_plugin.store);
     let instance = running_plugin.instance.clone();
     instance
         .get_typed_func::<(), i32>(&mut running_plugin.store, name)
@@ -319,6 +355,7 @@ pub fn render_targets(
             continue;
         };
         set_call_context(running_plugin, Some(*slot_id), Some(*client_id), true);
+        refuel_for_callback(&mut running_plugin.store);
         let instance = running_plugin.instance.clone();
         let result = instance
             .get_typed_func::<(i32, i32, i32, i32), ()>(&mut running_plugin.store, "shared_render")
@@ -638,7 +675,7 @@ fn tear_down_instance(
         return;
     };
     for (_worker_name, worker_sender) in workers {
-        drop(worker_sender.send(MessageToWorker::Exit));
+        worker_sender.retire();
     }
     let needs_before_close = subscriptions
         .lock()
@@ -793,7 +830,7 @@ pub fn start_instance_job(
     let previous_visible_slots = match previous {
         Some((running_plugin, _subscriptions, workers)) => {
             for (_worker_name, worker_sender) in workers {
-                drop(worker_sender.send(MessageToWorker::Exit));
+                worker_sender.retire();
             }
             let running_plugin = running_plugin.lock().unwrap();
             match running_plugin.store.data().shared.as_ref() {
@@ -914,5 +951,88 @@ mod tests {
             b"not a wasm module",
             SHARED_MARKER_EXPORT
         ));
+    }
+}
+
+#[cfg(test)]
+mod fuel_tests {
+    use super::{instantiate_metered, is_out_of_fuel, refuel_for_callback};
+    use wasmi::{Linker, Module, Store};
+
+    /// `(module (func $init) (start $init))`
+    const START_MODULE: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03,
+        0x02, 0x01, 0x00, 0x08, 0x01, 0x00, 0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    ];
+
+    /// `(module (func (export "spin") (loop br 0)) (func (export "crash") unreachable))`
+    const SPIN_AND_CRASH: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03,
+        0x03, 0x02, 0x00, 0x00, 0x07, 0x10, 0x02, 0x04, b's', b'p', b'i', b'n', 0x00, 0x00, 0x05,
+        b'c', b'r', b'a', b's', b'h', 0x00, 0x01, 0x0a, 0x0d, 0x02, 0x07, 0x00, 0x03, 0x40, 0x0c,
+        0x00, 0x0b, 0x0b, 0x03, 0x00, 0x00, 0x0b,
+    ];
+
+    fn metered_module(bytes: &[u8]) -> (wasmi::Engine, Module) {
+        let engine = crate::get_engine();
+        let module = Module::new(&engine, bytes).expect("embedded wasm module");
+        (engine, module)
+    }
+
+    #[test]
+    fn a_module_with_a_start_section_instantiates_on_the_metered_engine() {
+        let (engine, module) = metered_module(START_MODULE);
+        let mut store = Store::new(&engine, ());
+        let linker = Linker::<()>::new(&engine);
+        assert!(
+            linker.instantiate_and_start(&mut store, &module).is_err(),
+            "a fresh metered store has no fuel for the start section"
+        );
+        let mut store = Store::new(&engine, ());
+        assert!(instantiate_metered(&linker, &mut store, &module).is_ok());
+    }
+
+    #[test]
+    fn running_out_of_fuel_is_told_apart_from_other_failures() {
+        let (engine, module) = metered_module(SPIN_AND_CRASH);
+        let mut store = Store::new(&engine, ());
+        let linker = Linker::<()>::new(&engine);
+        let instance = instantiate_metered(&linker, &mut store, &module).unwrap();
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .unwrap();
+        let crash = instance
+            .get_typed_func::<(), ()>(&mut store, "crash")
+            .unwrap();
+        store.set_fuel(10_000).unwrap();
+        let spin_error = anyhow::Error::new(spin.call(&mut store, ()).unwrap_err())
+            .context("failed to call spin on the plugin");
+        assert!(is_out_of_fuel(&spin_error));
+        refuel_for_callback(&mut store);
+        let crash_error = anyhow::Error::new(crash.call(&mut store, ()).unwrap_err())
+            .context("failed to call crash on the plugin");
+        assert!(!is_out_of_fuel(&crash_error));
+        assert!(!is_out_of_fuel(&anyhow::anyhow!("not a wasm error")));
+    }
+
+    #[test]
+    fn a_nonterminating_callback_traps_instead_of_holding_its_thread() {
+        let (engine, module) = metered_module(SPIN_AND_CRASH);
+        let mut store = Store::new(&engine, ());
+        let linker = Linker::<()>::new(&engine);
+        let instance = instantiate_metered(&linker, &mut store, &module).unwrap();
+        let update = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .unwrap();
+        store.set_fuel(10_000).unwrap();
+        let error = update
+            .call(&mut store, ())
+            .expect_err("the loop must exhaust its fuel");
+        assert_eq!(error.as_trap_code(), Some(wasmi::TrapCode::OutOfFuel));
+        refuel_for_callback(&mut store);
+        assert_eq!(
+            store.get_fuel().unwrap(),
+            super::PLUGIN_CALLBACK_FUEL_BUDGET
+        );
     }
 }

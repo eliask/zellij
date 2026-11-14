@@ -17,7 +17,6 @@ use zellij_utils::web_server_commands::{
 };
 
 use isahc::prelude::*;
-use isahc::AsyncReadResponseExt;
 use isahc::{config::RedirectPolicy, HttpClient, Request};
 
 use std::collections::{BTreeMap, HashMap};
@@ -554,29 +553,28 @@ pub(crate) fn background_jobs_main(
                             timeout: None,
                         })
                         .await;
-                        match output {
-                            Ok(output) => {
-                                let stdout = output.stdout;
-                                let stderr = output.stderr;
-                                let exit_code = output.exit_code;
-                                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                    Some(plugin_id),
-                                    Some(client_id),
-                                    Event::RunCommandResult(exit_code, stdout, stderr, context),
-                                )]));
-                            },
+                        let event = match output {
+                            Ok(output) => run_command_result_event(
+                                output.exit_code,
+                                output.stdout,
+                                output.stderr,
+                                context,
+                            ),
                             Err(e) => {
                                 log::error!("Failed to run command: {}", e);
-                                let stdout = vec![];
-                                let stderr = format!("{}", e).as_bytes().to_vec();
-                                let exit_code = Some(2);
-                                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                    Some(plugin_id),
-                                    Some(client_id),
-                                    Event::RunCommandResult(exit_code, stdout, stderr, context),
-                                )]));
+                                run_command_result_event(
+                                    Some(2),
+                                    Vec::new(),
+                                    format!("{}", e).into_bytes(),
+                                    context,
+                                )
                             },
-                        }
+                        };
+                        let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                            Some(plugin_id),
+                            Some(client_id),
+                            event,
+                        )]));
                     }
                 });
             },
@@ -598,11 +596,10 @@ pub(crate) fn background_jobs_main(
                             verb: HttpVerb,
                             headers: BTreeMap<String, String>,
                             body: Vec<u8>,
+                            context: &BTreeMap<String, String>,
                             http_client: HttpClient,
-                        ) -> Result<
-                            (u16, BTreeMap<String, String>, Vec<u8>), // status_code, headers, body
-                            isahc::Error,
-                        > {
+                        ) -> Result<(u16, BTreeMap<String, String>, Vec<u8>), WebRequestError>
+                        {
                             let mut request = match verb {
                                 HttpVerb::Get => Request::get(url),
                                 HttpVerb::Post => Request::post(url),
@@ -612,7 +609,7 @@ pub(crate) fn background_jobs_main(
                             for (header, value) in headers {
                                 request = request.header(header.as_str(), value);
                             }
-                            let mut res = if !body.is_empty() {
+                            let res = if !body.is_empty() {
                                 let req = request.body(body)?;
                                 http_client.send_async(req).await?
                             } else {
@@ -620,7 +617,7 @@ pub(crate) fn background_jobs_main(
                                 http_client.send_async(req).await?
                             };
 
-                            let status_code = res.status();
+                            let status_code = res.status().as_u16();
                             let headers: BTreeMap<String, String> = res
                                 .headers()
                                 .iter()
@@ -636,15 +633,22 @@ pub(crate) fn background_jobs_main(
                                     },
                                 })
                                 .collect();
-                            let body = res.bytes().await?;
-                            Ok((status_code.as_u16(), headers, body))
+                            let mut body_stream = res.into_body();
+                            let body = read_web_body_within_host_pipe(
+                                &mut body_stream,
+                                status_code,
+                                &headers,
+                                context,
+                            )
+                            .await?;
+                            Ok((status_code, headers, body))
                         }
                         let Some(http_client) = http_client else {
                             log::error!("Cannot perform http request, likely due to a misconfigured http client");
                             return;
                         };
 
-                        match web_request(url, verb, headers, body, http_client).await {
+                        match web_request(url, verb, headers, body, &context, http_client).await {
                             Ok((status, headers, body)) => {
                                 let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
                                     Some(plugin_id),
@@ -654,16 +658,10 @@ pub(crate) fn background_jobs_main(
                             },
                             Err(e) => {
                                 log::error!("Failed to send web request: {}", e);
-                                let error_body = e.to_string().as_bytes().to_vec();
                                 let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
                                     Some(plugin_id),
                                     Some(client_id),
-                                    Event::WebRequestResult(
-                                        400,
-                                        BTreeMap::new(),
-                                        error_body,
-                                        context,
-                                    ),
+                                    web_request_failure_event(&e, context),
                                 )]));
                             },
                         }
@@ -1670,7 +1668,15 @@ pub enum BackgroundCommandError {
     Spawn(std::io::Error),
     Io(std::io::Error),
     TimedOut,
+    OutputTooLarge,
 }
+
+/// Combined stdout and stderr bytes read from one background command.
+///
+/// Plugin command results are buffered here before they become an event, so
+/// an unbounded child must not be copied into host memory. Past this the child
+/// is killed and the rest is not read.
+const BACKGROUND_COMMAND_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
 impl std::fmt::Display for BackgroundCommandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1678,6 +1684,11 @@ impl std::fmt::Display for BackgroundCommandError {
             BackgroundCommandError::Spawn(e) => write!(f, "failed to start command: {}", e),
             BackgroundCommandError::Io(e) => write!(f, "failed to run command: {}", e),
             BackgroundCommandError::TimedOut => write!(f, "command timed out"),
+            BackgroundCommandError::OutputTooLarge => write!(
+                f,
+                "command output exceeded {} bytes",
+                BACKGROUND_COMMAND_MAX_OUTPUT_BYTES
+            ),
         }
     }
 }
@@ -1692,6 +1703,325 @@ pub struct BackgroundCommand {
     pub timeout: Option<Duration>,
 }
 
+#[derive(Debug)]
+enum WebRequestError {
+    Http(isahc::Error),
+    HostPipe,
+}
+
+impl std::fmt::Display for WebRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WebRequestError::Http(error) => write!(f, "{error}"),
+            WebRequestError::HostPipe => write!(
+                f,
+                "response exceeds the host pipe cap of {} bytes",
+                crate::plugins::WASI_HOST_PIPE_CAP
+            ),
+        }
+    }
+}
+
+impl From<isahc::Error> for WebRequestError {
+    fn from(error: isahc::Error) -> Self {
+        WebRequestError::Http(error)
+    }
+}
+
+impl From<std::io::Error> for WebRequestError {
+    fn from(error: std::io::Error) -> Self {
+        WebRequestError::Http(error.into())
+    }
+}
+
+impl From<isahc::http::Error> for WebRequestError {
+    fn from(error: isahc::http::Error) -> Self {
+        WebRequestError::Http(error.into())
+    }
+}
+
+fn host_event_fits(event: &Event) -> bool {
+    crate::plugins::host_stdin_frame_len(event)
+        .is_some_and(|len| len <= crate::plugins::WASI_HOST_PIPE_CAP)
+}
+
+fn web_result_frame_fits(
+    status: u16,
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+    context: &BTreeMap<String, String>,
+) -> bool {
+    host_event_fits(&Event::WebRequestResult(
+        status,
+        headers.clone(),
+        body.to_vec(),
+        context.clone(),
+    ))
+}
+
+fn web_request_failure_event(error: &WebRequestError, context: BTreeMap<String, String>) -> Event {
+    let body = error.to_string().into_bytes();
+    let event = Event::WebRequestResult(400, BTreeMap::new(), body.clone(), context);
+    if host_event_fits(&event) {
+        return event;
+    }
+    let event = Event::WebRequestResult(400, BTreeMap::new(), body, BTreeMap::new());
+    if host_event_fits(&event) {
+        return event;
+    }
+    Event::WebRequestResult(
+        400,
+        BTreeMap::new(),
+        format!(
+            "response exceeds the host pipe cap of {} bytes",
+            crate::plugins::WASI_HOST_PIPE_CAP
+        )
+        .into_bytes(),
+        BTreeMap::new(),
+    )
+}
+
+/// Read `body` until EOF, or stop once those bytes cannot be part of a
+/// `WebRequestResult` whose stdin frame fits the host pipe. Oversized bytes
+/// are dropped; the caller reports the cap instead of a truncated success.
+async fn read_web_body_within_host_pipe<R>(
+    body: &mut R,
+    status: u16,
+    headers: &BTreeMap<String, String>,
+    context: &BTreeMap<String, String>,
+) -> Result<Vec<u8>, WebRequestError>
+where
+    R: futures_io::AsyncRead + Unpin,
+{
+    use std::future::poll_fn;
+    use std::pin::Pin;
+    if !web_result_frame_fits(status, headers, &[], context) {
+        return Err(WebRequestError::HostPipe);
+    }
+    let mut collected = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        let n = poll_fn(|cx| Pin::new(&mut *body).poll_read(cx, &mut chunk)).await?;
+        if n == 0 {
+            break;
+        }
+        let mut candidate = Vec::with_capacity(collected.len().saturating_add(n));
+        candidate.extend_from_slice(&collected);
+        candidate.extend_from_slice(&chunk[..n]);
+        if !web_result_frame_fits(status, headers, &candidate, context) {
+            return Err(WebRequestError::HostPipe);
+        }
+        collected = candidate;
+    }
+    Ok(collected)
+}
+
+fn claim_output_bytes(budget: &AtomicUsize, want: usize) -> usize {
+    let mut granted = 0;
+    let updated = budget.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        if used >= BACKGROUND_COMMAND_MAX_OUTPUT_BYTES {
+            granted = 0;
+            None
+        } else {
+            granted = want.min(BACKGROUND_COMMAND_MAX_OUTPUT_BYTES - used);
+            Some(used + granted)
+        }
+    });
+    if updated.is_err() {
+        0
+    } else {
+        granted
+    }
+}
+
+fn kill_child(child: &Mutex<Option<tokio::process::Child>>) {
+    let mut slot = child.lock().unwrap();
+    let Some(child) = slot.as_mut() else {
+        return;
+    };
+    #[cfg(unix)]
+    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        if pid > 0 {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+    let _ = child.start_kill();
+}
+
+/// Read until EOF or until `budget` reaches the output cap.
+///
+/// Bytes past the cap are not appended, and the child is killed so the other
+/// stream's read unblocks instead of draining the rest of the pipe.
+async fn read_capped(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    budget: Arc<AtomicUsize>,
+    exceeded: Arc<AtomicBool>,
+    io_error: Arc<Mutex<Option<std::io::Error>>>,
+    child: Arc<Mutex<Option<tokio::process::Child>>>,
+) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let note_io = |err: std::io::Error| {
+        if !exceeded.load(Ordering::Acquire) {
+            let mut slot = io_error.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(err);
+            }
+            kill_child(&child);
+        }
+    };
+    let cap_hit = || {
+        exceeded.store(true, Ordering::Release);
+        kill_child(&child);
+    };
+    loop {
+        if exceeded.load(Ordering::Acquire) || io_error.lock().unwrap().is_some() {
+            break;
+        }
+        let used = budget.load(Ordering::Acquire);
+        if used >= BACKGROUND_COMMAND_MAX_OUTPUT_BYTES {
+            match reader.read(&mut chunk[..1]).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    cap_hit();
+                    break;
+                },
+                Err(err) => {
+                    note_io(err);
+                    break;
+                },
+            }
+        }
+        let room = (BACKGROUND_COMMAND_MAX_OUTPUT_BYTES - used).min(chunk.len());
+        match reader.read(&mut chunk[..room]).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if exceeded.load(Ordering::Acquire) {
+                    break;
+                }
+                let granted = claim_output_bytes(&budget, n);
+                if granted == 0 || granted < n {
+                    cap_hit();
+                    break;
+                }
+                out.extend_from_slice(&chunk[..granted]);
+            },
+            Err(err) => {
+                note_io(err);
+                break;
+            },
+        }
+    }
+    out
+}
+
+async fn collect_command_output(
+    mut child: tokio::process::Child,
+) -> std::result::Result<BackgroundCommandOutput, BackgroundCommandError> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| BackgroundCommandError::Io(std::io::Error::other("stdout was not piped")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| BackgroundCommandError::Io(std::io::Error::other("stderr was not piped")))?;
+    let child = Arc::new(Mutex::new(Some(child)));
+    let budget = Arc::new(AtomicUsize::new(0));
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let io_error = Arc::new(Mutex::new(None));
+    let stdout_read = read_capped(
+        stdout,
+        Arc::clone(&budget),
+        Arc::clone(&exceeded),
+        Arc::clone(&io_error),
+        Arc::clone(&child),
+    );
+    let stderr_read = read_capped(
+        stderr,
+        budget,
+        Arc::clone(&exceeded),
+        Arc::clone(&io_error),
+        Arc::clone(&child),
+    );
+    tokio::pin!(stdout_read);
+    tokio::pin!(stderr_read);
+    let mut stdout = None;
+    let mut stderr = None;
+    loop {
+        tokio::select! {
+            biased;
+            value = &mut stdout_read, if stdout.is_none() => {
+                stdout = Some(value);
+            }
+            value = &mut stderr_read, if stderr.is_none() => {
+                stderr = Some(value);
+            }
+        }
+        if exceeded.load(Ordering::Acquire) || io_error.lock().unwrap().is_some() {
+            break;
+        }
+        if stdout.is_some() && stderr.is_some() {
+            break;
+        }
+    }
+    let stdout = stdout.unwrap_or_default();
+    let stderr = stderr.unwrap_or_default();
+    let mut child =
+        child.lock().unwrap().take().ok_or_else(|| {
+            BackgroundCommandError::Io(std::io::Error::other("command handle lost"))
+        })?;
+    let status = child.wait().await.map_err(BackgroundCommandError::Io)?;
+    if let Some(err) = io_error.lock().unwrap().take() {
+        return Err(BackgroundCommandError::Io(err));
+    }
+    if exceeded.load(Ordering::Acquire) {
+        return Err(BackgroundCommandError::OutputTooLarge);
+    }
+    Ok(BackgroundCommandOutput {
+        exit_code: status.code(),
+        stdout,
+        stderr,
+    })
+}
+
+fn command_result_host_pipe_error(context: BTreeMap<String, String>) -> Event {
+    let stderr = format!(
+        "command result exceeds the host pipe cap of {} bytes",
+        crate::plugins::WASI_HOST_PIPE_CAP
+    );
+    Event::RunCommandResult(Some(2), Vec::new(), stderr.into_bytes(), context)
+}
+
+/// `RunCommandResult` delivered to the plugin.
+///
+/// A frame that does not fit the host stdin pipe is replaced with a short command
+/// error. A result that already fits is unchanged, including a successful exit code.
+fn run_command_result_event(
+    exit_code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    context: BTreeMap<String, String>,
+) -> Event {
+    let event = Event::RunCommandResult(exit_code, stdout, stderr, context.clone());
+    if host_event_fits(&event) {
+        return event;
+    }
+    log::warn!(
+        "RunCommandResult does not fit in the host pipe cap of {} bytes; sending a short error",
+        crate::plugins::WASI_HOST_PIPE_CAP
+    );
+    let fallback = command_result_host_pipe_error(context);
+    if host_event_fits(&fallback) {
+        return fallback;
+    }
+    command_result_host_pipe_error(BTreeMap::new())
+}
+
 pub async fn run_background_command(
     command: BackgroundCommand,
 ) -> std::result::Result<BackgroundCommandOutput, BackgroundCommandError> {
@@ -1703,6 +2033,10 @@ pub async fn run_background_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        process.process_group(0);
+    }
     if let Some(cwd) = &command.cwd {
         process.current_dir(cwd);
     }
@@ -1718,24 +2052,222 @@ pub async fn run_background_command(
             let _ = stdin.shutdown().await;
         });
     }
-    let output = child.wait_with_output();
-    let output = match command.timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, output).await {
+    let collected = collect_command_output(child);
+    match command.timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, collected).await {
             Ok(output) => output,
-            Err(_) => return Err(BackgroundCommandError::TimedOut),
+            Err(_) => Err(BackgroundCommandError::TimedOut),
         },
-        None => output.await,
+        None => collected.await,
     }
-    .map_err(BackgroundCommandError::Io)?;
-    Ok(BackgroundCommandOutput {
-        exit_code: output.status.code(),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
 }
 
 pub fn run_background_command_blocking(
     command: BackgroundCommand,
 ) -> std::result::Result<BackgroundCommandOutput, BackgroundCommandError> {
     crate::global_async_runtime::get_tokio_runtime().block_on(run_background_command(command))
+}
+
+#[cfg(all(test, unix))]
+mod background_command_output_tests {
+    use super::*;
+
+    fn sh(
+        script: &str,
+        timeout: Duration,
+    ) -> Result<BackgroundCommandOutput, BackgroundCommandError> {
+        run_background_command_blocking(BackgroundCommand {
+            program: "sh".to_owned(),
+            args: vec!["-c".to_owned(), script.to_owned()],
+            timeout: Some(timeout),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn command_output_under_the_cap_is_unchanged() {
+        assert_eq!(BACKGROUND_COMMAND_MAX_OUTPUT_BYTES, 4 * 1024 * 1024);
+        let output = sh(
+            "printf hello; printf err >&2; exit 3",
+            Duration::from_secs(5),
+        )
+        .expect("a short command must succeed");
+        assert_eq!(output.exit_code, Some(3));
+        assert_eq!(output.stdout, b"hello");
+        assert_eq!(output.stderr, b"err");
+
+        let exact = sh(
+            &format!("head -c {} /dev/zero", BACKGROUND_COMMAND_MAX_OUTPUT_BYTES),
+            Duration::from_secs(5),
+        )
+        .expect("output exactly at the cap must be kept");
+        assert_eq!(exact.exit_code, Some(0));
+        assert_eq!(exact.stdout.len(), BACKGROUND_COMMAND_MAX_OUTPUT_BYTES);
+        assert!(exact.stderr.is_empty());
+    }
+
+    #[test]
+    fn command_output_past_the_cap_stops_reading_and_fails() {
+        let script = format!(
+            "head -c {} /dev/zero; sleep 30",
+            BACKGROUND_COMMAND_MAX_OUTPUT_BYTES + 1
+        );
+        let started = Instant::now();
+        let result = sh(&script, Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "output was read until the command finished or timed out ({:?})",
+            started.elapsed()
+        );
+        match result {
+            Err(BackgroundCommandError::OutputTooLarge) => {
+                let message = BackgroundCommandError::OutputTooLarge.to_string();
+                assert!(
+                    message.len() < 256,
+                    "failure shown to the plugin must be short"
+                );
+                assert!(message.contains(&BACKGROUND_COMMAND_MAX_OUTPUT_BYTES.to_string()));
+            },
+            other => panic!("expected a bounded output failure, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod web_request_host_pipe_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    struct CountingReader {
+        remaining: usize,
+        consumed: Arc<AtomicUsize>,
+    }
+
+    impl futures_io::AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.remaining == 0 {
+                return Poll::Ready(Ok(0));
+            }
+            let n = buf.len().min(self.remaining).min(8 * 1024);
+            buf[..n].fill(b'Z');
+            self.remaining -= n;
+            self.consumed.fetch_add(n, Ordering::Relaxed);
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    fn run<T>(future: impl std::future::Future<Output = T>) -> T {
+        crate::global_async_runtime::get_tokio_runtime().block_on(future)
+    }
+
+    #[test]
+    fn web_request_stops_before_an_oversized_body() {
+        let total = crate::plugins::WASI_HOST_PIPE_CAP.saturating_mul(4);
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let mut reader = CountingReader {
+            remaining: total,
+            consumed: consumed.clone(),
+        };
+        let headers = BTreeMap::from([(
+            "Content-Type".to_owned(),
+            "application/octet-stream".to_owned(),
+        )]);
+        let context = BTreeMap::from([("request_id".to_owned(), "oversized".to_owned())]);
+        let error = run(read_web_body_within_host_pipe(
+            &mut reader,
+            200,
+            &headers,
+            &context,
+        ))
+        .expect_err("an oversized body must not be returned as success");
+        let read = consumed.load(Ordering::Relaxed);
+        assert!(
+            read < total,
+            "production read kept the oversized body ({read} of {total} bytes)"
+        );
+        let event = web_request_failure_event(&error, context.clone());
+        match event {
+            Event::WebRequestResult(status, event_headers, body, event_context) => {
+                assert_eq!(status, 400);
+                assert!(event_headers.is_empty());
+                assert_eq!(event_context, context);
+                let message = String::from_utf8(body.clone()).expect("error text");
+                assert!(
+                    message.contains(&crate::plugins::WASI_HOST_PIPE_CAP.to_string()),
+                    "error must name the cap, got {message}"
+                );
+                assert!(body.len() < 512, "error body must stay short");
+                assert!(!body.iter().any(|byte| *byte == b'Z'));
+            },
+            other => panic!("expected the production WebRequestResult error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_request_returns_a_tiny_body_unchanged() {
+        let payload = b"tiny-body".to_vec();
+        let mut reader = isahc::AsyncBody::from(payload.clone());
+        let headers = BTreeMap::from([("Content-Type".to_owned(), "text/plain".to_owned())]);
+        let context = BTreeMap::from([("request_id".to_owned(), "tiny".to_owned())]);
+        let body = run(read_web_body_within_host_pipe(
+            &mut reader,
+            201,
+            &headers,
+            &context,
+        ))
+        .expect("a tiny body must be returned");
+        assert_eq!(body, payload);
+        assert!(web_result_frame_fits(201, &headers, &body, &context));
+    }
+}
+
+#[cfg(test)]
+mod command_result_host_pipe_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_command_stdout_becomes_a_short_host_pipe_error() {
+        let context = BTreeMap::from([("request_id".to_owned(), "oversized".to_owned())]);
+        let stdout = vec![b'A'; crate::plugins::WASI_HOST_PIPE_CAP + 1];
+        let event = run_command_result_event(Some(0), stdout, Vec::new(), context.clone());
+        let frame_len = crate::plugins::host_stdin_frame_len(&event)
+            .expect("the event that would be sent must have a measurable stdin frame");
+        assert!(
+            frame_len <= crate::plugins::WASI_HOST_PIPE_CAP,
+            "sent frame is {frame_len} bytes"
+        );
+        match event {
+            Event::RunCommandResult(exit_code, stdout, stderr, event_context) => {
+                assert_eq!(exit_code, Some(2));
+                assert!(stdout.is_empty());
+                assert_eq!(event_context, context);
+                let message = String::from_utf8(stderr).expect("error text");
+                assert!(
+                    message.contains(&crate::plugins::WASI_HOST_PIPE_CAP.to_string()),
+                    "error must name the cap, got {message}"
+                );
+            },
+            other => panic!("expected the production RunCommandResult error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tiny_command_result_is_unchanged() {
+        let context = BTreeMap::from([("request_id".to_owned(), "tiny".to_owned())]);
+        let stdout = b"ok".to_vec();
+        let stderr = b"warn".to_vec();
+        let event =
+            run_command_result_event(Some(0), stdout.clone(), stderr.clone(), context.clone());
+        assert_eq!(
+            event,
+            Event::RunCommandResult(Some(0), stdout, stderr, context)
+        );
+    }
 }

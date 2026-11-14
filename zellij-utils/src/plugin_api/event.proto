@@ -95,6 +95,9 @@ enum EventType {
     DesktopIntegration = 69;
     LiveViewStateChanged = 71;
     PluginSettingsEntries = 72;
+    /// A directory listing was trimmed to the host pipe and is not a complete FileSystemUpdate.
+    /// 73 is left unused.
+    FileSystemUpdateIncomplete = 74;
 }
 
 message EventNameList {
@@ -166,6 +169,8 @@ message Event {
     string desktop_integration_payload = 61;
     LiveViewStateChangedPayload live_view_state_changed_payload = 63;
     PluginSettingsEntriesPayload plugin_settings_entries_payload = 64;
+    // 65 is left unused.
+    FileListIncompletePayload file_list_incomplete_payload = 66;
   }
 }
 
@@ -653,6 +658,11 @@ message PermissionRequestResultPayload {
 }
 
 message FileListPayload {
+  repeated string paths = 1;
+  repeated FileMetadata paths_metadata = 2;
+}
+
+message FileListIncompletePayload {
   repeated string paths = 1;
   repeated FileMetadata paths_metadata = 2;
 }

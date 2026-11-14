@@ -13,7 +13,7 @@ use log::warn;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashSet},
-    io::{Read, Write},
+    io::Read,
     path::PathBuf,
     process,
     str::FromStr,
@@ -5165,7 +5165,14 @@ fn scan_host_folder(env: &PluginEnv, folder_to_scan: PathBuf) {
         .plugin_cwd
         .canonicalize()
         .unwrap_or_else(|_| env.plugin_cwd.clone());
-    let folder_to_scan = plugin_host_folder.join(folder_to_scan.strip_prefix("/host").unwrap());
+    let Some(relative) = folder_to_scan.strip_prefix("/host").ok() else {
+        log::error!(
+            "Failed to strip /host prefix from path: {}",
+            folder_to_scan.display()
+        );
+        return;
+    };
+    let folder_to_scan = plugin_host_folder.join(relative);
     match folder_to_scan.canonicalize() {
         Ok(folder_to_scan) => {
             if !folder_to_scan.starts_with(&plugin_host_folder) {
@@ -5180,29 +5187,50 @@ fn scan_host_folder(env: &PluginEnv, folder_to_scan: PathBuf) {
             match reading_folder {
                 Ok(reading_folder) => {
                     let send_plugin_instructions = env.senders.to_plugin.clone();
-                    let update_target = Some(env.plugin_id);
+                    let plugin_id = env.plugin_id;
+                    let update_target = Some(plugin_id);
                     let client_id = acting_client(env);
                     thread::spawn({
                         move || {
-                            let mut paths_in_folder = vec![];
+                            let mut paths_in_folder = Vec::new();
+                            let mut stopped_early = false;
                             for entry in reading_folder {
+                                if paths_in_folder.len()
+                                    >= super::plugin_loader::MAX_DIRECTORY_SCAN_ENTRIES
+                                {
+                                    stopped_early = true;
+                                    break;
+                                }
                                 if let Ok(entry) = entry {
                                     let entry_metadata = entry.metadata().ok().map(|m| m.into());
+                                    let entry_path = entry.path();
+                                    let Ok(relative) = entry_path.strip_prefix(&plugin_host_folder)
+                                    else {
+                                        continue;
+                                    };
                                     paths_in_folder.push((
-                                        PathBuf::from("/host").join(
-                                            entry.path().strip_prefix(&plugin_host_folder).unwrap(),
-                                        ),
+                                        PathBuf::from("/host").join(relative),
                                         entry_metadata.into(),
                                     ));
                                 }
                             }
+                            if stopped_early {
+                                log::warn!(
+                                    "Directory scan for plugin {plugin_id} stopped after {} entries",
+                                    super::plugin_loader::MAX_DIRECTORY_SCAN_ENTRIES
+                                );
+                            }
+                            let event = super::plugin_loader::filesystem_listing_event(
+                                paths_in_folder,
+                                stopped_early,
+                            );
                             let _ = send_plugin_instructions
                                 .ok_or(anyhow!("found no sender to send plugin instruction to"))
                                 .map(|sender| {
                                     let _ = sender.send(PluginInstruction::Update(vec![(
                                         update_target,
                                         Some(client_id),
-                                        Event::FileSystemUpdate(paths_in_folder),
+                                        event,
                                     )]));
                                 })
                                 .non_fatal();
@@ -5251,13 +5279,14 @@ fn list_windows_volumes(env: &PluginEnv) {
     thread::spawn(move || {
         let mut entries = enumerate_drives();
         entries.extend(enumerate_wsl_distributions());
+        let event = super::plugin_loader::filesystem_listing_event(entries, false);
         let _ = send_plugin_instructions
             .ok_or(anyhow!("found no sender to send plugin instruction to"))
             .map(|sender| {
                 let _ = sender.send(PluginInstruction::Update(vec![(
                     update_target,
                     Some(client_id),
-                    Event::FileSystemUpdate(entries),
+                    event,
                 )]));
             })
             .non_fatal();
@@ -6637,9 +6666,13 @@ pub fn wasi_read_string(plugin_env: &PluginEnv) -> Result<String> {
 
 pub fn wasi_write_string(plugin_env: &PluginEnv, buf: &str) -> Result<()> {
     let mut stdin = plugin_env.stdin_pipe.lock().unwrap();
-    writeln!(stdin, "{}\r", buf)
+    let mut line = String::with_capacity(buf.len().saturating_add(2));
+    line.push_str(buf);
+    line.push_str("\r\n");
+    super::plugin_loader::append_capped_host_pipe(&mut stdin, &[line.as_bytes()], "stdin")
         .map_err(anyError::new)
-        .with_context(|| format!("failed to write string to WASI env"))
+        .with_context(|| format!("failed to write string to WASI env"))?;
+    Ok(())
 }
 
 pub fn wasi_write_object(plugin_env: &PluginEnv, object: &(impl Serialize + ?Sized)) -> Result<()> {

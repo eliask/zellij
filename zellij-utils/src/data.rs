@@ -1277,6 +1277,9 @@ pub enum Event {
     FileSystemRead(Vec<(PathBuf, Option<FileMetadata>)>),
     /// A file was modified somewhere in the Zellij CWD folder
     FileSystemUpdate(Vec<(PathBuf, Option<FileMetadata>)>),
+    /// A directory listing that fit the host pipe only as a read-order prefix.
+    /// The listing is explicitly incomplete and is not a full `FileSystemUpdate`.
+    FileSystemUpdateIncomplete(Vec<(PathBuf, Option<FileMetadata>)>),
     /// A file was deleted somewhere in the Zellij CWD folder
     FileSystemDelete(Vec<(PathBuf, Option<FileMetadata>)>),
     /// A Result of plugin permission request

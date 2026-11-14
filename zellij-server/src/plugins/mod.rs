@@ -10,6 +10,7 @@ mod wasm_bridge;
 mod watch_filesystem;
 mod zellij_exports;
 use log::info;
+pub(crate) use plugin_loader::{host_stdin_frame_len, WASI_HOST_PIPE_CAP};
 
 pub use pinned_executor::PinnedExecutor;
 use std::{
