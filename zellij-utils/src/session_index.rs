@@ -1188,6 +1188,16 @@ mod tests {
     use crate::input::session_suggestions::default_rules;
 
     #[test]
+    fn bundled_sqlite_is_the_release_named_by_rustsec_2026_0459() {
+        // libsqlite3-sys 0.39.1 bundles SQLite 3.54.1. 3.44.0 (rusqlite 0.30) is affected.
+        assert!(
+            rusqlite::version_number() >= 3_054_001,
+            "bundled SQLite {} is behind RUSTSEC-2026-0459",
+            rusqlite::version()
+        );
+    }
+
+    #[test]
     fn an_overridden_socket_folder_gets_its_own_index_file() {
         let default_dir = Path::new("/run/user/1000/zellij/contract_version_1");
         let bench_dir = Path::new("/tmp/bench/s-1/contract_version_1");

@@ -6,6 +6,8 @@
 //!
 //! This binary is integrated into the `cargo` command line by using an alias in `.cargo/config`.
 
+#[cfg(test)]
+mod advisory_floors;
 mod assets;
 mod build;
 mod ci;
