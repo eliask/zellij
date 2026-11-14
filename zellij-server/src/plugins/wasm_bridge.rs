@@ -1,3 +1,4 @@
+use super::pinned_executor::{on_plugin_executor, JobClass, PluginWork};
 use super::{PinnedExecutor, PluginId, PluginInstruction};
 use crate::global_async_runtime::get_tokio_runtime;
 use crate::plugins::pipes::{
@@ -544,32 +545,41 @@ impl WasmBridge {
                             }
                         }
 
-                        plugin_executor.execute_plugin_load(
+                        let load_bytes = std::fs::metadata(&loading_context.plugin_config.path)
+                            .map(|metadata| metadata.len() as usize)
+                            .unwrap_or(0);
+                        let executor = plugin_executor.clone();
+                        let failure_indication = loading_indication.clone();
+                        if let Err(e) = plugin_executor.execute_plugin_load_with_payload(
                             plugin_id,
+                            load_bytes,
                             move |senders: ThreadSenders,
                                   plugin_map: Arc<Mutex<PluginMap>>,
                                   connected_clients: Arc<Mutex<Vec<ClientId>>>,
                                   plugin_cache: PluginCache,
                                   engine| {
-                                let mut plugin_map = plugin_map.lock().unwrap();
                                 match PluginLoader::new(
                                     skip_cache,
                                     loading_context,
                                     senders.clone(),
                                     engine.clone(),
                                     plugin_cache.clone(),
-                                    &mut plugin_map,
+                                    plugin_map.clone(),
                                     connected_clients.clone(),
                                 )
                                 .start_plugin()
                                 {
                                     Ok(_) => {
-                                        let plugin_list = plugin_map.list_plugins();
-                                        handle_plugin_successful_loading(
-                                            &senders,
-                                            plugin_id,
-                                            plugin_list,
-                                        );
+                                        let plugin_map_guard = plugin_map.lock().unwrap();
+                                        if plugin_map_guard.has_instance_of(plugin_id) {
+                                            let plugin_list = plugin_map_guard.list_plugins();
+                                            drop(plugin_map_guard);
+                                            handle_plugin_successful_loading(
+                                                &senders,
+                                                plugin_id,
+                                                plugin_list,
+                                            );
+                                        }
                                     },
                                     Err(e) => handle_plugin_loading_failure(
                                         &senders,
@@ -579,6 +589,9 @@ impl WasmBridge {
                                         Some(client_id),
                                     ),
                                 }
+                                if !plugin_map.lock().unwrap().has_instance_of(plugin_id) {
+                                    executor.unregister_plugin(plugin_id);
+                                }
 
                                 let _ =
                                     senders.send_to_plugin(PluginInstruction::ApplyCachedEvents {
@@ -586,39 +599,60 @@ impl WasmBridge {
                                         done_receiving_permissions: false,
                                     });
                             },
-                        );
+                        ) {
+                            let mut failure_indication = failure_indication;
+                            handle_plugin_loading_failure(
+                                &senders,
+                                plugin_id,
+                                &mut failure_indication,
+                                e,
+                                Some(client_id),
+                            );
+                            let _ = senders.send_to_plugin(PluginInstruction::ApplyCachedEvents {
+                                plugin_ids: vec![plugin_id],
+                                done_receiving_permissions: false,
+                            });
+                        }
                     });
                 } else {
                     let _ = senders
                         .send_to_background_jobs(BackgroundJob::AnimatePluginLoading(plugin_id));
                     let mut loading_indication = LoadingIndication::new(plugin_name.clone());
-
-                    self.plugin_executor.execute_plugin_load(
+                    let load_bytes = std::fs::metadata(&loading_context.plugin_config.path)
+                        .map(|metadata| metadata.len() as usize)
+                        .unwrap_or(0);
+                    let executor = self.plugin_executor.clone();
+                    let failure_indication = loading_indication.clone();
+                    if let Err(e) = self.plugin_executor.execute_plugin_load_with_payload(
                         plugin_id,
+                        load_bytes,
                         move |senders,
                               plugin_map,
                               connected_clients,
                               plugin_cache: PluginCache,
                               engine: Engine| {
-                            let mut plugin_map = plugin_map.lock().unwrap();
                             match PluginLoader::new(
                                 skip_cache,
                                 loading_context,
                                 senders.clone(),
                                 engine.clone(),
                                 plugin_cache.clone(),
-                                &mut plugin_map,
+                                plugin_map.clone(),
                                 connected_clients.clone(),
                             )
                             .start_plugin()
                             {
                                 Ok(_) => {
-                                    let plugin_list = plugin_map.list_plugins();
-                                    handle_plugin_successful_loading(
-                                        &senders,
-                                        plugin_id,
-                                        plugin_list,
-                                    );
+                                    let plugin_map_guard = plugin_map.lock().unwrap();
+                                    if plugin_map_guard.has_instance_of(plugin_id) {
+                                        let plugin_list = plugin_map_guard.list_plugins();
+                                        drop(plugin_map_guard);
+                                        handle_plugin_successful_loading(
+                                            &senders,
+                                            plugin_id,
+                                            plugin_list,
+                                        );
+                                    }
                                 },
                                 Err(e) => handle_plugin_loading_failure(
                                     &senders,
@@ -628,13 +662,32 @@ impl WasmBridge {
                                     Some(client_id),
                                 ),
                             }
+                            if !plugin_map.lock().unwrap().has_instance_of(plugin_id) {
+                                executor.unregister_plugin(plugin_id);
+                            }
 
                             let _ = senders.send_to_plugin(PluginInstruction::ApplyCachedEvents {
                                 plugin_ids: vec![plugin_id],
                                 done_receiving_permissions: false,
                             });
                         },
-                    );
+                    ) {
+                        let mut failure_indication = failure_indication;
+                        handle_plugin_loading_failure(
+                            &self.senders,
+                            plugin_id,
+                            &mut failure_indication,
+                            e,
+                            Some(client_id),
+                        );
+                        self.rollback_pending_plugin_load(plugin_id);
+                        self.next_plugin_id += 1;
+                        return Err(anyhow!(
+                            "failed to admit plugin load for {}: {}",
+                            plugin_id,
+                            e
+                        ));
+                    }
                 }
 
                 self.next_plugin_id += 1;
@@ -662,15 +715,22 @@ impl WasmBridge {
             self.unload_shared_slot(pid);
             return Ok(());
         }
-        if self
+        let still_loading = self
             .loading_plugins
             .iter()
-            .any(|(loading_plugin_id, _)| *loading_plugin_id == pid)
-        {
+            .any(|(loading_plugin_id, _)| *loading_plugin_id == pid);
+        if still_loading {
             self.loading_plugins
                 .retain(|(loading_plugin_id, _)| *loading_plugin_id != pid);
             self.plugins_to_unload_once_loaded.insert(pid);
         }
+
+        let plugin_location = self
+            .plugin_map
+            .lock()
+            .unwrap()
+            .metadata(pid)
+            .map(|metadata| metadata.plugin_config.location.clone());
 
         // Remove from plugin_map on main thread
         let plugins_to_cleanup: Vec<_> = {
@@ -678,69 +738,99 @@ impl WasmBridge {
             plugin_map.remove_plugins(pid).into_iter().collect()
         };
 
-        // Schedule cleanup on each plugin's pinned thread
+        // Every client instance shares one executor assignment. One retirement
+        // runs every cleanup, then drops that assignment. Cleanup must not wait
+        // on the guest: a saturated retirement runs on this thread while the
+        // guest may still hold its execution lock.
+        let mut cleanups: Vec<PluginWork> = Vec::with_capacity(plugins_to_cleanup.len());
         for ((plugin_id, client_id), (running_plugin, subscriptions, workers)) in plugins_to_cleanup
         {
-            // Clear key intercepts if needed (on main thread is OK)
-            if running_plugin.lock().unwrap().intercepting_key_presses() {
-                let _ = self
-                    .senders
-                    .send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(client_id));
-            }
-            // Clear any regex highlights this plugin registered across all panes
             let _ = self
                 .senders
                 .send_to_screen(ScreenInstruction::ClearAllPluginHighlights(plugin_id));
 
-            // Send worker exit messages
             for (_worker_name, worker_sender) in workers {
                 drop(worker_sender.send(MessageToWorker::Exit));
             }
 
-            self.plugin_executor.execute_plugin_unload(
-                plugin_id,
+            let data_dir = plugin_location.as_ref().map(|location| {
+                ZELLIJ_SESSION_CACHE_DIR
+                    .join(make_plugin_url_path_safe(Url::from(location).to_string()))
+                    .join(format!("{}-{}", plugin_id, client_id))
+            });
+            cleanups.push(Box::new(
                 move |senders, _plugin_map, _connected_clients, _plugin_cache, _engine| {
-                    let subscriptions_guard = subscriptions.lock().unwrap();
-                    let needs_before_close = subscriptions_guard.contains(&EventType::BeforeClose);
-                    drop(subscriptions_guard); // Release lock before calling plugin
-
-                    if needs_before_close {
-                        let mut rp = running_plugin.lock().unwrap();
-                        match apply_before_close_event_to_plugin(
-                            plugin_id,
-                            client_id,
-                            &mut rp,
-                            senders.clone(),
-                        ) {
-                            Ok(()) => {},
-                            Err(e) => {
-                                log::error!("{:?}", e);
-                                let stringified_error = format!("{:?}", e).replace("\n", "\n\r");
-                                handle_plugin_crash(plugin_id, stringified_error, senders.clone());
-                            },
+                    let guard = match running_plugin.try_lock() {
+                        Ok(guard) => Some(guard),
+                        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                            Some(poisoned.into_inner())
+                        },
+                        Err(std::sync::TryLockError::WouldBlock) => None,
+                    };
+                    if let Some(mut rp) = guard {
+                        if rp.intercepting_key_presses() {
+                            let _ = senders.send_to_screen(
+                                ScreenInstruction::ClearKeyPressesIntercepts(client_id),
+                            );
                         }
-                        let cache_dir = rp.store.data().plugin_own_data_dir.clone();
-                        drop(rp); // Release lock before filesystem operation
+                        let needs_before_close = subscriptions
+                            .lock()
+                            .unwrap()
+                            .contains(&EventType::BeforeClose);
+                        // BeforeClose enters the guest. Run it only on the plugin
+                        // executor, and only when the execution lock was free.
+                        if needs_before_close && on_plugin_executor() {
+                            match apply_before_close_event_to_plugin(
+                                plugin_id,
+                                client_id,
+                                &mut rp,
+                                senders.clone(),
+                            ) {
+                                Ok(()) => {},
+                                Err(e) => {
+                                    log::error!("{:?}", e);
+                                    let stringified_error =
+                                        format!("{:?}", e).replace("\n", "\n\r");
+                                    handle_plugin_crash(
+                                        plugin_id,
+                                        stringified_error,
+                                        senders.clone(),
+                                    );
+                                },
+                            }
+                        }
+                        let cache_dir = data_dir
+                            .clone()
+                            .unwrap_or_else(|| rp.store.data().plugin_own_data_dir.clone());
+                        drop(rp);
                         if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
                             log::error!("Failed to remove cache dir for plugin: {:?}", e);
                         }
-                    } else {
-                        let cache_dir = running_plugin
-                            .lock()
-                            .unwrap()
-                            .store
-                            .data()
-                            .plugin_own_data_dir
-                            .clone();
-                        if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
+                    } else if let Some(cache_dir) = &data_dir {
+                        log::warn!(
+                            "skipping guest cleanup for plugin {} while a host call holds it",
+                            plugin_id
+                        );
+                        if let Err(e) = std::fs::remove_dir_all(cache_dir) {
                             log::error!("Failed to remove cache dir for plugin: {:?}", e);
                         }
                     }
-
-                    drop(running_plugin);
-                    drop(subscriptions);
                 },
-            );
+            ));
+        }
+        // A plugin that is still loading is unloaded again once it has loaded.
+        // Retiring it now would drop that second unload's assignment.
+        if !cleanups.is_empty() || !still_loading {
+            if let Err(e) = self
+                .plugin_executor
+                .execute_plugin_unload_many(pid, cleanups)
+            {
+                log::warn!(
+                    "Plugin {} was retired without guest cleanup after admission failed: {}",
+                    pid,
+                    e
+                );
+            }
         }
 
         // Main thread cleanup
@@ -825,24 +915,27 @@ impl WasmBridge {
             size,
         );
 
-        plugin_executor.execute_for_plugin(
+        let loading_indication_for_job = loading_indication.clone();
+        if let Err(e) = plugin_executor.try_execute_for_plugin(
             plugin_id,
+            JobClass::Lifecycle,
+            0,
             move |senders, plugin_map, connected_clients, plugin_cache, engine| {
                 let skip_cache = true; // we want to explicitly reload the plugin
-                let mut plugin_map = plugin_map.lock().unwrap();
+                let mut loading_indication = loading_indication_for_job;
                 match PluginLoader::new(
                     skip_cache,
                     loading_context,
                     senders.clone(),
                     engine.clone(),
                     plugin_cache.clone(),
-                    &mut plugin_map,
+                    plugin_map.clone(),
                     connected_clients.clone(),
                 )
                 .start_plugin()
                 {
                     Ok(_) => {
-                        let plugin_list = plugin_map.list_plugins();
+                        let plugin_list = plugin_map.lock().unwrap().list_plugins();
                         handle_plugin_successful_loading(&senders, plugin_id, plugin_list);
                     },
                     Err(e) => handle_plugin_loading_failure(
@@ -858,8 +951,31 @@ impl WasmBridge {
                     done_receiving_permissions: false,
                 });
             },
-        );
+        ) {
+            handle_plugin_loading_failure(
+                &self.senders,
+                plugin_id,
+                &mut loading_indication,
+                e,
+                Some(first_client_id),
+            );
+            self.rollback_pending_plugin_load(plugin_id);
+        }
         Ok(())
+    }
+    /// Undo pending-load state when its lifecycle admission is rejected.
+    /// No loader closure ran, so nothing else will settle these entries.
+    fn rollback_pending_plugin_load(&mut self, plugin_id: PluginId) {
+        self.cached_events_for_pending_plugins.remove(&plugin_id);
+        self.cached_resizes_for_pending_plugins.remove(&plugin_id);
+        self.plugin_ids_waiting_for_permission_request
+            .remove(&plugin_id);
+        self.plugins_to_unload_once_loaded.remove(&plugin_id);
+        self.loading_plugins
+            .retain(|(loading_plugin_id, _)| *loading_plugin_id != plugin_id);
+        let _ = self
+            .senders
+            .send_to_background_jobs(BackgroundJob::StopPluginLoadingAnimation(plugin_id));
     }
     pub fn reload_plugin(&mut self, run_plugin: &RunPlugin) -> Result<()> {
         let canonical = canonical_run_plugin(run_plugin);
@@ -962,18 +1078,19 @@ impl WasmBridge {
                 size,
             );
 
-            plugin_executor.execute_for_plugin(
+            if let Err(e) = plugin_executor.try_execute_for_plugin(
                 plugin_id,
+                JobClass::Lifecycle,
+                0,
                 move |senders, plugin_map, connected_clients, plugin_cache, engine| {
                     let skip_cache = false;
-                    let mut plugin_map = plugin_map.lock().unwrap();
                     match PluginLoader::new(
                         skip_cache,
                         loading_context,
                         senders.clone(),
                         engine.clone(),
                         plugin_cache.clone(),
-                        &mut plugin_map,
+                        plugin_map.clone(),
                         connected_clients.clone(),
                     )
                     .without_connected_clients()
@@ -995,7 +1112,21 @@ impl WasmBridge {
                         },
                     }
                 },
-            )
+            ) {
+                log::warn!(
+                    "failed to admit plugin {} for client {}: {}",
+                    plugin_id,
+                    client_id,
+                    e
+                );
+                self.loading_plugins
+                    .retain(|(loading_plugin_id, _)| *loading_plugin_id != plugin_id);
+                self.cached_events_for_pending_plugins.remove(&plugin_id);
+                self.cached_resizes_for_pending_plugins.remove(&plugin_id);
+                let _ = self
+                    .senders
+                    .send_to_background_jobs(BackgroundJob::StopPluginLoadingAnimation(plugin_id));
+            }
         }
         Ok(())
     }
@@ -2882,8 +3013,10 @@ impl WasmBridge {
                     .unwrap()
                     .shared_instance_in_blocking_call(instance_id);
                 let (slot_added_sender, slot_added_receiver) = std::sync::mpsc::channel();
-                self.plugin_executor.execute_for_plugin(
+                if let Err(e) = self.plugin_executor.try_execute_for_plugin(
                     instance_id,
+                    JobClass::Lifecycle,
+                    0,
                     move |senders, plugin_map, _connected_clients, _plugin_cache, _engine| {
                         add_slot_job(
                             senders,
@@ -2894,7 +3027,33 @@ impl WasmBridge {
                             slot_added_sender,
                         );
                     },
-                );
+                ) {
+                    log::warn!(
+                        "failed to admit shared slot {} on {}: {}",
+                        slot_id,
+                        instance_id,
+                        e
+                    );
+                    self.shared_slot_owner.remove(&slot_id);
+                    if let Some(info) = self.shared_instances.get_mut(&instance_id) {
+                        info.slots.remove(&slot_id);
+                        info.background_slots.remove(&slot_id);
+                    }
+                    self.plugin_map.lock().unwrap().remove_metadata(slot_id);
+                    let mut loading_indication = LoadingIndication::new(String::new());
+                    handle_plugin_loading_failure(
+                        &self.senders,
+                        slot_id,
+                        &mut loading_indication,
+                        e,
+                        Some(client_id),
+                    );
+                    return Err(anyhow!(
+                        "failed to admit shared slot {} on {}",
+                        slot_id,
+                        instance_id
+                    ));
+                }
                 if instance_is_running && !instance_is_in_blocking_call {
                     let _ = slot_added_receiver
                         .recv_timeout(std::time::Duration::from_millis(SLOT_ADDED_WAIT_MS));
@@ -2927,12 +3086,16 @@ impl WasmBridge {
                         background_slots: BTreeSet::new(),
                     },
                 );
-                self.shared_keys.insert(key, instance_id);
+                self.shared_keys.insert(key.clone(), instance_id);
                 self.register_shared_slot(instance_id, slot_id, kind);
                 let mut initial_slots = BTreeMap::new();
                 initial_slots.insert(slot_id, slot);
-                self.plugin_executor.execute_plugin_load(
+                let load_bytes = std::fs::metadata(&loading_context.plugin_config.path)
+                    .map(|metadata| metadata.len() as usize)
+                    .unwrap_or(0);
+                if let Err(e) = self.plugin_executor.execute_plugin_load_with_payload(
                     instance_id,
+                    load_bytes,
                     move |senders, plugin_map, connected_clients, plugin_cache, engine| {
                         start_instance_job(
                             senders,
@@ -2946,7 +3109,25 @@ impl WasmBridge {
                             initial_slots,
                         );
                     },
-                );
+                ) {
+                    log::warn!("failed to admit shared plugin {}: {}", instance_id, e);
+                    self.shared_instances.remove(&instance_id);
+                    self.shared_keys.remove(&key);
+                    self.shared_slot_owner.remove(&slot_id);
+                    self.plugin_map.lock().unwrap().remove_metadata(slot_id);
+                    let mut loading_indication = LoadingIndication::new(String::new());
+                    handle_plugin_loading_failure(
+                        &self.senders,
+                        slot_id,
+                        &mut loading_indication,
+                        e,
+                        Some(client_id),
+                    );
+                    return Err(anyhow!(
+                        "failed to admit shared plugin load for {}",
+                        instance_id
+                    ));
+                }
                 instance_id
             },
         };
@@ -2992,7 +3173,11 @@ impl WasmBridge {
             if let Some(info) = self.shared_instances.remove(&instance_id) {
                 self.shared_keys.remove(&info.key);
             }
-            self.plugin_executor.execute_plugin_unload(
+            self.plugin_map
+                .lock()
+                .unwrap()
+                .note_unload_if_loading(instance_id);
+            let _ = self.plugin_executor.execute_plugin_unload(
                 instance_id,
                 move |senders, plugin_map, _connected_clients, _plugin_cache, _engine| {
                     remove_slot_job(senders, plugin_map, instance_id, slot_id, true);
@@ -3004,7 +3189,9 @@ impl WasmBridge {
             self.apply_prompt_actions(prompt_actions);
             self.settings_entries_changed(|entries| entries.plugin_unloaded(instance_id));
         } else {
-            self.plugin_executor.execute_for_plugin(
+            // Removal only tries the guest lock, so a full lifecycle queue can run
+            // it on this thread without waiting on the guest.
+            self.plugin_executor.submit_lifecycle_or_run(
                 instance_id,
                 move |senders, plugin_map, _connected_clients, _plugin_cache, _engine| {
                     remove_slot_job(senders, plugin_map, instance_id, slot_id, false);
@@ -3061,8 +3248,10 @@ impl WasmBridge {
         let loading_indication =
             LoadingIndication::new(loading_context.plugin_config.location.to_string());
         self.start_plugin_loading_indication(&slot_ids, &loading_indication);
-        self.plugin_executor.execute_for_plugin(
+        if let Err(e) = self.plugin_executor.try_execute_for_plugin(
             instance_id,
+            JobClass::Lifecycle,
+            0,
             move |senders, plugin_map, connected_clients, plugin_cache, engine| {
                 start_instance_job(
                     senders,
@@ -3076,7 +3265,17 @@ impl WasmBridge {
                     BTreeMap::new(),
                 );
             },
-        );
+        ) {
+            log::warn!(
+                "failed to admit shared plugin reload {}: {}",
+                instance_id,
+                e
+            );
+            for slot_id in slot_ids {
+                let mut failure = loading_indication.clone();
+                handle_plugin_loading_failure(&self.senders, slot_id, &mut failure, e, None);
+            }
+        }
     }
     fn existing_shared_targets(
         &mut self,

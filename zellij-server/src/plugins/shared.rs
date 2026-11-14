@@ -614,12 +614,26 @@ pub fn remove_slot_job(
     tear_down: bool,
 ) {
     if let Some((running_plugin, _subscriptions)) = lookup(&plugin_map, instance_id) {
-        let mut running_plugin = running_plugin.lock().unwrap();
-        if let Err(e) = call_slot_removed(&mut running_plugin, slot_id) {
-            log::error!(
-                "Failed to remove slot {} from shared plugin: {:?}",
+        // Do not wait. Retirement may run this on the caller while the guest
+        // still holds the execution lock.
+        let guard = match running_plugin.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(mut running_plugin) = guard {
+            if let Err(e) = call_slot_removed(&mut running_plugin, slot_id) {
+                log::error!(
+                    "Failed to remove slot {} from shared plugin: {:?}",
+                    slot_id,
+                    e
+                );
+            }
+        } else {
+            log::warn!(
+                "skipping slot {} removal while shared plugin {} is inside a host call",
                 slot_id,
-                e
+                instance_id
             );
         }
     }
@@ -644,7 +658,18 @@ fn tear_down_instance(
         .lock()
         .unwrap()
         .contains(&EventType::BeforeClose);
-    let mut running_plugin = running_plugin.lock().unwrap();
+    let guard = match running_plugin.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            log::warn!(
+                "skipping shared plugin {} teardown while a host call holds it",
+                instance_id
+            );
+            return;
+        },
+    };
+    let mut running_plugin = guard;
     if needs_before_close {
         if let Err(e) = call_update(
             &mut running_plugin,
@@ -810,19 +835,16 @@ pub fn start_instance_job(
         },
         None => HashMap::new(),
     };
-    let started = {
-        let mut plugin_map = plugin_map.lock().unwrap();
-        PluginLoader::new(
-            skip_cache,
-            loading_context,
-            senders.clone(),
-            engine,
-            plugin_cache,
-            &mut plugin_map,
-            connected_clients.clone(),
-        )
-        .start_shared_plugin()
-    };
+    let started = PluginLoader::new(
+        skip_cache,
+        loading_context,
+        senders.clone(),
+        engine,
+        plugin_cache,
+        plugin_map.clone(),
+        connected_clients.clone(),
+    )
+    .start_shared_plugin();
     let running_plugin = match started {
         Ok(running_plugin) => running_plugin,
         Err(e) => {

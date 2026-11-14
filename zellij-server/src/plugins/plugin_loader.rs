@@ -2,10 +2,11 @@ use crate::plugins::plugin_map::{
     PluginEnv, PluginMap, PluginMetadata, RunningPlugin, SharedEnv, VecDequeInputStream,
     WriteOutputStream,
 };
-use crate::plugins::plugin_worker::{plugin_worker, RunningWorker};
+use crate::plugins::plugin_worker::{plugin_worker, MessageToWorker, RunningWorker};
 use crate::plugins::wasm_bridge::{LoadingContext, PluginCache};
 use crate::plugins::zellij_exports::{wasi_write_object, zellij_exports};
 use crate::plugins::PluginId;
+use crate::screen::ScreenInstruction;
 use prost::Message;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -60,7 +61,7 @@ fn create_plugin_fs_entries(plugin_own_data_dir: &PathBuf, plugin_own_cache_dir:
     }
 }
 
-pub struct PluginLoader<'a> {
+pub struct PluginLoader {
     skip_cache: bool,
     plugin_id: PluginId,
     client_id: ClientId,
@@ -81,20 +82,30 @@ pub struct PluginLoader<'a> {
     senders: ThreadSenders,
     engine: Engine,
     plugin_cache: PluginCache,
-    plugin_map: &'a mut PluginMap, // we receive a mutable reference rather than the Arc so that it
-    // will be held for the lifetime of this struct and thus loading
-    // plugins for all connected clients will be one transaction
+    // Held as an Arc so guest `_start`/`load` does not keep the map locked.
+    // Unload can observe the load and mark it, instead of waiting on the guest.
+    plugin_map: Arc<Mutex<PluginMap>>,
+    // Instances this loader published, so a failure rolls back only its own work.
+    published_instances: Vec<(ClientId, Arc<Mutex<RunningPlugin>>)>,
+    published_shared_instance: Option<Arc<Mutex<RunningPlugin>>>,
+    unloaded_during_load: bool,
+    shared_load: bool,
     connected_clients: Option<Arc<Mutex<Vec<ClientId>>>>,
 }
 
-impl<'a> PluginLoader<'a> {
+struct LoadSnapshot {
+    metadata: Option<PluginMetadata>,
+    had_instance: bool,
+}
+
+impl PluginLoader {
     pub fn new(
         skip_cache: bool,
         loading_context: LoadingContext,
         senders: ThreadSenders,
         engine: Engine,
         plugin_cache: PluginCache,
-        plugin_map: &'a mut PluginMap,
+        plugin_map: Arc<Mutex<PluginMap>>,
         connected_clients: Arc<Mutex<Vec<ClientId>>>,
     ) -> Self {
         let loading_indication = LoadingIndication::new("".into());
@@ -124,6 +135,10 @@ impl<'a> PluginLoader<'a> {
             engine,
             plugin_cache,
             plugin_map,
+            published_instances: Vec::new(),
+            published_shared_instance: None,
+            unloaded_during_load: false,
+            shared_load: false,
             connected_clients: Some(connected_clients),
             loading_indication,
         }
@@ -133,6 +148,24 @@ impl<'a> PluginLoader<'a> {
         self
     }
     pub fn start_plugin(&mut self) -> Result<()> {
+        let snapshot = self.load_snapshot();
+        self.plugin_map.lock().unwrap().begin_load(self.plugin_id);
+        let result = self.start_plugin_instances();
+        if result.is_err() {
+            if self.unloaded_during_load {
+                self.remove_failed_load_data_dir_if_unused(&snapshot);
+            } else {
+                self.rollback_failed_load(&snapshot);
+            }
+        }
+        self.plugin_map.lock().unwrap().end_load(self.plugin_id);
+        match result {
+            // The plugin is gone; there is nothing left to report.
+            Err(_) if self.unloaded_during_load => Ok(()),
+            result => result,
+        }
+    }
+    fn start_plugin_instances(&mut self) -> Result<()> {
         self.record_plugin_metadata();
         let module = if self.skip_cache {
             self.interpret_module()?
@@ -146,18 +179,38 @@ impl<'a> PluginLoader<'a> {
         Ok(())
     }
     pub fn start_shared_plugin(&mut self) -> Result<Arc<Mutex<RunningPlugin>>> {
-        let module = if self.skip_cache {
-            self.interpret_module()?
-        } else {
-            self.load_module_from_memory()
-                .or_else(|_e| self.interpret_module())?
-        };
-        let (mut store, instance) = self.create_plugin_environment(module)?;
-        store.data_mut().shared = Some(SharedEnv::default());
-        self.load_plugin_instance(store, &instance, true)
+        self.shared_load = true;
+        let snapshot = self.load_snapshot();
+        self.plugin_map.lock().unwrap().begin_load(self.plugin_id);
+        let result = (|| {
+            let module = if self.skip_cache {
+                self.interpret_module()?
+            } else {
+                self.load_module_from_memory()
+                    .or_else(|_e| self.interpret_module())?
+            };
+            let (mut store, instance) = self.create_plugin_environment(module)?;
+            store.data_mut().shared = Some(SharedEnv::default());
+            self.load_plugin_instance(store, &instance, true)
+        })();
+        if result.is_err() {
+            if !self.unloaded_during_load {
+                self.rollback_failed_load(&snapshot);
+            }
+        }
+        self.plugin_map.lock().unwrap().end_load(self.plugin_id);
+        result
+    }
+    fn load_snapshot(&self) -> LoadSnapshot {
+        let plugin_map = self.plugin_map.lock().unwrap();
+        LoadSnapshot {
+            metadata: plugin_map.metadata(self.plugin_id).cloned(),
+            had_instance: plugin_map.has_instance_of(self.plugin_id)
+                || plugin_map.shared_running_plugin(self.plugin_id).is_some(),
+        }
     }
     fn record_plugin_metadata(&mut self) {
-        self.plugin_map.insert_metadata(
+        self.plugin_map.lock().unwrap().insert_metadata(
             self.plugin_id,
             PluginMetadata {
                 plugin_config: self.plugin_config.clone(),
@@ -238,40 +291,180 @@ impl<'a> PluginLoader<'a> {
             self.size.rows,
             self.size.cols,
         )));
-        if shared {
-            self.plugin_map.insert_shared(
-                self.plugin_id,
-                (plugin.clone(), subscriptions, workers),
-                in_blocking_call,
-            );
-        } else {
-            self.plugin_map.insert(
-                self.plugin_id,
-                self.client_id,
-                plugin.clone(),
-                subscriptions,
-                workers,
-            );
+        {
+            let mut plugin_map = self.plugin_map.lock().unwrap();
+            // Checked under the same lock as the insert, which unload also takes.
+            if plugin_map.unloaded_during_load(self.plugin_id) {
+                self.unloaded_during_load = true;
+                drop(plugin_map);
+                for (_worker_name, worker_sender) in workers {
+                    drop(worker_sender.send(MessageToWorker::Exit));
+                }
+                return Err(anyhow!(
+                    "plugin {} was unloaded while it was loading",
+                    self.plugin_id
+                ));
+            }
+            if shared {
+                plugin_map.insert_shared(
+                    self.plugin_id,
+                    (plugin.clone(), subscriptions, workers),
+                    in_blocking_call,
+                );
+                self.published_shared_instance = Some(plugin.clone());
+            } else {
+                plugin_map.insert(
+                    self.plugin_id,
+                    self.client_id,
+                    plugin.clone(),
+                    subscriptions,
+                    workers,
+                );
+                self.published_instances
+                    .push((self.client_id, plugin.clone()));
+            }
         }
 
-        start_function
-            .call(&mut plugin.lock().unwrap().store, ())
-            .with_context(err_context)?;
+        // The instance is already in the map so it can resolve itself during
+        // `_start`/`load`. A failure below rolls that provisional entry back.
+        let init_result: Result<()> = (|| {
+            start_function
+                .call(&mut plugin.lock().unwrap().store, ())
+                .with_context(err_context)?;
 
-        let protobuf_plugin_configuration: ProtobufPluginConfiguration = self
-            .plugin_config
-            .initial_userspace_configuration
-            .clone()
-            .try_into()
-            .map_err(|e| anyhow!("Failed to serialize user configuration: {:?}", e))?;
-        let protobuf_bytes = protobuf_plugin_configuration.encode_to_vec();
-        wasi_write_object(plugin.lock().unwrap().store.data(), &protobuf_bytes)
-            .with_context(err_context)?;
-        load_function
-            .call(&mut plugin.lock().unwrap().store, ())
-            .with_context(err_context)?;
+            let protobuf_plugin_configuration: ProtobufPluginConfiguration = self
+                .plugin_config
+                .initial_userspace_configuration
+                .clone()
+                .try_into()
+                .map_err(|e| anyhow!("Failed to serialize user configuration: {:?}", e))?;
+            let protobuf_bytes = protobuf_plugin_configuration.encode_to_vec();
+            wasi_write_object(plugin.lock().unwrap().store.data(), &protobuf_bytes)
+                .with_context(err_context)?;
+            load_function
+                .call(&mut plugin.lock().unwrap().store, ())
+                .with_context(err_context)?;
+            Ok(())
+        })();
+        init_result?;
+
+        if shared {
+            let still_published = self
+                .plugin_map
+                .lock()
+                .unwrap()
+                .shared_running_plugin(self.plugin_id)
+                .map(|(current, _)| Arc::ptr_eq(&current, &plugin))
+                .unwrap_or(false);
+            if !still_published {
+                self.unloaded_during_load = true;
+                return Err(anyhow!(
+                    "plugin {} was unloaded while it was loading",
+                    self.plugin_id
+                ));
+            }
+        }
 
         Ok(plugin)
+    }
+    /// Roll back only the instances this loader published. A concurrent load of the
+    /// same id may have replaced one of them, so each entry is matched by identity.
+    fn rollback_failed_load(&mut self, snapshot: &LoadSnapshot) {
+        // The guest locks its instance and then the map. Read the instance first.
+        let mut published_clients = Vec::new();
+        for (client_id, published) in &self.published_instances {
+            if published.lock().unwrap().intercepting_key_presses() {
+                published_clients.push(*client_id);
+            }
+        }
+        let (removed, other_instances_remain) = {
+            let mut plugin_map = self.plugin_map.lock().unwrap();
+            let mut removed = Vec::new();
+            for (client_id, published) in self.published_instances.drain(..) {
+                let still_published = plugin_map
+                    .get_running_plugin(self.plugin_id, Some(client_id))
+                    .map(|current| Arc::ptr_eq(&current, &published))
+                    .unwrap_or(false);
+                if still_published {
+                    if let Some(assets) =
+                        plugin_map.remove_plugin_instance(self.plugin_id, client_id)
+                    {
+                        removed.push(assets);
+                    }
+                }
+            }
+            if let Some(published) = self.published_shared_instance.take() {
+                let still_published = plugin_map
+                    .shared_running_plugin(self.plugin_id)
+                    .map(|(current, _)| Arc::ptr_eq(&current, &published))
+                    .unwrap_or(false);
+                if still_published {
+                    if let Some(assets) = plugin_map.remove_shared(self.plugin_id) {
+                        removed.push(assets);
+                    }
+                }
+            }
+            let other_instances_remain = plugin_map.has_instance_of(self.plugin_id)
+                || plugin_map.shared_running_plugin(self.plugin_id).is_some();
+            if !other_instances_remain {
+                match snapshot.metadata.clone() {
+                    Some(metadata) => plugin_map.insert_metadata(self.plugin_id, metadata),
+                    None => plugin_map.remove_metadata(self.plugin_id),
+                }
+            }
+            (removed, other_instances_remain)
+        };
+        for (_running_plugin, _subscriptions, workers) in removed {
+            for (_worker_name, worker_sender) in workers {
+                drop(worker_sender.send(MessageToWorker::Exit));
+            }
+        }
+        // A plugin that never finished loading is not unloaded later, so its data
+        // directory would stay behind. It is shared by every instance and outlives a
+        // reload, so it is removed only when this first load left nothing behind.
+        if !snapshot.had_instance && !other_instances_remain {
+            self.remove_data_dir();
+        }
+        if !self.shared_load && !other_instances_remain {
+            for client_id in published_clients {
+                let _ = self
+                    .senders
+                    .send_to_screen(ScreenInstruction::ClearKeyPressesIntercepts(client_id));
+            }
+            let _ = self
+                .senders
+                .send_to_screen(ScreenInstruction::ClearAllPluginHighlights(self.plugin_id));
+            let _ = self
+                .senders
+                .send_to_plugin(super::PluginInstruction::UnregisterSettingsEntry(
+                    self.plugin_id,
+                ));
+        }
+    }
+    fn remove_failed_load_data_dir_if_unused(&self, snapshot: &LoadSnapshot) {
+        if snapshot.had_instance {
+            return;
+        }
+        let unused = {
+            let plugin_map = self.plugin_map.lock().unwrap();
+            !plugin_map.has_instance_of(self.plugin_id)
+                && plugin_map.shared_running_plugin(self.plugin_id).is_none()
+                && plugin_map.metadata(self.plugin_id).is_none()
+        };
+        if unused {
+            self.remove_data_dir();
+        }
+    }
+    fn remove_data_dir(&self) {
+        if let Err(e) = fs::remove_dir_all(&self.plugin_own_data_dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::error!(
+                    "Failed to remove data dir of plugin {} after a failed load: {:?}",
+                    self.plugin_id,
+                    e
+                );
+            }
+        }
     }
     pub fn create_plugin_environment(
         &self,
@@ -363,8 +556,19 @@ impl<'a> PluginLoader<'a> {
                     // don't reload the plugin once more for ourselves
                     continue;
                 }
+                if self
+                    .plugin_map
+                    .lock()
+                    .unwrap()
+                    .unloaded_during_load(self.plugin_id)
+                {
+                    // Unload already collected the instances published so far.
+                    // Anything published now would never be cleaned up.
+                    self.unloaded_during_load = true;
+                    break;
+                }
                 self.client_id = client_id;
-                self.start_plugin()?;
+                self.start_plugin_instances()?;
             }
         }
         Ok(())

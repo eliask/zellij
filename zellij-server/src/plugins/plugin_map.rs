@@ -53,10 +53,52 @@ pub struct PluginMap {
     plugin_metadata: HashMap<PluginId, PluginMetadata>,
     shared_assets: HashMap<PluginId, PluginAssets>,
     shared_blocking_calls: HashMap<PluginId, Arc<AtomicBool>>,
+    // Plugins whose loader is still publishing instances, and which of those were
+    // unloaded meanwhile. An instance published after unload would never be cleaned up.
+    loads_in_progress: HashSet<PluginId>,
+    unloaded_during_load: HashSet<PluginId>,
 }
 
 impl PluginMap {
+    /// A loader starts publishing instances of the plugin.
+    pub fn begin_load(&mut self, pid: PluginId) {
+        self.loads_in_progress.insert(pid);
+        self.unloaded_during_load.remove(&pid);
+    }
+    pub fn end_load(&mut self, pid: PluginId) {
+        self.loads_in_progress.remove(&pid);
+        self.unloaded_during_load.remove(&pid);
+    }
+    /// Whether the plugin was unloaded after its loader started. Instances published
+    /// after that point are not part of what the unload collected, so the loader must
+    /// not publish them.
+    pub fn unloaded_during_load(&self, pid: PluginId) -> bool {
+        self.unloaded_during_load.contains(&pid)
+    }
+    /// Unload observed a loader that has not finished publishing. Later inserts of
+    /// this id must not land after the unload has already collected the map.
+    pub fn note_unload_if_loading(&mut self, pid: PluginId) {
+        if self.loads_in_progress.contains(&pid) {
+            self.unloaded_during_load.insert(pid);
+        }
+    }
+    /// Remove one (plugin, client) instance so a failed load can roll back only the
+    /// instances it published.
+    pub fn remove_plugin_instance(
+        &mut self,
+        plugin_id: PluginId,
+        client_id: ClientId,
+    ) -> Option<PluginAssets> {
+        self.plugin_assets.remove(&(plugin_id, client_id))
+    }
+    pub fn has_instance_of(&self, plugin_id: PluginId) -> bool {
+        self.plugin_assets.keys().any(|(pid, _)| *pid == plugin_id)
+    }
+
     pub fn remove_plugins(&mut self, pid: PluginId) -> RemovedPluginAssets {
+        if self.loads_in_progress.contains(&pid) {
+            self.unloaded_during_load.insert(pid);
+        }
         self.plugin_metadata.remove(&pid);
         let mut removed = HashMap::new();
         let ids_in_plugin_map: Vec<PluginKey> = self.plugin_assets.keys().copied().collect();
@@ -87,7 +129,12 @@ impl PluginMap {
         assets: PluginAssets,
         in_blocking_call: Option<Arc<AtomicBool>>,
     ) {
-        self.shared_assets.insert(instance_id, assets);
+        let replaced = self.shared_assets.insert(instance_id, assets);
+        if let Some((_running_plugin, _subscriptions, workers)) = replaced {
+            for (_worker_name, worker_sender) in workers {
+                drop(worker_sender.send(MessageToWorker::Exit));
+            }
+        }
         match in_blocking_call {
             Some(in_blocking_call) => {
                 self.shared_blocking_calls
@@ -302,10 +349,17 @@ impl PluginMap {
         subscriptions: Arc<Mutex<Subscriptions>>,
         running_workers: HashMap<String, UnboundedSender<MessageToWorker>>,
     ) {
-        self.plugin_assets.insert(
+        let replaced = self.plugin_assets.insert(
             (plugin_id, client_id),
             (running_plugin, subscriptions, running_workers),
         );
+        if let Some((_running_plugin, _subscriptions, workers)) = replaced {
+            // The replacement owns this key. Stop the previous workers so they do not
+            // keep running against an instance the map no longer holds.
+            for (_worker_name, worker_sender) in workers {
+                drop(worker_sender.send(MessageToWorker::Exit));
+            }
+        }
     }
     pub fn run_plugin_of_plugin_id(&self, plugin_id: PluginId) -> Option<RunPlugin> {
         self.plugin_metadata
