@@ -11577,3 +11577,363 @@ fn oversized_xtgettcap_request_is_dropped() {
     vte_parser.feed(&mut grid, &sequence);
     assert!(grid.pending_messages_to_pty.is_empty());
 }
+
+fn stored_text(grid: &Grid) -> String {
+    grid.lines_above
+        .iter()
+        .chain(grid.viewport.iter())
+        .chain(grid.lines_below.iter())
+        .map(row_to_string)
+        .collect()
+}
+
+#[test]
+fn resize_around_a_wide_glyph_keeps_the_cursor_after_the_following_character() {
+    // 4 columns: `a` `你` `X`, cursor pending-wrap. At 2 columns the wide
+    // glyph does not fit after `a`, so dividing the linear index by the new
+    // width lands on `你` and the next write replaces `X`.
+    let mut grid = create_sized_grid_with_content(1, 4, "a你X\u{1b}7");
+    assert_eq!((grid.cursor.x, grid.cursor.y), (4, 0));
+
+    grid.change_size(3, 2);
+
+    assert_eq!(
+        grid.viewport.iter().map(row_to_string).collect::<Vec<_>>(),
+        vec!["a".to_owned(), "你".to_owned(), "X".to_owned()]
+    );
+    assert_eq!((grid.cursor.x, grid.cursor.y), (1, 2));
+    assert_eq!(
+        grid.saved_cursor_position
+            .as_ref()
+            .map(|cursor| (cursor.x, cursor.y)),
+        Some((1, 2))
+    );
+
+    feed(&mut grid, "Y");
+    assert_eq!(stored_text(&grid), "a你XY");
+}
+
+#[test]
+fn widening_a_clipped_glyph_keeps_the_cursor_past_its_restored_width() {
+    let mut grid = create_sized_grid_with_content(4, 4, "a你X");
+    assert_eq!((grid.cursor.x, grid.cursor.y), (4, 0));
+
+    grid.change_size(4, 1);
+    assert_eq!(grid.viewport[1].columns[0].width(), 1);
+    assert!(grid.viewport[1].columns[0].width_was_clipped());
+    assert_eq!((grid.cursor.x, grid.cursor.y), (1, 2));
+
+    grid.change_size(3, 4);
+    assert_eq!(grid.viewport[0].columns[1].character, '你');
+    assert_eq!(grid.viewport[0].columns[1].width(), 2);
+    assert!(!grid.viewport[0].columns[1].width_was_clipped());
+    assert_eq!((grid.cursor.x, grid.cursor.y), (4, 0));
+
+    feed(&mut grid, "Y");
+    assert_eq!(stored_text(&grid), "a你XY");
+}
+
+#[test]
+fn a_following_canonical_row_does_not_drop_the_wide_glyph_cursor_correction() {
+    let mut grid = create_sized_grid_with_content(6, 4, "a你X\u{1b}7\n\rZ");
+    assert_eq!(
+        grid.saved_cursor_position
+            .as_ref()
+            .map(|cursor| (cursor.x, cursor.y)),
+        Some((4, 0))
+    );
+
+    grid.change_size(6, 1);
+
+    assert_eq!(
+        grid.viewport
+            .iter()
+            .take(4)
+            .map(row_to_string)
+            .collect::<Vec<_>>(),
+        vec![
+            "a".to_owned(),
+            "你".to_owned(),
+            "X".to_owned(),
+            "Z".to_owned()
+        ]
+    );
+    assert_eq!(
+        grid.saved_cursor_position
+            .as_ref()
+            .map(|cursor| (cursor.x, cursor.y)),
+        Some((1, 2))
+    );
+}
+
+#[test]
+fn cursor_reflow_of_clipped_wide_text_does_not_overwrite_the_next_character() {
+    let mut grid = create_sized_grid_with_content(1, 3, "你X");
+    assert_eq!(grid.cursor.x, 3);
+
+    grid.change_size(2, 1);
+    feed(&mut grid, "Y");
+
+    assert_eq!(stored_text(&grid), "你XY");
+    assert!(
+        grid.viewport
+            .iter()
+            .any(|row| row_to_string(row).contains('X')),
+        "X must still be on screen, not replaced by Y: {:?}",
+        grid.viewport.iter().map(row_to_string).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_narrow_soft_wrapped_wide_character_regains_its_width() {
+    let wrapped = crate::panes::grid::Row::rewrap_rows(vec![row_from_str("你ab")], 3);
+    assert_eq!(wrapped.len(), 2);
+    assert_eq!(row_to_string(&wrapped[0]), "你a");
+    assert_eq!(wrapped[0].columns[0].width(), 2);
+
+    let narrow = crate::panes::grid::Row::rewrap_rows(wrapped, 1);
+    assert!(narrow.iter().all(|row| row.width() <= 1));
+    assert_eq!(narrow.iter().map(row_to_string).collect::<String>(), "你ab");
+    assert_eq!(narrow[0].columns[0].width(), 1);
+    assert_eq!(narrow[0].columns[0].natural_width(), 2);
+    assert!(narrow[0].columns[0].width_was_clipped());
+
+    let restored = crate::panes::grid::Row::rewrap_rows(narrow, 3);
+    assert_eq!(row_to_string(&restored[0]), "你a");
+    assert_eq!(restored[0].columns[0].width(), 2);
+    assert!(!restored[0].columns[0].width_was_clipped());
+}
+
+#[test]
+fn reflow_keeps_a_vs16_cluster_at_its_stored_width_unless_reflow_clipped_it() {
+    use crate::panes::grid::Row;
+    use crate::panes::terminal_character::TerminalCharacter;
+
+    let mut stored_narrow = TerminalCharacter::new_with_width('⚠', 1, Default::default());
+    assert!(stored_narrow.attach('\u{FE0F}'));
+    assert_eq!(stored_narrow.natural_width(), 2);
+    let wide = Row::rewrap_rows(vec![Row::from_columns(vec![stored_narrow])], 80);
+    assert_eq!(wide[0].columns[0].width(), 1);
+    let narrow = Row::rewrap_rows(wide, 1);
+    assert_eq!(narrow[0].columns[0].width(), 1);
+    let widened = Row::rewrap_rows(narrow, 80);
+    assert_eq!(
+        widened[0].columns[0].width(),
+        1,
+        "a VS16 cluster that was stored narrow must not grow on reflow"
+    );
+
+    let mut clipped = TerminalCharacter::new_with_width('⚠', 2, Default::default());
+    assert!(clipped.attach('\u{FE0F}'));
+    let narrow = Row::rewrap_rows(vec![Row::from_columns(vec![clipped])], 1);
+    assert_eq!(narrow[0].columns[0].width(), 1);
+    assert!(narrow[0].columns[0].width_was_clipped());
+    let widened = Row::rewrap_rows(narrow, 80);
+    assert_eq!(widened[0].columns[0].width(), 2);
+}
+
+struct HistoryCapGuard;
+
+impl Drop for HistoryCapGuard {
+    fn drop(&mut self) {
+        super::set_history_row_cap_override_for_test(None);
+    }
+}
+
+#[test]
+fn unpark_keeps_live_bytes_after_parked_overlap_retention() {
+    let _guard = HistoryCapGuard;
+    super::set_history_row_cap_override_for_test(Some(2));
+
+    let mut grid = create_grid_with_size_and_raw(4, 20, b"");
+    let mut content = Vec::new();
+    for index in 0..5 {
+        content.extend_from_slice(format!("line-{index}\r\n").as_bytes());
+    }
+    feed_bytes(&mut grid, &content);
+    grid.move_viewport_up(1);
+    assert_eq!(grid.lines_below.len(), 1);
+    assert!(grid.park_at_live_bottom());
+    assert!(grid.is_live_bottom_parked());
+    grid.viewport[0] = row_from_str("LIVEKEEP").canonical();
+    grid.unpark_live_bottom();
+    assert!(
+        stored_text(&grid).contains("LIVEKEEP"),
+        "unpark dropped the live overlap row: {}",
+        stored_text(&grid)
+    );
+}
+
+#[test]
+fn parked_output_stays_inside_the_scrollback_budget() {
+    let _guard = HistoryCapGuard;
+    super::set_history_row_cap_override_for_test(Some(6));
+
+    let mut grid = create_grid_with_size_and_raw(3, 8, b"MARKER-ROW\r\n");
+    let mut parser = vt_parser::Parser::new();
+    parser.feed(&mut grid, &b"x\r\n".repeat(8));
+    grid.move_viewport_up(2);
+    assert!(grid.park_at_live_bottom());
+    parser.feed(&mut grid, &b"y\r\n".repeat(4));
+    assert!(
+        grid.is_live_bottom_parked(),
+        "a short burst must not evict the whole pinned view"
+    );
+    assert!(
+        grid.parked_history_rows() <= 6,
+        "parked history {} exceeded the cap",
+        grid.parked_history_rows()
+    );
+    parser.feed(&mut grid, &b"z\r\n".repeat(20));
+    assert!(grid.history_was_truncated());
+    assert!(grid.parked_history_rows() <= 6);
+    grid.unpark_live_bottom();
+    assert!(
+        !stored_text(&grid).contains("MARKER-ROW"),
+        "the pinned anchor was evicted and must not come back"
+    );
+}
+
+#[test]
+fn reset_while_parked_does_not_restore_the_old_viewport() {
+    let mut grid = create_grid_with_size_and_raw(5, 40, b"PARKED-SECRET\r\n");
+    let mut parser = vt_parser::Parser::new();
+    parser.feed(&mut grid, &b"live-line\r\n".repeat(8));
+    grid.move_viewport_up(4);
+    assert!(grid.park_at_live_bottom());
+    parser.feed(&mut grid, b"\x1bcafter-reset\r\n");
+    grid.unpark_live_bottom();
+    let document = stored_text(&grid);
+    assert!(document.contains("after-reset"), "{document}");
+    assert!(!document.contains("PARKED-SECRET"), "{document}");
+    assert!(!grid.is_live_bottom_parked());
+    assert!(!grid.history_was_truncated());
+}
+
+#[test]
+fn alternate_screen_while_parked_restores_the_held_text() {
+    let mut grid = create_grid_with_size_and_raw(4, 20, b"");
+    let mut parser = vt_parser::Parser::new();
+    parser.feed(
+        &mut grid,
+        b"PARKED-SECRET\r\na\r\nb\r\nc\r\nd\r\ne\r\nf\r\nBOTTOM\r\n",
+    );
+    grid.move_viewport_up(6);
+    assert!(grid.dump_screen(false).contains("PARKED-SECRET"));
+    assert!(grid.park_at_live_bottom());
+    parser.feed(&mut grid, b"\x1b[?1049h");
+    assert!(!grid.is_live_bottom_parked());
+    assert!(!grid.dump_screen(true).contains("PARKED-SECRET"));
+    parser.feed(&mut grid, b"\x1b[?1049l");
+    assert!(grid.dump_screen(true).contains("PARKED-SECRET"));
+}
+
+#[test]
+fn resize_while_parked_unparks_and_keeps_the_held_text() {
+    let mut grid = create_grid_with_size_and_raw(4, 20, b"PARKED-SECRET\r\n");
+    let mut parser = vt_parser::Parser::new();
+    parser.feed(&mut grid, &b"later\r\n".repeat(8));
+    grid.move_viewport_up(4);
+    assert!(grid.park_at_live_bottom());
+    grid.change_size(5, 24);
+    assert!(!grid.is_live_bottom_parked());
+    assert!(stored_text(&grid).contains("PARKED-SECRET"));
+}
+
+fn grid_document_snapshot(grid: &Grid) -> Vec<String> {
+    grid.lines_above
+        .iter()
+        .chain(grid.viewport.iter())
+        .chain(grid.lines_below.iter())
+        .map(|row| {
+            let mut snapshot = String::new();
+            for cell in &row.columns {
+                snapshot.push_str(&format!("{:?}{:?}", cell, cell.styles));
+            }
+            snapshot.push_str(&format!(
+                "|trailing={}|canonical={}|markers={:?}",
+                row.trailing_blanks,
+                row.is_canonical,
+                row.osc133_markers.as_slice(),
+            ));
+            snapshot
+        })
+        .collect()
+}
+
+fn overlap_park_pane(scrolled: bool) -> crate::panes::TerminalPane {
+    use crate::tab::Pane;
+    use zellij_utils::pane_size::PaneGeom;
+
+    let mut geom = PaneGeom::default();
+    geom.rows.set_inner(3);
+    geom.cols.set_inner(40);
+    let mut pane = crate::panes::TerminalPane::new(
+        1,
+        geom,
+        Style::default(),
+        0,
+        String::new(),
+        Rc::new(RefCell::new(LinkHandler::new())),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(SixelImageStore::default())),
+        Rc::new(RefCell::new(KittyImageStore::default())),
+        Rc::new(RefCell::new(Palette::default())),
+        Rc::new(RefCell::new(HashMap::new())),
+        None,
+        None,
+        false,
+        true,
+        true,
+        true,
+        false,
+        None,
+    );
+    let mut content = Vec::new();
+    for index in 0..12 {
+        content.extend_from_slice(format!("line-{index}\r\n").as_bytes());
+    }
+    pane.handle_pty_bytes(content);
+    if scrolled {
+        pane.scroll_up(1, 1);
+        assert!(pane.grid.is_scrolled);
+    }
+    pane
+}
+
+#[test]
+fn a_short_scroll_keeps_edits_to_the_overlapping_live_rows() {
+    use crate::tab::Pane;
+
+    let operations: &[&[u8]] = &[
+        b"\x1b[1;1Hoverwritten",
+        b"\x1b[2;1H\x1b[31mstyled\x1b[0m",
+        b"\x1b[3;1H\x1b[K",
+        b"\x1b[2;1H\x1b]133;A\x07\x1b]133;B\x07prompt\x1b]133;C\x07",
+        b"\x1b[1;1H\x1b[L",
+        b"\x1b[2;1H\x1b[M",
+        b"\x1b[2;3r\x1b[3;1H\n\x1b[r",
+        b"\x1b[1;1Hlast",
+    ];
+
+    let mut plain = overlap_park_pane(false);
+    let mut parked = overlap_park_pane(true);
+    for operation in operations {
+        plain.handle_pty_bytes(operation.to_vec());
+        parked.handle_pty_bytes(operation.to_vec());
+    }
+    plain.clear_scroll();
+    parked.clear_scroll();
+
+    assert!(plain.grid.lines_below.is_empty());
+    assert!(parked.grid.lines_below.is_empty());
+    assert_eq!(
+        grid_document_snapshot(&plain.grid),
+        grid_document_snapshot(&parked.grid),
+        "a pinned view one row above the bottom changed the live document"
+    );
+    assert_eq!(
+        format!("{:?}", plain.grid.cursor),
+        format!("{:?}", parked.grid.cursor)
+    );
+}

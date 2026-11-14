@@ -3184,3 +3184,47 @@ fn graphics_media_files_are_private_and_never_reuse_an_existing_file() {
     assert!(super::super::write_private_media(&path, b"other").is_err());
     assert_eq!(std::fs::read(&path).unwrap(), b"pixels");
 }
+
+#[test]
+fn clipped_wide_cjk_is_emitted_as_a_single_column_placeholder() {
+    let mut flagged = TerminalCharacter::new('你');
+    flagged.set_width(1);
+    flagged.set_width_was_clipped(true);
+    let flagged_output = ansi_for(CharacterChunk::new(vec![flagged], 0, 0), None);
+    assert_eq!(flagged_output, "\u{1b}[1;1H\u{1b}[m ");
+    assert!(!flagged_output.contains('你'));
+
+    let mut narrow = TerminalCharacter::new('你');
+    narrow.set_width(1);
+    assert!(!narrow.width_was_clipped());
+    let mut grouped = CharacterChunk::new(vec![narrow, TerminalCharacter::new('X')], 0, 0);
+    grouped.may_have_groups = true;
+    let grouped_output = ansi_for(grouped, None);
+    assert_eq!(grouped_output, "\u{1b}[1;1H\u{1b}[m X");
+    assert!(!grouped_output.contains('你'));
+}
+
+#[test]
+fn a_one_column_clipped_cluster_is_not_written_wider_than_its_cell() {
+    let cases: [&[(&str, usize)]; 2] = [
+        &[("你\u{0301}", 1), ("X", 1)],
+        &[("\u{1F468}\u{200D}\u{1F469}", 1), ("X", 1)],
+    ];
+    for parts in cases {
+        for grouped in [false, true] {
+            let cells = cells_of(parts);
+            let mut chunk = CharacterChunk::new(cells, 0, 0);
+            chunk.may_have_groups = grouped;
+            let output = ansi_for(chunk, None);
+            let sentinel = output.find('X').expect("sentinel");
+            let before = &output[..sentinel];
+            assert!(
+                !before.contains('你')
+                    && !before.contains('\u{1F468}')
+                    && !before.contains('\u{1F469}'),
+                "grouped={grouped} output={output:?}"
+            );
+            assert_eq!(output, "\u{1b}[1;1H\u{1b}[m X", "grouped={grouped}");
+        }
+    }
+}

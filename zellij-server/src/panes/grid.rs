@@ -587,6 +587,100 @@ fn recycle_columns(mut columns: Vec<TerminalCharacter>) {
     });
 }
 
+#[cfg(test)]
+thread_local! {
+    static HISTORY_ROW_CAP_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_history_row_cap_override_for_test(cap: Option<usize>) {
+    HISTORY_ROW_CAP_OVERRIDE.with(|cap_cell| cap_cell.set(cap));
+}
+
+/// User viewport held off to the side while PTY bytes are applied to the
+/// live screen. `overlap_skip` is how many live rows still duplicate the
+/// tail of `held` and must not be appended under that view. It stays
+/// clamped to `held.len()`: a front row is part of that overlap only
+/// when the overlap already covers the whole held buffer.
+///
+/// `held` and `gap` are retained history. They share the scrollback row
+/// budget with `lines_above`.
+#[derive(Clone)]
+struct LiveBottomPark {
+    held: VecDeque<Row>,
+    gap: VecDeque<Row>,
+    overlap_skip: usize,
+}
+
+/// Stored width, replaced by `natural_width()` when an earlier reflow clipped
+/// the glyph. A VS16 cluster is only as wide as its base character until the
+/// client opts into grapheme mode, so reflowing it must not widen it: that
+/// would make the structured frame disagree with the ANSI dialect such a
+/// client replays. Other cells keep the width they were stored with.
+fn logical_reflow_width(character: &TerminalCharacter) -> (usize, usize) {
+    let stored = character.width();
+    let natural = character.natural_width();
+    let logical = if stored < natural
+        && (character.width_was_clipped() || !character.contains_code_point('\u{FE0F}'))
+    {
+        natural
+    } else {
+        stored
+    };
+    (logical, natural)
+}
+
+/// Width `rewrap_rows` will give this character.
+fn fitted_character_width(character: &TerminalCharacter, max_row_length: usize) -> usize {
+    if max_row_length == 0 {
+        return character.width().max(1);
+    }
+    let (logical, _) = logical_reflow_width(character);
+    if logical > max_row_length {
+        max_row_length
+    } else {
+        logical
+    }
+}
+
+/// Greedy wrap of one logical line. A character that does not fit the
+/// remaining columns moves to the next display row whole.
+#[derive(Clone, Copy, Default)]
+struct WrapState {
+    completed_rows: usize,
+    current: usize,
+}
+
+impl WrapState {
+    fn push_character(&mut self, character_width: usize, width: usize) {
+        if self.current + character_width > width {
+            if self.current > 0 {
+                self.completed_rows += 1;
+            }
+            self.current = 0;
+        }
+        self.current += character_width;
+    }
+
+    fn push_single_width_cells(&mut self, cells: usize, width: usize) {
+        if cells == 0 || width == 0 {
+            return;
+        }
+        if self.current > width {
+            self.completed_rows += 1;
+            self.current = 0;
+        }
+        let total = self.current + cells;
+        if total <= width {
+            self.current = total;
+        } else {
+            let completed = (total - 1) / width;
+            self.completed_rows += completed;
+            self.current = total - completed * width;
+        }
+    }
+}
+
 fn columns_with_capacity(capacity: usize) -> Vec<TerminalCharacter> {
     let recycled = RECYCLED_COLUMNS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
     if recycled.capacity() >= capacity {
@@ -594,6 +688,17 @@ fn columns_with_capacity(capacity: usize) -> Vec<TerminalCharacter> {
     } else {
         Vec::with_capacity(capacity)
     }
+}
+
+fn scrollback_row_limit() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = HISTORY_ROW_CAP_OVERRIDE.with(|cap_cell| cap_cell.get()) {
+        return cap;
+    }
+    SCROLL_BUFFER_SIZE
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_SCROLL_BUFFER_SIZE)
 }
 
 fn bounded_push(
@@ -608,7 +713,7 @@ fn bounded_push(
         exact.append(&mut value.columns);
         recycle_columns(std::mem::replace(&mut value.columns, exact));
     }
-    let scroll_buffer_size = *SCROLL_BUFFER_SIZE.get().unwrap();
+    let scroll_buffer_size = scrollback_row_limit();
     let mut evicted_row_width = None;
     if vec.len() >= scroll_buffer_size {
         let line = vec.pop_front();
@@ -960,6 +1065,12 @@ pub struct Grid {
     pub(crate) lines_above: VecDeque<Row>,
     pub(crate) viewport: VecDeque<Row>,
     pub(crate) lines_below: VecDeque<Row>,
+    /// User viewport held aside while bytes are parsed against the live
+    /// screen. Rows that scroll off that screen join `gap` instead of
+    /// `lines_above`, so the history between the two windows stays put.
+    live_bottom: Option<LiveBottomPark>,
+    /// Retention dropped rows the user had scrolled back to see.
+    history_truncated: bool,
     horizontal_tabstops: BTreeSet<usize>,
     alternate_screen_state: Option<AlternateScreenState>,
     cursor: Cursor,
@@ -1367,6 +1478,8 @@ impl Grid {
             lines_above: VecDeque::new(),
             viewport: VecDeque::from(vec![Row::new().canonical()]),
             lines_below: VecDeque::new(),
+            live_bottom: None,
+            history_truncated: false,
             horizontal_tabstops: create_horizontal_tabstops(columns),
             cursor: Cursor::new(0, 0, styled_underlines),
             cursor_is_hidden: false,
@@ -1606,40 +1719,104 @@ impl Grid {
         }
         canonical_line_index
     }
-    // TODO: merge these two functions
-    fn cursor_index_in_canonical_line(&self) -> usize {
-        let mut cursor_canonical_line_index = 0;
-        let mut cursor_index_in_canonical_line = 0;
+    fn column_index_in_canonical_line(&self, x: usize, y: usize) -> usize {
+        let mut line_start = 0;
         for (i, line) in self.viewport.iter().enumerate() {
             if line.is_canonical {
-                cursor_canonical_line_index = i;
+                line_start = i;
             }
-            if i == self.cursor.y {
-                let line_wraps = self.cursor.y.saturating_sub(cursor_canonical_line_index);
-                cursor_index_in_canonical_line = (line_wraps * self.width) + self.cursor.x;
-                break;
+            if i == y {
+                return y.saturating_sub(line_start) * self.width + x;
             }
         }
-        cursor_index_in_canonical_line
+        0
     }
-    fn saved_cursor_index_in_canonical_line(&self) -> Option<usize> {
-        if let Some(saved_cursor_position) = self.saved_cursor_position.as_ref() {
-            let mut cursor_canonical_line_index = 0;
-            let mut cursor_index_in_canonical_line = 0;
-            for (i, line) in self.viewport.iter().enumerate() {
-                if line.is_canonical {
-                    cursor_canonical_line_index = i;
-                }
-                if i == saved_cursor_position.y {
-                    let line_wraps = saved_cursor_position.y - cursor_canonical_line_index;
-                    cursor_index_in_canonical_line =
-                        (line_wraps * self.width) + saved_cursor_position.x;
+    /// Linear column index, shifted by every fitted-width change of a glyph
+    /// wholly before the cursor. A clip narrows that index; a clipped glyph
+    /// regaining its natural width lengthens it. The canonical row after the
+    /// cursor must not wipe the shift.
+    fn reflowed_column_index(&self, x: usize, y: usize, new_columns: usize) -> usize {
+        let index = self.column_index_in_canonical_line(x, y);
+        let mut delta = 0isize;
+        for (i, row) in self.viewport.iter().enumerate() {
+            if i > y {
+                break;
+            }
+            if row.is_canonical {
+                delta = 0;
+            }
+            let mut column = 0usize;
+            for cell in &row.columns {
+                let old = cell.width();
+                let end = column + old;
+                if !(i < y || end <= x) {
                     break;
                 }
+                let fitted = fitted_character_width(cell, new_columns);
+                delta += fitted as isize - old as isize;
+                column = end;
             }
-            Some(cursor_index_in_canonical_line)
+        }
+        (index as isize + delta).max(0) as usize
+    }
+    /// Where `(x, y)` sits inside its canonical line after the same greedy
+    /// wrap as `Row::rewrap_rows`. A cursor that was not in column 0 and
+    /// lands on a full row stays pending-wrap (`x == new_columns`) so the
+    /// next character does not replace the glyph that wrapped early.
+    fn project_cursor_through_wrap(
+        &self,
+        x: usize,
+        y: usize,
+        new_columns: usize,
+    ) -> (usize, usize) {
+        if new_columns == 0 {
+            return (0, 0);
+        }
+        if new_columns == self.width {
+            let index = self.column_index_in_canonical_line(x, y);
+            let mut row = index / new_columns;
+            let mut column = index % new_columns;
+            if x != 0 && column == 0 {
+                row = row.saturating_sub(1);
+                column = new_columns;
+            }
+            return (column, row);
+        }
+        let mut line_start = 0usize;
+        for (i, row) in self.viewport.iter().enumerate() {
+            if i > y {
+                break;
+            }
+            if row.is_canonical {
+                line_start = i;
+            }
+        }
+        let mut state = WrapState::default();
+        for (i, row) in self.viewport.iter().enumerate().skip(line_start) {
+            if i > y {
+                break;
+            }
+            let mut column = 0usize;
+            let limit = if i == y { x } else { usize::MAX };
+            for cell in &row.columns {
+                let old = cell.width();
+                let end = column.saturating_add(old);
+                if end > limit {
+                    break;
+                }
+                state.push_character(fitted_character_width(cell, new_columns), new_columns);
+                column = end;
+            }
+            if i < y {
+                state.push_single_width_cells(row.trailing_blanks as usize, new_columns);
+            } else if x > column {
+                state.push_single_width_cells(x - column, new_columns);
+            }
+        }
+        if x == 0 && state.current == new_columns {
+            (0, state.completed_rows.saturating_add(1))
         } else {
-            None
+            (state.current, state.completed_rows)
         }
     }
     fn canonical_line_y_coordinates(&self, canonical_line_index: usize) -> usize {
@@ -1877,6 +2054,9 @@ impl Grid {
         if new_columns == 0 || new_rows == 0 {
             return;
         }
+        // Reflow owns one document. Put the pinned view back first so the
+        // parked gap is not a second history the resize never sees.
+        self.unpark_live_bottom();
         self.invalidate_scroll_offset();
         if self.alternate_screen_state.is_some() {
             // in alternate screen we do nothing but log the new size, the program in the terminal
@@ -1894,8 +2074,14 @@ impl Grid {
         let cursors = if force_rewrap || new_columns != self.width {
             self.horizontal_tabstops = create_horizontal_tabstops(new_columns);
             let mut cursor_canonical_line_index = self.cursor_canonical_line_index();
-            let cursor_index_in_canonical_line = self.cursor_index_in_canonical_line();
-            let saved_cursor_index_in_canonical_line = self.saved_cursor_index_in_canonical_line();
+            let (mut new_cursor_x, cursor_y_offset) =
+                self.project_cursor_through_wrap(self.cursor.x, self.cursor.y, new_columns);
+            let saved_cursor_projection = self
+                .saved_cursor_position
+                .as_ref()
+                .map(|saved| self.project_cursor_through_wrap(saved.x, saved.y, new_columns));
+            let cursor_index_in_canonical_line =
+                self.reflowed_column_index(self.cursor.x, self.cursor.y, new_columns);
             let mut saved_cursor_canonical_line_index = self
                 .saved_cursor_position
                 .as_ref()
@@ -1960,8 +2146,8 @@ impl Grid {
             let mut new_viewport_rows = vec![];
             for mut canonical_line in viewport_canonical_lines {
                 let mut canonical_line_parts = canonical_line.split_to_rows_of_length(new_columns);
-                // If a character is wider than the grid, split_to_rows_of_length returns an empty
-                // vec — skip the line, matching the old `break` behavior
+                // An empty split contributes no rows. Wide characters are clipped to the
+                // pane inside rewrap, not dropped.
                 if canonical_line_parts.is_empty() {
                     continue;
                 }
@@ -1973,53 +2159,23 @@ impl Grid {
             let cursor_line_first_y =
                 self.canonical_line_y_coordinates(cursor_canonical_line_index);
             let cursor_line_last_y = self.last_row_of_line_starting_at(cursor_line_first_y);
-            let mut new_cursor_y =
-                cursor_line_first_y + (cursor_index_in_canonical_line / new_columns);
-            let mut saved_cursor_y_coordinates = match (
-                saved_cursor_canonical_line_index,
-                saved_cursor_index_in_canonical_line,
-            ) {
-                (Some(line_index), Some(index_in_line)) => Some(
-                    self.canonical_line_y_coordinates(line_index) + index_in_line / new_columns,
-                ),
-                _ => None,
-            };
-
-            // A cursor at EOL has two equivalent positions - end of this line or beginning of
-            // next. If not already at the beginning of line, bias to EOL so add character logic
-            // doesn't create spurious canonical lines
-            let mut new_cursor_x = cursor_index_in_canonical_line % new_columns;
-            if self.cursor.x != 0 && new_cursor_x == 0 {
-                new_cursor_y = new_cursor_y.saturating_sub(1);
-                new_cursor_x = new_columns
-            }
+            let mut new_cursor_y = cursor_line_first_y + cursor_y_offset;
+            let (saved_cursor_x_coordinates, saved_cursor_y_coordinates) =
+                match (saved_cursor_projection, saved_cursor_canonical_line_index) {
+                    (Some((saved_x, saved_y_offset)), Some(line_index)) => (
+                        Some(saved_x),
+                        Some(self.canonical_line_y_coordinates(line_index) + saved_y_offset),
+                    ),
+                    _ => (None, None),
+                };
+            // Trailing blanks trimmed above can leave the anchor past the
+            // reflowed line. Pin it to the last row.
             if new_cursor_y > cursor_line_last_y {
                 let offset_in_last_row = cursor_index_in_canonical_line
                     .saturating_sub((cursor_line_last_y - cursor_line_first_y) * new_columns);
                 new_cursor_y = cursor_line_last_y;
                 new_cursor_x = offset_in_last_row.min(new_columns.saturating_sub(1));
             }
-            let saved_cursor_x_coordinates = match (
-                saved_cursor_index_in_canonical_line.as_ref(),
-                self.saved_cursor_position.as_mut(),
-                saved_cursor_y_coordinates.as_mut(),
-            ) {
-                (
-                    Some(saved_cursor_index_in_canonical_line),
-                    Some(saved_cursor_position),
-                    Some(saved_cursor_y_coordinates),
-                ) => {
-                    let x = saved_cursor_position.x;
-                    let mut new_x = *saved_cursor_index_in_canonical_line % new_columns;
-                    let new_y = saved_cursor_y_coordinates;
-                    if x != 0 && new_x == 0 {
-                        *new_y = new_y.saturating_sub(1);
-                        new_x = new_columns
-                    }
-                    Some(new_x)
-                },
-                _ => None,
-            };
             Some((
                 new_cursor_y,
                 saved_cursor_y_coordinates,
@@ -2700,7 +2856,10 @@ impl Grid {
                 self.viewport.pop_front();
             }
             self.viewport.push_back(new_row);
-            self.selection.move_up(1);
+            // The selection belongs to the held view, not the live screen.
+            if self.live_bottom.is_none() {
+                self.selection.move_up(1);
+            }
         } else {
             self.scroll_region_content_up(
                 scroll_region_top,
@@ -3256,6 +3415,10 @@ impl Grid {
         self.note_change();
     }
     pub fn reset_terminal_state(&mut self) {
+        // Drop the parked projection before clearing the live screen. A
+        // later unpark must not put the pre-reset viewport back.
+        self.live_bottom = None;
+        self.history_truncated = false;
         if let Some(alternate_screen_state) = self.alternate_screen_state.as_mut() {
             alternate_screen_state.kitty_grid.clear_all_placements();
         }
@@ -4324,7 +4487,267 @@ impl Grid {
             self.title = Some(popped_title);
         }
     }
+    fn history_row_cap(&self) -> usize {
+        scrollback_row_limit()
+    }
+    fn evict_one_scrollback_row(&mut self) -> bool {
+        let Some(mut line) = self.lines_above.pop_front() else {
+            return false;
+        };
+        self.sixel_grid.offset_grid_top();
+        self.kitty_grid.offset_grid_top();
+        if line.is_canonical {
+            let first_canonical_row = if self
+                .kitty_grid
+                .has_placement_anchored_to_first_canonical_line()
+            {
+                self.lines_above
+                    .iter()
+                    .position(|row| row.is_canonical)
+                    .unwrap_or(self.lines_above.len())
+            } else {
+                0
+            };
+            self.kitty_grid
+                .drop_first_canonical_anchor_line(first_canonical_row);
+        }
+        let evicted_width = line.width_cached();
+        let delta = evicted_row_display_row_delta(&mut self.lines_above, evicted_width, self.width);
+        self.apply_scrollback_display_row_delta(delta);
+        true
+    }
+    /// Drop the oldest retained row until `lines_above`, the pinned view,
+    /// and the gap fit the scrollback budget. The live viewport is not
+    /// history. Evicting the pinned view clamps the overlap to the rows
+    /// that remain.
+    fn enforce_parked_retention(&mut self) {
+        let row_cap = self.history_row_cap();
+        loop {
+            let Some(park) = self.live_bottom.as_ref() else {
+                return;
+            };
+            let rows = self.lines_above.len() + park.held.len() + park.gap.len();
+            if rows <= row_cap {
+                return;
+            }
+            if !self.lines_above.is_empty() {
+                if !self.evict_one_scrollback_row() {
+                    return;
+                }
+                continue;
+            }
+            let removed_held = {
+                let Some(park) = self.live_bottom.as_mut() else {
+                    return;
+                };
+                if let Some(_row) = park.held.pop_front() {
+                    // The overlap is a suffix. Dropping the front shrinks it
+                    // only once that suffix already covered every held row.
+                    park.overlap_skip = park.overlap_skip.min(park.held.len());
+                    Some(park.held.is_empty())
+                } else {
+                    None
+                }
+            };
+            if let Some(held_empty) = removed_held {
+                self.history_truncated = true;
+                if held_empty {
+                    self.collapse_truncated_park();
+                }
+                continue;
+            }
+            let removed_gap = {
+                let Some(park) = self.live_bottom.as_mut() else {
+                    return;
+                };
+                if park.gap.len() > 1 {
+                    park.gap.pop_front().is_some()
+                } else {
+                    false
+                }
+            };
+            if removed_gap {
+                self.history_truncated = true;
+                continue;
+            }
+            return;
+        }
+    }
+    /// The pinned view was evicted entirely. Admit whatever gap remains
+    /// through ordinary scrollback and leave the viewport on the live screen.
+    fn collapse_truncated_park(&mut self) {
+        let Some(park) = self.live_bottom.take() else {
+            return;
+        };
+        self.history_truncated = true;
+        for row in park.gap {
+            if let Some(evicted_width) = bounded_push(
+                &mut self.lines_above,
+                &mut self.sixel_grid,
+                &mut self.kitty_grid,
+                row,
+            ) {
+                let delta =
+                    evicted_row_display_row_delta(&mut self.lines_above, evicted_width, self.width);
+                self.apply_scrollback_display_row_delta(delta);
+            }
+            self.apply_scrollback_display_row_delta(1);
+            let row_cap = self.history_row_cap();
+            while self.lines_above.len() > row_cap {
+                if !self.evict_one_scrollback_row() {
+                    break;
+                }
+            }
+        }
+        self.is_scrolled = false;
+        self.lines_below.clear();
+        self.output_buffer.update_all_lines();
+    }
+    /// Replace the viewport with the live screen. The rows between the user's
+    /// window and that screen stay in `gap`. False when there is nothing to
+    /// hold aside, or an image placement is using scrollback coordinates this
+    /// swap does not update.
+    pub(crate) fn park_at_live_bottom(&mut self) -> bool {
+        if self.live_bottom.is_some() {
+            return true;
+        }
+        if !self.is_scrolled
+            || self.alternate_screen_state.is_some()
+            || self.height == 0
+            || self.viewport.len() != self.height
+            || self.lines_below.is_empty()
+            || self.sixel_grid.has_images()
+            || self.kitty_grid.placement_count() > 0
+        {
+            return false;
+        }
+        let height = self.viewport.len();
+        let below = self.lines_below.len();
+        let (held, live, gap, overlap_skip) = if below >= height {
+            let held = std::mem::take(&mut self.viewport);
+            let live = self.lines_below.split_off(below - height);
+            let gap = std::mem::take(&mut self.lines_below);
+            (held, live, gap, 0)
+        } else {
+            let held = self.viewport.clone();
+            let overlap_skip = height - below;
+            let mut live = self.viewport.split_off(below);
+            live.extend(self.lines_below.drain(..));
+            self.viewport.clear();
+            (held, live, VecDeque::new(), overlap_skip)
+        };
+        self.viewport = live;
+        self.lines_below.clear();
+        self.is_scrolled = false;
+        self.live_bottom = Some(LiveBottomPark {
+            held,
+            gap,
+            overlap_skip,
+        });
+        self.enforce_parked_retention();
+        self.kitty_reanchor_all_from_pixels();
+        true
+    }
+    pub(crate) fn is_live_bottom_parked(&self) -> bool {
+        self.live_bottom.is_some()
+    }
+    #[cfg(test)]
+    pub(crate) fn history_was_truncated(&self) -> bool {
+        self.history_truncated
+    }
+    #[cfg(test)]
+    pub(crate) fn parked_history_rows(&self) -> usize {
+        let parked = self
+            .live_bottom
+            .as_ref()
+            .map(|park| park.held.len() + park.gap.len())
+            .unwrap_or(0);
+        self.lines_above.len() + parked + self.lines_below.len()
+    }
+    /// Put the held viewport back. Rows that scrolled off the live screen
+    /// land under it. Overlapping live rows replace the stale held copy.
+    pub(crate) fn unpark_live_bottom(&mut self) {
+        let Some(mut park) = self.live_bottom.take() else {
+            return;
+        };
+        park.overlap_skip = park.overlap_skip.min(park.held.len());
+        let skip = park.overlap_skip.min(self.viewport.len());
+        for _ in 0..skip {
+            let Some(row) = self.viewport.pop_front() else {
+                break;
+            };
+            // The live window and the held view share these rows. The live
+            // copy is authoritative: it saw this turn's edits. The index
+            // stays in range because the overlap is the suffix of `held`.
+            let held_index = park.held.len() - park.overlap_skip;
+            park.overlap_skip = park.overlap_skip.saturating_sub(1);
+            if let Some(held_row) = park.held.get_mut(held_index) {
+                *held_row = row;
+            }
+        }
+        for row in self.viewport.drain(..) {
+            park.gap.push_back(row);
+        }
+        self.viewport = park.held;
+        self.lines_below = park.gap;
+        while self.viewport.len() < self.height {
+            match self.lines_below.pop_front() {
+                Some(row) => self.viewport.push_back(row),
+                None => self.viewport.push_back(Row::new().canonical()),
+            }
+        }
+        self.is_scrolled = !self.lines_below.is_empty();
+        self.kitty_reanchor_all_from_pixels();
+        self.output_buffer.update_all_lines();
+    }
+    fn capture_live_scrolled_rows(&mut self, count: usize) {
+        let count = count.min(self.viewport.len());
+        if count == 0 {
+            return;
+        }
+        let drained: Vec<Row> = self.viewport.drain(..count).collect();
+        for row in drained {
+            let Some(row) = self.reconcile_parked_overlap_row(row) else {
+                continue;
+            };
+            let Some(park) = self.live_bottom.as_mut() else {
+                return;
+            };
+            park.gap.push_back(row);
+        }
+    }
+    /// A row leaving the front of the live window may still duplicate one
+    /// row of the held view. Write the live copy back before dropping it.
+    /// Returns the row when it belongs in the gap, or `None` once its place
+    /// in the held view has been updated.
+    fn reconcile_parked_overlap_row(&mut self, row: Row) -> Option<Row> {
+        let Some(park) = self.live_bottom.as_mut() else {
+            return Some(row);
+        };
+        park.overlap_skip = park.overlap_skip.min(park.held.len());
+        if park.overlap_skip == 0 {
+            return Some(row);
+        }
+        let held_index = park.held.len() - park.overlap_skip;
+        park.overlap_skip -= 1;
+        if let Some(held_row) = park.held.get_mut(held_index) {
+            *held_row = row;
+        }
+        None
+    }
     fn transfer_rows_to_lines_above(&mut self, count: usize) {
+        if self.live_bottom.is_some()
+            && (self.sixel_grid.has_images() || self.kitty_grid.placement_count() > 0)
+        {
+            // Image coordinates use scrollback rows. The gap is not in
+            // that space, so the park cannot stay up once a placement exists.
+            self.unpark_live_bottom();
+        }
+        if self.live_bottom.is_some() {
+            self.capture_live_scrolled_rows(count);
+            self.enforce_parked_retention();
+            return;
+        }
         self.invalidate_scroll_offset();
         self.kitty_settle_placements_below_the_viewport();
         let width = self.width;
@@ -6124,7 +6547,10 @@ impl Handler for Grid {
                             self.bracketed_paste_mode = true;
                         },
                         1049 => {
-                            // enter alternate buffer
+                            // enter alternate buffer. The saved primary view
+                            // is the user's rows, not the live window a park
+                            // swapped in.
+                            self.unpark_live_bottom();
                             let current_lines_above =
                                 std::mem::replace(&mut self.lines_above, VecDeque::new());
                             let current_viewport = std::mem::replace(
@@ -7372,6 +7798,51 @@ impl Row {
             None
         }
     }
+    /// Fit each stored width to `max_row_length` without dropping the character.
+    /// A width this reflow clips is restored on a later, wider reflow. A cell
+    /// that is already narrower than its natural width for another reason
+    /// keeps that width. Markers at or after a character's old end column
+    /// move by the width delta, in the row's old column coordinates.
+    fn fit_character_widths_for_reflow(&mut self, max_row_length: usize) {
+        if max_row_length == 0 {
+            return;
+        }
+        let mut old_column = 0usize;
+        let mut adjustments: Vec<(usize, isize)> = Vec::new();
+        for character in self.columns.iter_mut() {
+            let old = character.width();
+            let (logical, natural) = logical_reflow_width(character);
+            let new = if logical > max_row_length {
+                max_row_length
+            } else {
+                logical
+            };
+            if new != old {
+                // `set_width` clears the clip flag. Record a clip only when this
+                // reflow itself stored fewer columns than the glyph's natural width.
+                character.set_width(new as u8);
+                character.set_width_was_clipped(new < natural);
+                adjustments.push((old_column + old, new as isize - old as isize));
+            }
+            old_column += old;
+        }
+        if adjustments.is_empty() {
+            return;
+        }
+        self.mark_widths_changed();
+        for marker in self.osc133_markers.iter_mut() {
+            let mut shift = 0isize;
+            for &(old_end, delta) in &adjustments {
+                if marker.column < old_end {
+                    break;
+                }
+                shift += delta;
+            }
+            if shift != 0 {
+                marker.column = marker.column.saturating_add_signed(shift);
+            }
+        }
+    }
     pub fn split_to_rows_of_length(&mut self, max_row_length: usize) -> Vec<Row> {
         let drained = Row {
             columns: Vec::new(),
@@ -7399,6 +7870,7 @@ impl Row {
         let mut current_part_len = 0;
         let mut current_part_width = 0;
         for row in &mut rows {
+            row.fit_character_widths_for_reflow(max_row_length);
             for mut marker in row.osc133_markers.take_all() {
                 marker.column += column_offset;
                 markers.push(marker);
@@ -7406,7 +7878,9 @@ impl Row {
             for character in &row.columns {
                 let character_width = character.width();
                 if current_part_width + character_width > max_row_length {
-                    part_lengths.push(current_part_len);
+                    if current_part_len > 0 {
+                        part_lengths.push(current_part_len);
+                    }
                     current_part_len = 0;
                     current_part_width = 0;
                 }

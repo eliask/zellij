@@ -163,7 +163,6 @@ macro_rules! resize_pty {
 pub const MIN_TERMINAL_HEIGHT: usize = 5;
 pub const MIN_TERMINAL_WIDTH: usize = 5;
 
-const MAX_PENDING_VTE_EVENTS: usize = 7000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneNotCreatedReason {
     NoRoom,
@@ -5173,31 +5172,9 @@ impl Tab {
             return Ok(());
         }
         let err_context = || format!("failed to handle pty bytes from fd {pid}");
-        if let Some(terminal_output) = self
-            .tiled_panes
-            .get_pane_mut(PaneId::Terminal(pid))
-            .or_else(|| self.floating_panes.get_pane_mut(PaneId::Terminal(pid)))
-            .or_else(|| {
-                self.suppressed_panes
-                    .values_mut()
-                    .find(|s_p| s_p.1.pid() == PaneId::Terminal(pid))
-                    .map(|s_p| &mut s_p.1)
-            })
-        {
-            // If the pane is scrolled buffer the vte events
-            if terminal_output.is_scrolled() {
-                self.pending_vte_events.entry(pid).or_default().push(bytes);
-                if let Some(evs) = self.pending_vte_events.get(&pid) {
-                    // Reset scroll - and process all pending events for this pane
-                    if evs.len() >= MAX_PENDING_VTE_EVENTS {
-                        terminal_output.clear_scroll();
-                        self.process_pending_vte_events(pid)
-                            .with_context(err_context)?;
-                    }
-                }
-                return Ok(());
-            }
-        }
+        // A scrolled pane used to queue bytes until the user returned to the
+        // bottom, and a full queue cleared that scroll. The pane applies the
+        // bytes to the live screen and restores the viewport.
         self.process_pty_bytes(pid, bytes).with_context(err_context)
     }
     pub fn handle_plugin_bytes(
