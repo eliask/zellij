@@ -609,7 +609,7 @@ impl SessionIndex {
         let id = match registered_id {
             Some(Some(id)) => id,
             _ => {
-                let id = if self.files_named(name) && !id_taken_by_another(&transaction, name)? {
+                let id = if self.files_named(name)? && !id_taken_by_another(&transaction, name)? {
                     name.to_owned()
                 } else {
                     self.unused_id(&transaction)?
@@ -670,15 +670,18 @@ impl SessionIndex {
         query_names_by_id(&self.conn)
     }
 
-    fn files_named(&self, name: &str) -> bool {
-        self.sock_dir.join(name).exists() || self.cache_dir.join(name).exists()
+    fn files_named(&self, name: &str) -> Result<bool> {
+        occupies_session_id(
+            self.sock_dir.join(name).try_exists(),
+            self.cache_dir.join(name).try_exists(),
+        )
     }
 
     fn unused_id(&self, transaction: &Transaction) -> Result<String> {
         loop {
             let candidate = crate::sessions::generate_session_id();
             if query_session_name(transaction, &candidate)?.is_none()
-                && !self.files_named(&candidate)
+                && !self.files_named(&candidate)?
             {
                 return Ok(candidate);
             }
@@ -707,25 +710,21 @@ impl SessionIndex {
         Ok(changed > 0)
     }
 
-    pub fn session_state(&self, name: &str) -> Option<SessionState> {
-        // The socket and the cache folder are named by the session's id.
-        let id = self
-            .session_id(name)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| name.to_owned());
-        if self.sock_dir.join(&id).exists() {
-            Some(SessionState::Running)
-        } else if self
-            .cache_dir
-            .join(&id)
-            .join(SESSION_LAYOUT_FILE_NAME)
-            .exists()
-        {
-            Some(SessionState::Resumable)
-        } else {
-            None
-        }
+    pub fn session_state(&self, name: &str) -> Result<Option<SessionState>> {
+        // A lookup error must stay an error: swallowing it and falling back to the
+        // display name makes a renamed session look absent, and resolve_candidates
+        // would prune it.
+        let id = match self.session_id(name)? {
+            Some(id) => id,
+            None => name.to_owned(),
+        };
+        session_state_from_probes(
+            self.sock_dir.join(&id).try_exists(),
+            self.cache_dir
+                .join(&id)
+                .join(SESSION_LAYOUT_FILE_NAME)
+                .try_exists(),
+        )
     }
 
     fn query_rows(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<SessionRow>> {
@@ -886,12 +885,15 @@ impl SessionIndex {
                 continue;
             }
             match self.session_state(&row.name) {
-                Some(state) => candidates.push(Candidate { row, state }),
-                None => {
+                Ok(Some(state)) => candidates.push(Candidate { row, state }),
+                Ok(None) => {
                     if now.saturating_sub(row.created_at) > RECENTLY_CREATED_GRACE_SECS {
                         let _ = self.delete(&row.name);
                     }
                 },
+                // A metadata or index error is not absence. Deleting the row would
+                // drop a session that could not be inspected.
+                Err(_) => {},
             }
         }
         candidates
@@ -1039,54 +1041,198 @@ fn query_names_by_id(conn: &Connection) -> Result<HashMap<String, String>> {
     Ok(names)
 }
 
-// Lookups for callers that only map between session names and ids (listings, attaching). They
-// skip `open`'s setup and integrity check and never create the index: a missing, unreadable or
-// pre-id index knows no session, which callers take to mean "the id is the name".
-fn open_existing_default_index() -> Option<Connection> {
-    let conn = Connection::open_with_flags(
-        default_index_path(),
+/// `Ok(false)` is absence. `Err` is not: [`Path::exists`] would hide a metadata
+/// failure and let an unreadable socket or cache path look free or dead.
+fn presence_from_try_exists(try_exists: std::io::Result<bool>) -> Result<bool> {
+    Ok(try_exists?)
+}
+
+/// Whether a socket or cache directory occupies this id. A probe error is
+/// returned; it does not make the id free.
+fn occupies_session_id(
+    socket: std::io::Result<bool>,
+    cache: std::io::Result<bool>,
+) -> Result<bool> {
+    let socket = presence_from_try_exists(socket);
+    let cache = presence_from_try_exists(cache);
+    if matches!(socket, Ok(true)) || matches!(cache, Ok(true)) {
+        Ok(true)
+    } else {
+        socket?;
+        cache
+    }
+}
+
+/// Socket means running, layout means resumable, both absent means no session.
+/// A probe error is not [`None`].
+fn session_state_from_probes(
+    socket: std::io::Result<bool>,
+    layout: std::io::Result<bool>,
+) -> Result<Option<SessionState>> {
+    if presence_from_try_exists(socket)? {
+        Ok(Some(SessionState::Running))
+    } else if presence_from_try_exists(layout)? {
+        Ok(Some(SessionState::Resumable))
+    } else {
+        Ok(None)
+    }
+}
+
+/// `Ok(is_live)` keeps the caller's classification. An inspection error is not
+/// death and must not drop the entry.
+pub fn socket_type_error_is_not_death(file_type_is_live: std::io::Result<bool>) -> bool {
+    match file_type_is_live {
+        Ok(is_live) => is_live,
+        Err(_) => true,
+    }
+}
+
+fn live_socket_name_if_present(name: String, is_live: std::io::Result<bool>) -> Option<String> {
+    if crate::consts::is_app_socket_name(&name) {
+        return None;
+    }
+    if socket_type_error_is_not_death(is_live) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn partition_dead_session_ids(
+    cache_ids: Vec<String>,
+    live_sessions: &HashSet<String>,
+) -> Vec<String> {
+    let mut dead: Vec<String> = cache_ids
+        .into_iter()
+        .filter(|id| {
+            !live_sessions.contains(id)
+                && !crate::consts::is_app_socket_name(id)
+                && crate::sessions::validate_session_folder_name(id).is_ok()
+        })
+        .collect();
+    dead.sort();
+    dead
+}
+
+/// `NotFound` is an empty live set. Any other directory or entry error means the
+/// inventory is incomplete: nothing from it is eligible for deletion.
+fn dead_session_ids_from_socket_entries<I>(
+    entries: std::io::Result<I>,
+    cache_ids: Vec<String>,
+) -> Vec<String>
+where
+    I: IntoIterator<Item = std::io::Result<(String, std::io::Result<bool>)>>,
+{
+    let entries = match entries {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return partition_dead_session_ids(cache_ids, &HashSet::new());
+        },
+        Err(error) => {
+            log::error!("Failed to read session socket dir: {:?}", error);
+            return Vec::new();
+        },
+    };
+    let mut live_sessions = HashSet::new();
+    for entry in entries {
+        let (name, is_live) = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                log::error!("Failed to read a session socket entry: {:?}", error);
+                return Vec::new();
+            },
+        };
+        if let Some(name) = live_socket_name_if_present(name, is_live) {
+            live_sessions.insert(name);
+        }
+    }
+    partition_dead_session_ids(cache_ids, &live_sessions)
+}
+
+// `Ok(true)` only when the index file is not there. `try_exists` failing is not absence.
+fn index_file_is_missing(path: &Path) -> Result<bool> {
+    match path.try_exists() {
+        Ok(exists) => Ok(!exists),
+        Err(error) => Err(error.into()),
+    }
+}
+
+// `SQLITE_CANTOPEN` after a missing file (a race with `try_exists`) is absence.
+// The same code is a real error when the path is still there.
+fn open_error_is_missing_index(path: &Path, error: &rusqlite::Error) -> Result<bool> {
+    let cannot_open = matches!(
+        error,
+        rusqlite::Error::SqliteFailure(ffi_error, _)
+            if ffi_error.code == rusqlite::ErrorCode::CannotOpen
+    );
+    if !cannot_open {
+        return Ok(false);
+    }
+    index_file_is_missing(path)
+}
+
+// Lookups skip `open`'s setup and integrity check and never create the index.
+// A missing file is `Ok(None)`. A locked, corrupt, or unreadable index is `Err`.
+fn open_existing_index(path: &Path) -> Result<Option<Connection>> {
+    if index_file_is_missing(path)? {
+        return Ok(None);
+    }
+    match Connection::open_with_flags(
+        path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
-    conn.busy_timeout(BUSY_TIMEOUT).ok()?;
-    Some(conn)
+    ) {
+        Ok(conn) => {
+            conn.busy_timeout(BUSY_TIMEOUT)?;
+            Ok(Some(conn))
+        },
+        Err(error) => {
+            if open_error_is_missing_index(path, &error)? {
+                Ok(None)
+            } else {
+                Err(error.into())
+            }
+        },
+    }
+}
+
+fn open_existing_default_index() -> Result<Option<Connection>> {
+    open_existing_index(&default_index_path())
 }
 
 pub fn dead_session_ids_in(sock_dir: &Path, cache_dir: &Path) -> Vec<String> {
-    use crate::consts::{is_app_socket_name, is_ipc_socket};
-    let live_sessions: HashSet<String> = std::fs::read_dir(sock_dir)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| {
-                    entry
-                        .file_type()
-                        .map(|file_type| is_ipc_socket(&file_type))
-                        .unwrap_or(false)
-                })
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .filter(|name| !is_app_socket_name(name))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut dead: Vec<String> = match std::fs::read_dir(cache_dir) {
+    let cache_ids = match std::fs::read_dir(cache_dir) {
         Ok(entries) => entries
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.path().is_dir())
             .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|id| {
-                !live_sessions.contains(id)
-                    && !is_app_socket_name(id)
-                    && crate::sessions::validate_session_folder_name(id).is_ok()
-            })
             .collect(),
         Err(e) => {
             log::error!("Failed to read session info cache dir: {:?}", e);
             vec![]
         },
     };
-    dead.sort();
-    dead
+    let socket_entries = match std::fs::read_dir(sock_dir) {
+        Ok(entries) => Ok(entries.filter_map(|entry| match entry {
+            Err(error) => Some(Err(error)),
+            Ok(entry) => {
+                let name = entry.file_name().into_string().ok()?;
+                let is_live = entry
+                    .file_type()
+                    .map(|ft| crate::consts::is_ipc_socket(&ft));
+                Some(Ok((name, is_live)))
+            },
+        })),
+        Err(error) => Err(error),
+    };
+    dead_session_ids_from_socket_entries(socket_entries, cache_ids)
+}
+
+/// `true` only when `session_id` is in the dead set from a complete socket
+/// inventory. An unreadable inventory yields no ids, so this is `false`.
+pub fn session_id_is_definitely_dead(sock_dir: &Path, cache_dir: &Path, session_id: &str) -> bool {
+    dead_session_ids_in(sock_dir, cache_dir)
+        .iter()
+        .any(|id| id == session_id)
 }
 
 pub fn delete_dead_sessions_in(
@@ -1098,19 +1244,23 @@ pub fn delete_dead_sessions_in(
     if dead_sessions.is_empty() {
         return Ok(0);
     }
-    if let Some(index) = index {
-        if let Err(e) = index.delete_by_ids(&dead_sessions) {
-            log::error!(
-                "Failed to remove dead sessions from the session index: {}",
-                e
-            );
-        }
-    }
     let mut first_error = None;
     let mut deleted = 0;
     for session_id in &dead_sessions {
         match std::fs::remove_dir_all(cache_dir.join(session_id)) {
-            Ok(()) => deleted += 1,
+            Ok(()) => {
+                deleted += 1;
+                // The index row goes only after this session's cache is gone.
+                if let Some(index) = index {
+                    if let Err(e) = index.delete_by_ids(std::slice::from_ref(session_id)) {
+                        log::error!(
+                            "Failed to remove dead session {:?} from the session index: {}",
+                            session_id,
+                            e
+                        );
+                    }
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
             Err(e) => {
                 first_error.get_or_insert_with(|| {
@@ -1125,22 +1275,39 @@ pub fn delete_dead_sessions_in(
     }
 }
 
+/// Id lookup that distinguishes a missing index from a database error.
+/// Listings still use [`session_id_for_name`], which collapses errors to "no id".
+pub fn session_id_for_name_strict(name: &str) -> Result<Option<String>> {
+    match open_existing_default_index()? {
+        Some(conn) => query_session_id(&conn, name),
+        None => Ok(None),
+    }
+}
+
 pub fn session_id_for_name(name: &str) -> Option<String> {
-    query_session_id(&open_existing_default_index()?, name)
-        .ok()
-        .flatten()
+    session_id_for_name_strict(name).ok().flatten()
+}
+
+/// Name lookup that distinguishes a missing index from a database error.
+/// Display fallbacks still use [`session_name_for_id`].
+pub fn session_name_for_id_strict(id: &str) -> Result<Option<String>> {
+    match open_existing_default_index()? {
+        Some(conn) => query_session_name(&conn, id),
+        None => Ok(None),
+    }
 }
 
 pub fn session_name_for_id(id: &str) -> Option<String> {
-    query_session_name(&open_existing_default_index()?, id)
-        .ok()
-        .flatten()
+    session_name_for_id_strict(id).ok().flatten()
 }
 
+/// Names for listings. An error or a missing index is an empty map, which callers
+/// use only as a display fallback. It must not choose a folder to delete.
 pub fn session_names_by_id() -> HashMap<String, String> {
-    open_existing_default_index()
-        .and_then(|conn| query_names_by_id(&conn).ok())
-        .unwrap_or_default()
+    let Ok(Some(conn)) = open_existing_default_index() else {
+        return HashMap::new();
+    };
+    query_names_by_id(&conn).unwrap_or_default()
 }
 
 /// Socket filenames are session ids; `names_by_id` maps them to session names (an id without an
@@ -1155,10 +1322,11 @@ pub fn running_session_names_in(
     entries
         .flatten()
         .filter(|entry| {
-            entry
-                .file_type()
-                .map(|ft| crate::consts::is_ipc_socket(&ft) || ft.is_file())
-                .unwrap_or(false)
+            socket_type_error_is_not_death(
+                entry
+                    .file_type()
+                    .map(|ft| crate::consts::is_ipc_socket(&ft) || ft.is_file()),
+            )
         })
         .filter_map(|entry| entry.file_name().into_string().ok())
         .filter(|name| {
@@ -1807,15 +1975,15 @@ mod tests {
     fn session_state_finds_the_socket_and_layout_by_id() {
         let test = TestIndex::new();
         let id = test.index.register("work", 10).unwrap();
-        assert_eq!(test.index.session_state("work"), None);
+        assert_eq!(test.index.session_state("work").unwrap(), None);
         test.mark_resumable(&id);
         assert_eq!(
-            test.index.session_state("work"),
+            test.index.session_state("work").unwrap(),
             Some(SessionState::Resumable)
         );
         test.mark_running(&id);
         assert_eq!(
-            test.index.session_state("work"),
+            test.index.session_state("work").unwrap(),
             Some(SessionState::Running)
         );
     }
@@ -1876,5 +2044,53 @@ mod tests {
             test.index.session_id("bar").unwrap(),
             Some("foo".to_owned())
         );
+    }
+
+    #[test]
+    fn a_stat_error_does_not_make_a_session_id_free() {
+        let socket_error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "socket");
+        assert!(occupies_session_id(Err(socket_error), Ok(false)).is_err());
+        let layout_error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "layout");
+        assert!(session_state_from_probes(Ok(false), Err(layout_error)).is_err());
+    }
+
+    #[test]
+    fn a_socket_dir_error_yields_no_deletable_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let not_a_dir = root.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::create_dir(cache.path().join("orphan")).unwrap();
+        assert!(dead_session_ids_in(&not_a_dir, cache.path()).is_empty());
+    }
+
+    #[test]
+    fn a_socket_entry_error_yields_no_deletable_ids() {
+        let entries: std::io::Result<Vec<std::io::Result<(String, std::io::Result<bool>)>>> =
+            Ok(vec![Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "entry",
+            ))]);
+        assert!(
+            dead_session_ids_from_socket_entries(entries, vec!["orphan".to_owned()]).is_empty()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_socket_type_is_not_death() {
+        let entries = Ok(vec![Ok((
+            "wedged".to_owned(),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "type",
+            )),
+        ))]);
+        assert!(
+            dead_session_ids_from_socket_entries(entries, vec!["wedged".to_owned()]).is_empty()
+        );
+        assert!(socket_type_error_is_not_death(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "type",
+        ))));
     }
 }

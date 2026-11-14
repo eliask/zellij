@@ -13,7 +13,8 @@ use zellij_client::{
 use zellij_utils::sessions::{
     assert_dead_session, assert_session, assert_session_ne, delete_session as delete_session_impl,
     generate_unique_session_name, get_active_session, get_resurrectable_sessions, get_sessions,
-    kill_session as kill_session_impl, ActiveSession,
+    kill_session as kill_session_impl, observe_sessions, resurrectable_sessions_to_delete,
+    ActiveSession,
 };
 
 #[cfg(feature = "web_server_capability")]
@@ -44,12 +45,26 @@ use zellij_utils::{
 pub(crate) use zellij_utils::sessions::list_sessions;
 
 pub(crate) fn kill_all_sessions(yes: bool) {
-    match get_sessions() {
-        Ok(sessions) if sessions.is_empty() => {
+    match observe_sessions() {
+        Ok(observation) if observation.is_definitely_empty() => {
             eprintln!("No active zellij sessions found.");
             process::exit(1);
         },
-        Ok(sessions) => {
+        Ok(observation) if observation.responsive.is_empty() => {
+            eprintln!(
+                "Found session socket(s) that did not respond in time; \
+                 refusing to treat them as absent: {}",
+                observation
+                    .unknown
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            process::exit(1);
+        },
+        Ok(observation) => {
+            let sessions = observation.responsive;
             if !yes {
                 println!("WARNING: this action will kill all sessions.");
                 if !Confirm::new()
@@ -74,33 +89,24 @@ pub(crate) fn kill_all_sessions(yes: bool) {
 }
 
 pub(crate) fn delete_all_sessions(yes: bool, force: bool) {
-    use std::collections::BTreeMap;
-    use zellij_server::background_jobs::scan_session_list_default_dirs;
-
-    let active_sessions: Vec<String> = get_sessions()
-        .unwrap_or_default()
-        .iter()
-        .map(|s| s.0.clone())
-        .collect();
-    let (_live_sessions, resurrectable_map) =
-        scan_session_list_default_dirs(&String::new(), &[], &BTreeMap::new());
-    let mut resurrectable_sessions: Vec<(String, Duration)> =
-        resurrectable_map.into_iter().collect();
-    if force {
-        for entry in get_resurrectable_sessions() {
-            if !resurrectable_sessions.iter().any(|(n, _)| *n == entry.0) {
-                resurrectable_sessions.push(entry);
-            }
+    let observation = match observe_sessions() {
+        Ok(observation) => observation,
+        Err(e) => {
+            eprintln!("Error occurred while discovering sessions: {:?}", e);
+            process::exit(1);
+        },
+    };
+    if !force && !observation.unknown.is_empty() {
+        eprintln!(
+            "Refusing to delete session(s) whose sockets did not respond; \
+             treating them as active (use --force to delete them):"
+        );
+        for (name, _) in &observation.unknown {
+            eprintln!("  {} (unresponsive)", name);
         }
     }
-    let dead_sessions: Vec<_> = if force {
-        resurrectable_sessions
-    } else {
-        resurrectable_sessions
-            .into_iter()
-            .filter(|(name, _)| !active_sessions.contains(name))
-            .collect()
-    };
+    let dead_sessions =
+        resurrectable_sessions_to_delete(force, &observation, get_resurrectable_sessions());
     if !yes {
         println!("WARNING: this action will delete all resurrectable sessions.");
         if !Confirm::new()
@@ -540,6 +546,14 @@ pub(crate) fn send_action_to_session(
             eprintln!("There is no active session!");
             std::process::exit(1);
         },
+        ActiveSession::Unresponsive(names) => {
+            eprintln!(
+                "Found session socket(s) that did not respond in time; \
+                 cannot claim there is no active session: {}",
+                names.join(", ")
+            );
+            std::process::exit(1);
+        },
         ActiveSession::One(session_name) => {
             if let Some(requested_session_name) = requested_session_name {
                 if requested_session_name != session_name {
@@ -588,6 +602,14 @@ pub(crate) fn subscribe_to_session(
     let session_name = match get_active_session() {
         ActiveSession::None => {
             eprintln!("There is no active session!");
+            std::process::exit(1);
+        },
+        ActiveSession::Unresponsive(names) => {
+            eprintln!(
+                "Found session socket(s) that did not respond in time; \
+                 cannot claim there is no active session: {}",
+                names.join(", ")
+            );
             std::process::exit(1);
         },
         ActiveSession::One(session_name) => {

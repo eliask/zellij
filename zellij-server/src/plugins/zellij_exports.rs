@@ -4138,17 +4138,44 @@ fn delete_session_index_row(session_name: &str) {
 }
 
 fn delete_dead_session(session_name: String) -> Result<()> {
-    // The cache folder is keyed by session id; resolve the name (falling back to
-    // treating the argument as the id, e.g. when called with an id directly).
-    let id = zellij_utils::sessions::resolve_session_id(&session_name)
-        .unwrap_or_else(|| session_name.clone());
-    validate_session_folder_name(&id).map_err(|e| anyhow!(e))?;
-    // The session index is keyed by display name, which differs from the argument
-    // when called with an id.
-    let display_name = zellij_utils::sessions::display_name_for_session_id(&id);
-    delete_session_index_row(&display_name);
+    delete_dead_session_cache(&session_name)
+}
+
+/// The cache folder is keyed by session id. A lookup error leaves the cache and
+/// the index row in place. The row is removed only after the cache is gone, and
+/// only when the socket inventory proves this id is dead.
+fn delete_dead_session_cache(session_name: &str) -> Result<()> {
+    let id = zellij_utils::sessions::session_folder_id(session_name).map_err(|error| {
+        anyhow!(
+            "session index lookup failed; the cache and the index row were left in place: {}",
+            error
+        )
+    })?;
+    validate_session_folder_name(&id).map_err(|error| anyhow!(error))?;
+    let display_name = match zellij_utils::session_index::session_name_for_id_strict(&id) {
+        Ok(Some(name)) => name,
+        Ok(None) => id.clone(),
+        Err(error) => {
+            return Err(anyhow!(
+                "session index lookup failed; the cache and the index row were left in place: {}",
+                error
+            ));
+        },
+    };
+    if !zellij_utils::session_index::session_id_is_definitely_dead(
+        &ZELLIJ_SOCK_DIR,
+        &ZELLIJ_SESSION_INFO_CACHE_DIR,
+        &id,
+    ) {
+        return Err(anyhow!(
+            "Refusing to delete session {:?}: it is not known to be dead",
+            session_name
+        ));
+    }
     std::fs::remove_dir_all(&*ZELLIJ_SESSION_INFO_CACHE_DIR.join(&id))
-        .with_context(|| format!("Failed to delete dead session: {:?}", &session_name))
+        .with_context(|| format!("Failed to delete dead session: {:?}", session_name))?;
+    delete_session_index_row(&display_name);
+    Ok(())
 }
 
 fn delete_all_dead_sessions() -> Result<()> {
@@ -4587,8 +4614,17 @@ fn disconnect_other_clients(env: &PluginEnv) {
 
 fn kill_sessions(session_names: Vec<String>) {
     for session_name in session_names {
-        let resolved = zellij_utils::sessions::resolve_session_socket_path(&session_name)
-            .unwrap_or_else(|| ZELLIJ_SOCK_DIR.join(&session_name));
+        let resolved = match zellij_utils::sessions::session_folder_id(&session_name) {
+            Ok(id) => ZELLIJ_SOCK_DIR.join(id),
+            Err(error) => {
+                log::error!(
+                    "Failed to resolve session {:?}: {}. The session was not killed.",
+                    session_name,
+                    error
+                );
+                continue;
+            },
+        };
         if let Err(e) = zellij_utils::sessions::send_kill_session(&resolved) {
             log::error!("Failed to kill session {}: {:?}", session_name, e);
         }
@@ -4609,8 +4645,24 @@ fn kill_sessions_and_reply(env: &PluginEnv, session_names: Vec<String>) {
     let result: Result<(), String> = runtime.block_on(async {
         let mut set: JoinSet<(String, std::io::Result<()>)> = JoinSet::new();
         for name in session_names {
-            let path = zellij_utils::sessions::resolve_session_socket_path(&name)
-                .unwrap_or_else(|| ZELLIJ_SOCK_DIR.join(&name));
+            let path = match zellij_utils::sessions::session_folder_id(&name) {
+                Ok(id) => ZELLIJ_SOCK_DIR.join(id),
+                Err(error) => {
+                    set.spawn(async move {
+                        (
+                            name,
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!(
+                                    "session index lookup failed; the session was not killed: {}",
+                                    error
+                                ),
+                            )),
+                        )
+                    });
+                    continue;
+                },
+            };
             set.spawn(async move {
                 let res = zellij_utils::ipc::async_send_kill_and_await(&path).await;
                 (name, res)
@@ -4656,22 +4708,12 @@ fn kill_sessions_and_reply(env: &PluginEnv, session_names: Vec<String>) {
 }
 
 fn delete_dead_session_and_reply(env: &PluginEnv, session_name: String) {
-    // Cache folder is keyed by session id; resolve the display name.
-    let id = zellij_utils::sessions::resolve_session_id(&session_name)
-        .unwrap_or_else(|| session_name.clone());
-    let response = match validate_session_folder_name(&id) {
-        Err(e) => DeleteDeadSessionResponse::Err(e),
+    let response = match delete_dead_session_cache(&session_name) {
         Ok(()) => {
-            delete_session_index_row(&session_name);
             notify_session_index_changed(env);
-            match std::fs::remove_dir_all(&*ZELLIJ_SESSION_INFO_CACHE_DIR.join(&id)) {
-                Ok(()) => DeleteDeadSessionResponse::Ok,
-                Err(e) => DeleteDeadSessionResponse::Err(format!(
-                    "Failed to delete dead session {}: {}",
-                    session_name, e
-                )),
-            }
+            DeleteDeadSessionResponse::Ok
         },
+        Err(error) => DeleteDeadSessionResponse::Err(format!("{error:#}")),
     };
     let protobuf_response = ProtobufDeleteDeadSessionResponse::from(response);
     wasi_write_object(env, &protobuf_response.encode_to_vec())

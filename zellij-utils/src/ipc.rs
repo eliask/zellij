@@ -12,7 +12,7 @@ use std::{
     fmt::{Display, Error, Formatter},
     io::{self, Read, Write},
     marker::PhantomData,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 // Protobuf imports
@@ -594,6 +594,311 @@ fn write_protobuf_message<T: Message>(writer: &mut impl Write, msg: &T) -> Resul
     writer.write_all(&len.to_le_bytes())?;
     writer.write_all(&encoded)?;
     Ok(())
+}
+
+/// Cap for one session-liveness probe reply. A silent or hostile peer must not
+/// make the probe allocate an unbounded frame. This does not change the
+/// ordinary client/server frame limit.
+pub const PROBE_MAX_FRAME_BYTES: usize = 64 * 1024;
+
+#[cfg(unix)]
+fn remaining_until(deadline: Instant) -> io::Result<Duration> {
+    // Sub-millisecond values round to a zero timeval, and Linux treats
+    // SO_RCVTIMEO/SO_SNDTIMEO of zero as "block forever".
+    match deadline.checked_duration_since(Instant::now()) {
+        Some(remaining) if remaining >= Duration::from_millis(1) => Ok(remaining),
+        _ => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "deadline exhausted",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn decode_server_frame(buf: &[u8]) -> io::Result<ServerToClientMsg> {
+    let proto = ProtoServerToClientMsg::decode(buf)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    ServerToClientMsg::try_from(proto)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+}
+
+/// Socket timeouts are inactivity timers. A probe that needs one absolute
+/// deadline refreshes them before every syscall. On macOS the read path does
+/// not use SO_RCVTIMEO: a just-connected Unix socket has returned EINVAL there.
+#[cfg(unix)]
+pub(crate) trait DeadlineIo {
+    fn refresh_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn refresh_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn wait_readable(&self, deadline: Instant) -> io::Result<()>;
+}
+
+#[cfg(unix)]
+impl DeadlineIo for LocalSocketStream {
+    fn refresh_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        use interprocess::local_socket::traits::Stream;
+        self.set_recv_timeout(timeout)
+    }
+    fn refresh_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        use interprocess::local_socket::traits::Stream;
+        self.set_send_timeout(timeout)
+    }
+    fn wait_readable(&self, deadline: Instant) -> io::Result<()> {
+        use nix::errno::Errno;
+        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+        use std::os::fd::AsFd;
+
+        let interprocess::local_socket::Stream::UdSocket(stream) = self;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "deadline exhausted",
+                ));
+            }
+            let poll_timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX);
+            let mut fds = [PollFd::new(stream.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, poll_timeout) {
+                Err(Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "deadline exhausted",
+                    ))
+                },
+                Ok(_) => return Ok(()),
+            }
+        }
+    }
+}
+
+/// Errors that mean the peer is not ready yet, not that the probe is finished.
+///
+/// macOS `poll` reports `POLLHUP` with `SO_ERROR == 0` for a Unix socket that
+/// has connected and is sitting in the accept queue. Before `accept`, a read
+/// or write can return would-block, an immediate EOF, a reset, or EINVAL.
+/// Retrying those is bounded by the caller's deadline and does not open a new
+/// socket.
+#[cfg(unix)]
+pub(crate) fn error_means_peer_not_ready(
+    kind: io::ErrorKind,
+    raw_os_error: Option<i32>,
+    apple: bool,
+) -> bool {
+    if matches!(
+        kind,
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    ) {
+        return true;
+    }
+    if apple && raw_os_error == Some(nix::errno::Errno::EPROTOTYPE as i32) {
+        return true;
+    }
+    // macOS has returned EINVAL while a just-connected Unix socket was not yet
+    // ready for the probe read. Retry only that platform, and only inside the
+    // probe deadline.
+    apple && kind == io::ErrorKind::InvalidInput
+}
+
+#[cfg(unix)]
+fn peer_not_ready(err: &io::Error) -> bool {
+    error_means_peer_not_ready(
+        err.kind(),
+        err.raw_os_error(),
+        cfg!(target_vendor = "apple"),
+    )
+}
+
+#[cfg(unix)]
+fn pause_until_peer_ready(deadline: Instant) -> io::Result<()> {
+    let remaining = remaining_until(deadline)?;
+    std::thread::sleep(Duration::from_millis(1).min(remaining));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn trace_probe_retry_once(
+    traced: &mut bool,
+    stage: &str,
+    completed: usize,
+    total: usize,
+    error: &io::Error,
+) {
+    if *traced {
+        return;
+    }
+    *traced = true;
+    log::debug!("probe {stage} first retry at {completed}/{total} bytes: {error:?}");
+}
+
+/// `read_exact` against one absolute deadline. Bytes already stored stay stored.
+/// On macOS, readiness is `poll` only: `SO_RCVTIMEO` is not set.
+#[cfg(unix)]
+pub(crate) fn read_exact_until_deadline<R>(
+    reader: &mut R,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()>
+where
+    R: Read + DeadlineIo,
+{
+    let mut filled = 0;
+    let mut traced = false;
+    while filled < buf.len() {
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let remaining = remaining_until(deadline)?;
+            reader.refresh_read_timeout(Some(remaining))?;
+        }
+        #[cfg(target_vendor = "apple")]
+        remaining_until(deadline)?;
+        reader.wait_readable(deadline)?;
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => {
+                trace_probe_retry_once(
+                    &mut traced,
+                    "read",
+                    filled,
+                    buf.len(),
+                    &io::Error::new(io::ErrorKind::UnexpectedEof, "read returned zero"),
+                );
+                pause_until_peer_ready(deadline)?;
+            },
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if peer_not_ready(&err) => {
+                trace_probe_retry_once(&mut traced, "read", filled, buf.len(), &err);
+                pause_until_peer_ready(deadline)?;
+            },
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// `write_all` against one absolute deadline. A short write keeps the bytes
+/// already counted and retries only the tail.
+#[cfg(unix)]
+pub(crate) fn write_all_until_deadline<W>(
+    writer: &mut W,
+    buf: &[u8],
+    deadline: Instant,
+) -> io::Result<()>
+where
+    W: Write + DeadlineIo,
+{
+    let mut written = 0;
+    let mut traced = false;
+    while written < buf.len() {
+        let remaining = remaining_until(deadline)?;
+        writer.refresh_write_timeout(Some(remaining))?;
+        match writer.write(&buf[written..]) {
+            Ok(0) => {
+                trace_probe_retry_once(
+                    &mut traced,
+                    "write",
+                    written,
+                    buf.len(),
+                    &io::Error::new(io::ErrorKind::WriteZero, "write returned zero"),
+                );
+                pause_until_peer_ready(deadline)?;
+            },
+            Ok(n) => written += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if peer_not_ready(&err) => {
+                trace_probe_retry_once(&mut traced, "write", written, buf.len(), &err);
+                pause_until_peer_ready(deadline)?;
+            },
+            Err(err) => return Err(err),
+        }
+    }
+    loop {
+        let remaining = remaining_until(deadline)?;
+        writer.refresh_write_timeout(Some(remaining))?;
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if peer_not_ready(&err) => {
+                trace_probe_retry_once(&mut traced, "flush", written, buf.len(), &err);
+                pause_until_peer_ready(deadline)?;
+            },
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn encode_client_frame(msg: ClientToServerMsg) -> io::Result<Vec<u8>> {
+    let proto: ProtoClientToServerMsg = msg.into();
+    let encoded = proto.encode_to_vec();
+    if encoded.len() > PROBE_MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "encoded IPC frame exceeds the probe cap",
+        ));
+    }
+    let len = u32::try_from(encoded.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame length exceeds u32"))?;
+    let mut frame = Vec::with_capacity(4 + encoded.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&encoded);
+    Ok(frame)
+}
+
+/// Read one length-prefixed server frame, refusing to allocate above `max_frame`.
+#[cfg(unix)]
+pub(crate) fn read_server_frame_until_deadline<R>(
+    reader: &mut R,
+    deadline: Instant,
+    max_frame: usize,
+) -> io::Result<ServerToClientMsg>
+where
+    R: Read + DeadlineIo,
+{
+    let mut len_bytes = [0u8; 4];
+    read_exact_until_deadline(reader, &mut len_bytes, deadline)?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > max_frame {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame exceeds the allowed cap",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    read_exact_until_deadline(reader, &mut buf, deadline)?;
+    decode_server_frame(&buf)
+}
+
+#[cfg(all(test, unix))]
+mod probe_deadline_tests {
+    use super::error_means_peer_not_ready;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn macos_probe_read_einval_is_retried_and_other_invalid_input_is_not() {
+        assert!(error_means_peer_not_ready(
+            ErrorKind::InvalidInput,
+            Some(22),
+            true
+        ));
+        assert!(!error_means_peer_not_ready(
+            ErrorKind::InvalidInput,
+            Some(22),
+            false
+        ));
+        assert!(error_means_peer_not_ready(
+            ErrorKind::WouldBlock,
+            None,
+            false
+        ));
+    }
 }
 
 // Protobuf helper functions
