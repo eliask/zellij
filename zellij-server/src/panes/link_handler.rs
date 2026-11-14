@@ -13,6 +13,8 @@ pub struct LinkHandler {
 pub struct Link {
     pub id: Option<String>,
     pub uri: String,
+    /// Created by URL detection rather than by an OSC 8 sequence.
+    pub detected: bool,
 }
 
 impl LinkHandler {
@@ -46,7 +48,14 @@ impl LinkHandler {
                     }
                 }
                 let anchor = LinkAnchor::Start(self.link_index);
-                self.links.insert(self.link_index, Link { id, uri });
+                self.links.insert(
+                    self.link_index,
+                    Link {
+                        id,
+                        uri,
+                        detected: false,
+                    },
+                );
                 self.link_index += 1;
                 anchor
             })
@@ -63,10 +72,22 @@ impl LinkHandler {
             Link {
                 id: Some(self.link_index.to_string()),
                 uri: url,
+                detected: true,
             },
         );
         self.link_index += 1;
         anchor
+    }
+
+    /// Whether the anchor starts a link made by URL detection (as opposed to
+    /// one an application requested with OSC 8).
+    pub fn is_detected(&self, link_anchor: Option<LinkAnchor>) -> bool {
+        match link_anchor {
+            Some(LinkAnchor::Start(index)) => {
+                self.links.get(&index).is_some_and(|link| link.detected)
+            },
+            _ => false,
+        }
     }
 
     pub fn uri(&self, link_anchor: Option<LinkAnchor>) -> Option<&str> {

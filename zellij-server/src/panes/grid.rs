@@ -6744,10 +6744,18 @@ pub struct Row {
     pub may_have_groups: bool,
     only_single_width: bool,
     pub link_scan_pending: bool,
+    /// Cells at the start of this row whose text the hyperlink scanner has
+    /// already accepted. A later append scans only the suffix plus a bounded
+    /// lookbehind. Zero means the row has not been scanned.
+    pub(crate) link_prefix_scanned: u32,
+    /// A mutation other than a suffix append. The next scan cannot trust
+    /// `link_prefix_scanned`.
+    pub(crate) link_scan_dirty: bool,
+    pub(crate) link_prefix_has_colon: bool,
 }
 
 #[cfg(target_arch = "x86_64")]
-const _: [(); 48] = [(); std::mem::size_of::<Row>()];
+const _: [(); 56] = [(); std::mem::size_of::<Row>()];
 
 fn encode_width(width: usize) -> Option<NonZeroU32> {
     u32::try_from(width)
@@ -6855,6 +6863,9 @@ impl Row {
             may_have_groups: false,
             only_single_width: false,
             link_scan_pending: false,
+            link_prefix_scanned: 0,
+            link_scan_dirty: false,
+            link_prefix_has_colon: false,
         }
     }
     pub fn with_capacity(capacity: usize) -> Self {
@@ -6868,6 +6879,9 @@ impl Row {
             may_have_groups: false,
             only_single_width: false,
             link_scan_pending: false,
+            link_prefix_scanned: 0,
+            link_scan_dirty: false,
+            link_prefix_has_colon: false,
         }
     }
     pub fn from_columns(columns: Vec<TerminalCharacter>) -> Self {
@@ -6881,6 +6895,9 @@ impl Row {
             may_have_groups: false,
             only_single_width: false,
             link_scan_pending: false,
+            link_prefix_scanned: 0,
+            link_scan_dirty: false,
+            link_prefix_has_colon: false,
         }
     }
     pub fn from_rows(mut rows: Vec<Row>) -> Self {
@@ -6904,6 +6921,11 @@ impl Row {
     pub fn canonical(mut self) -> Self {
         self.is_canonical = true;
         self
+    }
+    pub(crate) fn invalidate_link_scan(&mut self) {
+        self.link_prefix_scanned = 0;
+        self.link_scan_dirty = true;
+        self.link_prefix_has_colon = false;
     }
     pub fn with_bg_color(mut self, bg_color: Option<AnsiCode>) -> Self {
         self.bg_color = bg_color;
@@ -7092,6 +7114,7 @@ impl Row {
             TerminalCharacter::append_plain_ascii(&mut self.columns, run, styles);
             self.width = encode_width(x + run.len());
         } else {
+            self.invalidate_link_scan();
             for (cell, byte) in self.columns[x..x + run.len()].iter_mut().zip(run) {
                 *cell = TerminalCharacter::new_with_width(*byte as char, 1, styles.clone());
             }
@@ -7131,6 +7154,7 @@ impl Row {
         x: usize,
         keep_marker_on_replaced_blank: bool,
     ) {
+        self.invalidate_link_scan();
         let character_width = terminal_character.width();
         if self.width.is_some() && self.only_single_width && character_width == 1 {
             if let Some(existing) = self.columns.get(x) {
@@ -7194,6 +7218,7 @@ impl Row {
         self.width = None;
     }
     pub fn insert_character_at(&mut self, terminal_character: TerminalCharacter, x: usize) {
+        self.invalidate_link_scan();
         let character_width = terminal_character.width();
         for marker in self.osc133_markers.iter_mut() {
             if marker.column > x {
@@ -7221,6 +7246,7 @@ impl Row {
         self.width = None;
     }
     pub fn replace_columns(&mut self, columns: Vec<TerminalCharacter>) {
+        self.invalidate_link_scan();
         self.columns = columns;
         self.osc133_markers.clear();
         self.width = None;
@@ -7230,6 +7256,7 @@ impl Row {
         self.width = None;
     }
     pub fn truncate(&mut self, x: usize) {
+        self.invalidate_link_scan();
         let truncate_position = self.character_index_and_start_column(x).0;
         if truncate_position < self.columns.len() {
             self.columns.truncate(truncate_position);
@@ -7257,6 +7284,7 @@ impl Row {
         to: usize,
         terminal_character: TerminalCharacter,
     ) {
+        self.invalidate_link_scan();
         self.osc133_markers.retain(|marker| marker.column <= from);
         let (from_index, _) = self.character_index_and_start_column(from);
         self.columns.truncate(from_index);
@@ -7277,6 +7305,7 @@ impl Row {
         self.width = None;
     }
     pub fn append(&mut self, to_append: &mut Row) {
+        self.invalidate_link_scan();
         self.expand_trailing_blanks();
         to_append.expand_trailing_blanks();
         if !to_append.osc133_markers.is_empty() {
@@ -7303,6 +7332,7 @@ impl Row {
         self.may_have_groups |= to_append.may_have_groups;
     }
     pub fn drain_until(&mut self, x: usize) -> Vec<TerminalCharacter> {
+        self.invalidate_link_scan();
         let mut drained_part_len = 0;
         let mut split_pos = 0;
         for next_character in self.columns.iter() {
@@ -7321,6 +7351,7 @@ impl Row {
         drained_part
     }
     pub fn replace_and_pad_beginning(&mut self, to: usize, terminal_character: TerminalCharacter) {
+        self.invalidate_link_scan();
         let (to_position_accounting_for_widechars, character_start_column) =
             self.character_index_and_start_column(to);
         let width_of_current_character = self
@@ -7350,6 +7381,7 @@ impl Row {
         self.columns.is_empty()
     }
     pub fn delete_and_return_character(&mut self, x: usize) -> Option<TerminalCharacter> {
+        self.invalidate_link_scan();
         let erase_position = self.absolute_character_index(x);
         if erase_position < self.columns.len() {
             self.width = None;
@@ -7383,6 +7415,9 @@ impl Row {
             may_have_groups: false,
             only_single_width: false,
             link_scan_pending: false,
+            link_prefix_scanned: 0,
+            link_scan_dirty: false,
+            link_prefix_has_colon: false,
         };
         Row::rewrap_rows(vec![std::mem::replace(self, drained)], max_row_length)
     }
