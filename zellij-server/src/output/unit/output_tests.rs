@@ -3184,3 +3184,66 @@ fn graphics_media_files_are_private_and_never_reuse_an_existing_file() {
     assert!(super::super::write_private_media(&path, b"other").is_err());
     assert_eq!(std::fs::read(&path).unwrap(), b"pixels");
 }
+
+#[test]
+fn a_zero_height_cell_does_not_split_a_covered_image_chunk() {
+    let stack = FloatingPanesStack {
+        layers: vec![PaneGeom {
+            x: 0,
+            y: 0,
+            rows: Dimension::fixed(2),
+            cols: Dimension::fixed(2),
+            ..PaneGeom::default()
+        }],
+    };
+    let kitty = KittyImageChunk {
+        cell_x: 1,
+        cell_y: 1,
+        internal_image_id: 1,
+        source_px_x: 0,
+        source_px_y: 0,
+        source_px_width: 8,
+        source_px_height: 8,
+        cell_offset_x: 0,
+        cell_offset_y: 0,
+        z_index: 0,
+        scaled_image: None,
+        placement_uid: 1,
+    };
+    let sixel = SixelImageChunk {
+        cell_x: 1,
+        cell_y: 1,
+        sixel_image_pixel_width: 8,
+        sixel_image_pixel_height: 8,
+        sixel_image_id: 1,
+        ..SixelImageChunk::default()
+    };
+    for cell in [
+        SizeInPixels {
+            width: 0,
+            height: 0,
+        },
+        SizeInPixels {
+            width: 10,
+            height: 0,
+        },
+        SizeInPixels {
+            width: 0,
+            height: 20,
+        },
+    ] {
+        assert_eq!(
+            stack.visible_kitty_image_chunks(vec![kitty], None, &cell),
+            vec![kitty],
+            "kitty chunk split on {:?}",
+            cell
+        );
+        let visible_sixel = stack.visible_sixel_image_chunks(vec![sixel], None, &cell);
+        assert_eq!(
+            format!("{visible_sixel:?}"),
+            format!("{:?}", vec![sixel]),
+            "sixel chunk split on {:?}",
+            cell
+        );
+    }
+}

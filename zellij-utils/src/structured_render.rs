@@ -57,6 +57,10 @@ pub const PANE_UNDER_FLOATING: u8 = 1 << 7;
 
 pub const GRAPHICS_FORMAT_RGBA8: u32 = 0;
 
+pub const MAX_VIEWPORT_COLUMNS: usize = 4096;
+pub const MAX_VIEWPORT_ROWS: usize = 4096;
+pub const MAX_VIEWPORT_CELLS: usize = 1_000_000;
+
 const FLAG_FULL_REPAINT: u8 = 1 << 0;
 const FLAG_CLEAR: u8 = 1 << 1;
 
@@ -173,6 +177,19 @@ impl WireCell {
             c0, c1, c2, c3, f0, f1, f2, f3, b0, b1, b2, b3, u0, u1, u2, u3, a0, a1, self.width,
             self.link,
         ]
+    }
+
+    #[inline]
+    fn from_wire_bytes(bytes: &[u8; CELL_LEN]) -> Self {
+        WireCell {
+            ch: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            fg: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            bg: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            underline_color: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            attrs: u16::from_le_bytes([bytes[16], bytes[17]]),
+            width: bytes[18],
+            link: bytes[19],
+        }
     }
 }
 
@@ -1214,6 +1231,7 @@ pub enum DecodeError {
     RowOutOfRange,
     CellsExhausted,
     BadGraphicsRecord,
+    ViewportTooLarge,
 }
 
 impl Display for DecodeError {
@@ -1233,6 +1251,12 @@ impl Display for DecodeError {
             },
             DecodeError::BadGraphicsRecord => {
                 write!(f, "a graphics record is malformed or runs past its section")
+            },
+            DecodeError::ViewportTooLarge => {
+                write!(
+                    f,
+                    "the frame declares a viewport larger than the supported limit"
+                )
             },
         }
     }
@@ -1496,6 +1520,19 @@ pub fn decode(buffer: &[u8]) -> Result<FrameView<'_>, DecodeError> {
         sideband_offset: u32_at(40),
         sideband_len: u32_at(44),
     };
+    // Reject the viewport before row records, cluster text, or graphics
+    // payloads are walked. A hostile header must not become a cell grid.
+    let cols = header.cols as usize;
+    let rows = header.rows as usize;
+    let viewport_cells = cols
+        .checked_mul(rows)
+        .ok_or(DecodeError::ViewportTooLarge)?;
+    if cols > MAX_VIEWPORT_COLUMNS
+        || rows > MAX_VIEWPORT_ROWS
+        || viewport_cells > MAX_VIEWPORT_CELLS
+    {
+        return Err(DecodeError::ViewportTooLarge);
+    }
 
     let records_len = (header.row_record_count as usize)
         .checked_mul(ROW_RECORD_LEN)
@@ -1796,18 +1833,35 @@ impl<'a> FrameView<'a> {
     }
 
     fn blit(&self, record: RowRecord, at: usize, destination: &mut [WireCell], cols: usize) {
-        let start = record.y as usize * cols + record.x0 as usize;
         let len = record.len as usize;
-        let bytes = len * CELL_LEN;
-        if start + len > destination.len() {
+        let Some(start) = (record.y as usize)
+            .checked_mul(cols)
+            .and_then(|row| row.checked_add(record.x0 as usize))
+        else {
+            return;
+        };
+        let Some(end) = start.checked_add(len) else {
+            return;
+        };
+        if end > destination.len() {
             return;
         }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.buffer.as_ptr().add(at),
-                destination.as_mut_ptr().add(start) as *mut u8,
-                bytes,
-            );
+        let Some(bytes) = len.checked_mul(CELL_LEN) else {
+            return;
+        };
+        let Some(src_end) = at.checked_add(bytes) else {
+            return;
+        };
+        if src_end > self.buffer.len() {
+            return;
+        }
+        let source = &self.buffer[at..src_end];
+        for (slot, chunk) in destination[start..end]
+            .iter_mut()
+            .zip(source.chunks_exact(CELL_LEN))
+        {
+            let chunk: &[u8; CELL_LEN] = chunk.try_into().expect("chunks are CELL_LEN long");
+            *slot = WireCell::from_wire_bytes(chunk);
         }
     }
 
@@ -1824,17 +1878,10 @@ impl<'a> FrameView<'a> {
     }
 
     pub fn cell(&self, at: usize) -> WireCell {
-        let mut chunk = [0u8; CELL_LEN];
-        chunk.copy_from_slice(&self.buffer[at..at + CELL_LEN]);
-        WireCell {
-            ch: u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
-            fg: u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
-            bg: u32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]),
-            underline_color: u32::from_le_bytes([chunk[12], chunk[13], chunk[14], chunk[15]]),
-            attrs: u16::from_le_bytes([chunk[16], chunk[17]]),
-            width: chunk[18],
-            link: chunk[19],
-        }
+        let chunk: &[u8; CELL_LEN] = self.buffer[at..at + CELL_LEN]
+            .try_into()
+            .expect("a cell is CELL_LEN bytes");
+        WireCell::from_wire_bytes(chunk)
     }
 }
 
@@ -1853,8 +1900,10 @@ impl<'v, 'a> Iterator for RowIter<'v, 'a> {
         }
         let record = self.view.record_at(self.index);
         let mut cells = Vec::with_capacity(record.len as usize);
-        for offset in 0..record.len as usize {
-            cells.push(self.view.cell(self.cursor + offset * CELL_LEN));
+        let end = self.cursor + record.len as usize * CELL_LEN;
+        for chunk in self.view.buffer[self.cursor..end].chunks_exact(CELL_LEN) {
+            let chunk: &[u8; CELL_LEN] = chunk.try_into().expect("chunks are CELL_LEN long");
+            cells.push(WireCell::from_wire_bytes(chunk));
         }
         self.index += 1;
         self.cursor += record.len as usize * CELL_LEN;
@@ -2256,6 +2305,69 @@ mod tests {
                 cut
             );
         }
+    }
+
+    #[test]
+    fn a_frame_that_declares_an_unreasonably_large_viewport_is_rejected() {
+        let frame = FrameBuilder::new(1, 1, 0).finish();
+
+        let mut enormous = frame.clone();
+        enormous[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        enormous[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(error_of(&enormous), Some(DecodeError::ViewportTooLarge));
+
+        let mut too_wide = frame.clone();
+        too_wide[2..4].copy_from_slice(&((MAX_VIEWPORT_COLUMNS + 1) as u16).to_le_bytes());
+        assert_eq!(error_of(&too_wide), Some(DecodeError::ViewportTooLarge));
+
+        let mut too_tall = frame.clone();
+        too_tall[4..6].copy_from_slice(&((MAX_VIEWPORT_ROWS + 1) as u16).to_le_bytes());
+        assert_eq!(error_of(&too_tall), Some(DecodeError::ViewportTooLarge));
+
+        // Each side is inside its own cap; the product is not.
+        let mut too_many_cells = frame.clone();
+        too_many_cells[2..4].copy_from_slice(&2500u16.to_le_bytes());
+        too_many_cells[4..6].copy_from_slice(&401u16.to_le_bytes());
+        assert_eq!(
+            error_of(&too_many_cells),
+            Some(DecodeError::ViewportTooLarge)
+        );
+
+        let mut at_the_cell_cap = frame;
+        at_the_cell_cap[2..4].copy_from_slice(&2500u16.to_le_bytes());
+        at_the_cell_cap[4..6].copy_from_slice(&400u16.to_le_bytes());
+        let view = decode(&at_the_cell_cap).expect("1_000_000 cells is the inclusive cap");
+        assert_eq!((view.header().cols, view.header().rows), (2500, 400));
+    }
+
+    #[test]
+    fn a_grapheme_cluster_is_not_expanded_when_the_viewport_is_too_large() {
+        let mut builder = FrameBuilder::new(4, 1, 0);
+        let ch = builder.cluster("e\u{301}").expect("a short cluster");
+        let mut grapheme = WireCell::BLANK;
+        grapheme.ch = ch;
+        grapheme.width = 1;
+        builder.push_row(0, 0, &[grapheme]);
+        let frame = builder.finish();
+
+        let view = decode(&frame).unwrap();
+        let (record, cells) = view.rows().next().expect("one row");
+        assert_eq!(record.len, 1);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].width, 1);
+        assert_eq!(view.clusters().get(0), Some("e\u{301}"));
+        let placed = grid(4, 1, &frame);
+        assert_eq!(placed[0].width, 1);
+        assert_eq!(placed[1], WireCell::BLANK);
+
+        // Corrupt the cluster payload. The viewport check runs first, so the
+        // error is the size, not a graphics-record failure from the cluster.
+        let mut oversized = frame;
+        oversized[2..4].copy_from_slice(&((MAX_VIEWPORT_COLUMNS + 1) as u16).to_le_bytes());
+        if let Some(last) = oversized.last_mut() {
+            *last ^= 0xff;
+        }
+        assert_eq!(error_of(&oversized), Some(DecodeError::ViewportTooLarge));
     }
 
     #[test]

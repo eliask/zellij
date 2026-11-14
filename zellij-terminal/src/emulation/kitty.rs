@@ -15,7 +15,7 @@ const BASE64: GeneralPurpose = GeneralPurpose::new(
 const MAX_CSI_PARAMS: usize = 32;
 const MAX_FORWARDED: usize = 2;
 const MAX_OSC_LEN: usize = 8192;
-const MAX_IMAGE_BYTES: usize = 104_857_600;
+pub(crate) const MAX_IMAGE_BYTES: usize = 104_857_600;
 const SHM_DIR: &str = "/dev/shm";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
