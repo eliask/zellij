@@ -4381,9 +4381,10 @@ impl Grid {
                     .end_image(new_image_id, x_pixel_coordinates, y_pixel_coordinates);
             if let Some(new_sixel_image) = new_sixel_image {
                 let (image_pixel_height, _image_pixel_width) = new_sixel_image.pixel_size();
-                self.sixel_grid
+                let admitted = self
+                    .sixel_grid
                     .new_sixel_image(new_image_id, new_sixel_image);
-                if !self.sixel_scrolling {
+                if admitted && !self.sixel_scrolling {
                     self.move_cursor_down_by_pixels(image_pixel_height);
                 }
                 self.render_full_viewport(); // TODO: this could be optimized if it's a performance bottleneck

@@ -1,5 +1,9 @@
-use super::{crop_rgba, scale_rgba, KittyGrid, KittyPlacement, KittyVerticalAnchor};
-use crate::panes::kitty_graphics::parser::{DecodedImage, KittyCommand, KittyFormat};
+use super::{
+    crop_rgba, scale_rgba, KittyGrid, KittyPlacement, KittyVerticalAnchor, MAX_KITTY_PLACEMENTS,
+};
+use crate::panes::kitty_graphics::parser::{
+    DecodedImage, KittyCommand, KittyErrorCode, KittyFormat,
+};
 use crate::panes::kitty_graphics::store::KittyImageStore;
 use crate::panes::sixel::PixelRect;
 use std::cell::RefCell;
@@ -381,4 +385,61 @@ fn a_scaled_placement_emits_from_the_origin_of_its_cropped_variant() {
     assert_eq!(placement.emit_y, 0);
     assert_eq!(placement.source_rect.x, 8);
     assert_eq!(placement.source_rect.y, 10);
+}
+
+#[test]
+fn anonymous_placement_id_zero_is_capped_without_copying_the_raster() {
+    let mut grid = test_grid();
+    let (pane_image_id, internal) = transmitted(&mut grid, 1, 1);
+    let bytes_after_transmit = grid.kitty_image_store.borrow().total_bytes();
+    let image_count = grid.kitty_image_store.borrow().image_count();
+    let cell = SizeInPixels {
+        width: 10,
+        height: 20,
+    };
+    let anchor = KittyVerticalAnchor {
+        canonical_line: 0,
+        offset_px_from_line_start: 0,
+    };
+    // a=p,i=<id>,p=0: placement id 0 is a new placement.
+    let command = KittyCommand {
+        image_id: Some(pane_image_id),
+        placement_id: Some(0),
+        suppress_cursor_movement: true,
+        ..Default::default()
+    };
+    for _ in 0..MAX_KITTY_PLACEMENTS {
+        grid.place(pane_image_id, internal, &command, (0, 0), cell, anchor)
+            .expect("a placement within the cap");
+    }
+    let kept: Vec<_> = grid
+        .placements()
+        .iter()
+        .map(|placement| placement.placement_uid)
+        .collect();
+
+    let error = grid
+        .place(pane_image_id, internal, &command, (0, 0), cell, anchor)
+        .expect_err("the placement past the cap");
+
+    assert_eq!(error.code, KittyErrorCode::Einval);
+    assert_eq!(grid.placements().len(), MAX_KITTY_PLACEMENTS);
+    assert_eq!(
+        grid.placements()
+            .iter()
+            .map(|placement| placement.placement_uid)
+            .collect::<Vec<_>>(),
+        kept,
+        "a refused placement must leave the stored records unchanged"
+    );
+    assert_eq!(grid.kitty_image_store.borrow().image_count(), image_count);
+    assert_eq!(
+        grid.kitty_image_store.borrow().total_bytes(),
+        bytes_after_transmit,
+        "sharing one raster must not admit another copy per placement"
+    );
+    assert!(grid
+        .placements()
+        .iter()
+        .all(|placement| placement.placement_id == 0 && placement.internal_id == internal));
 }

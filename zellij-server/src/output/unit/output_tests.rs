@@ -5,7 +5,9 @@ use super::super::{
 use crate::panes::kitty_graphics::parser::{
     DecodedImage, KittyAction, KittyCommandParser, KittyFormat,
 };
-use crate::panes::kitty_graphics::store::{InternalImageId, KittyImageStore, ScaledImageKey};
+use crate::panes::kitty_graphics::store::{
+    InternalImageId, KittyImageStore, ScaledImageKey, KITTY_IMAGE_METADATA_BYTES,
+};
 use crate::panes::kitty_graphics::KittyHostCapability;
 use crate::panes::sixel::{PixelRect, SixelImageStore};
 use crate::panes::terminal_character::AnsiCode;
@@ -2336,7 +2338,13 @@ fn kitty_cropped_placements_preserve_pixels_after_cell_resize() {
                 }
             }
             let scaled_bytes = if scaled { 4 * size.0 * size.1 * 4 } else { 0 };
-            assert_eq!(parts.0.borrow().total_bytes(), 20 * 40 * 4 + scaled_bytes);
+            let store = parts.0.borrow();
+            // Cached transmit encodings are accounted as derived bytes on
+            // top of the base raster and retained scaled variants.
+            assert_eq!(
+                store.total_bytes() - store.encoded_cache_bytes(),
+                20 * 40 * 4 + scaled_bytes + KITTY_IMAGE_METADATA_BYTES
+            );
         }
     }
 }
