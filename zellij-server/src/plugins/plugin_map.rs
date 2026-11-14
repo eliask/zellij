@@ -5,8 +5,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, LazyLock, Mutex,
     },
 };
 use wasmi::{Instance, Store, StoreLimits};
@@ -67,17 +67,25 @@ impl PluginMap {
                 }
             }
         }
+        // Workers share the plugin id and are not the map entry. Retire them
+        // with the instance, but keep their quota until the operation drops.
+        retire_plugin(pid);
         removed
     }
     pub fn remove_plugin_clients(&mut self, client_id: ClientId) -> RemovedPluginAssets {
         let mut removed = HashMap::new();
         let ids_in_plugin_map: Vec<PluginKey> = self.plugin_assets.keys().copied().collect();
+        let mut retired = Vec::new();
         for key in ids_in_plugin_map {
             if key.1 == client_id {
                 if let Some(plugin_asset) = self.plugin_assets.remove(&key) {
+                    retired.push(key);
                     removed.insert(key, plugin_asset);
                 }
             }
+        }
+        for (plugin_id, client_id) in retired {
+            retire_all_loads(plugin_id, client_id);
         }
         removed
     }
@@ -87,6 +95,13 @@ impl PluginMap {
         assets: PluginAssets,
         in_blocking_call: Option<Arc<AtomicBool>>,
     ) {
+        let (plugin_id, client_id, generation) = {
+            let running = assets.0.lock().unwrap();
+            let env = running.store.data();
+            (env.plugin_id, env.client_id, env.generation)
+        };
+        // The replacement is already registered. Cancel only the load it supersedes.
+        retire_older_loads(plugin_id, client_id, generation);
         self.shared_assets.insert(instance_id, assets);
         match in_blocking_call {
             Some(in_blocking_call) => {
@@ -100,7 +115,9 @@ impl PluginMap {
     }
     pub fn remove_shared(&mut self, instance_id: PluginId) -> Option<PluginAssets> {
         self.shared_blocking_calls.remove(&instance_id);
-        self.shared_assets.remove(&instance_id)
+        let assets = self.shared_assets.remove(&instance_id)?;
+        retire_plugin(instance_id);
+        Some(assets)
     }
     pub fn shared_instance_in_blocking_call(&self, instance_id: PluginId) -> bool {
         self.shared_blocking_calls
@@ -302,6 +319,11 @@ impl PluginMap {
         subscriptions: Arc<Mutex<Subscriptions>>,
         running_workers: HashMap<String, UnboundedSender<MessageToWorker>>,
     ) {
+        let generation = running_plugin.lock().unwrap().store.data().generation;
+        // Workers created for this load are registered after `generation`.
+        // Retire before the previous instance is dropped so its flag is clear
+        // while its reservation, if any, is still outstanding.
+        retire_older_loads(plugin_id, client_id, generation);
         self.plugin_assets.insert(
             (plugin_id, client_id),
             (running_plugin, subscriptions, running_workers),
@@ -337,6 +359,121 @@ impl PluginMap {
 
 pub type Subscriptions = HashSet<EventType>;
 
+static NEXT_PLUGIN_GENERATION: AtomicU64 = AtomicU64::new(1);
+static LOAD_ALIVE: LazyLock<Mutex<HashMap<(PluginId, ClientId), Vec<(u64, Arc<AtomicBool>)>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn load_registry(
+) -> std::sync::MutexGuard<'static, HashMap<(PluginId, ClientId), Vec<(u64, Arc<AtomicBool>)>>> {
+    LOAD_ALIVE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Generation and liveness for one plugin load, including its workers.
+///
+/// Workers of a load are registered under the same plugin and client with a
+/// later generation. Replacing a load retires only older generations, so the
+/// new load and the workers created with it stay admitted.
+pub(crate) fn register_plugin_load(
+    plugin_id: PluginId,
+    client_id: ClientId,
+    generation: u64,
+    alive: Arc<AtomicBool>,
+) {
+    load_registry()
+        .entry((plugin_id, client_id))
+        .or_default()
+        .push((generation, alive));
+}
+
+fn unregister_plugin_load(plugin_id: PluginId, client_id: ClientId, generation: u64) {
+    let mut loads = load_registry();
+    let Some(entries) = loads.get_mut(&(plugin_id, client_id)) else {
+        return;
+    };
+    entries.retain(|(registered, _)| *registered != generation);
+    if entries.is_empty() {
+        loads.remove(&(plugin_id, client_id));
+    }
+}
+
+fn mark_retired(entries: &[(u64, Arc<AtomicBool>)]) {
+    for (_, alive) in entries {
+        alive.store(false, Ordering::Release);
+    }
+}
+
+/// Cancel every load of `plugin_id` for `client_id`, including its workers.
+pub(crate) fn retire_all_loads(plugin_id: PluginId, client_id: ClientId) {
+    {
+        let mut loads = load_registry();
+        if let Some(entries) = loads.remove(&(plugin_id, client_id)) {
+            mark_retired(&entries);
+        }
+    }
+    crate::plugins::reap_retired_operations();
+}
+
+/// Cancel loads of this client older than `keep`. The kept generation and any
+/// worker registered after it stay alive.
+pub(crate) fn retire_older_loads(plugin_id: PluginId, client_id: ClientId, keep: u64) {
+    {
+        let mut loads = load_registry();
+        let Some(entries) = loads.get_mut(&(plugin_id, client_id)) else {
+            return;
+        };
+        let mut retired = Vec::new();
+        entries.retain(|(generation, alive)| {
+            if *generation < keep {
+                retired.push(alive.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if entries.is_empty() {
+            loads.remove(&(plugin_id, client_id));
+        }
+        drop(loads);
+        for alive in retired {
+            alive.store(false, Ordering::Release);
+        }
+    }
+    crate::plugins::reap_retired_operations();
+}
+
+fn retire_plugin(plugin_id: PluginId) {
+    let mut retired = Vec::new();
+    {
+        let mut loads = load_registry();
+        let keys: Vec<_> = loads
+            .keys()
+            .copied()
+            .filter(|(id, _)| *id == plugin_id)
+            .collect();
+        for key in keys {
+            if let Some(entries) = loads.remove(&key) {
+                retired.extend(entries.into_iter().map(|(_, alive)| alive));
+            }
+        }
+    }
+    for alive in retired {
+        alive.store(false, Ordering::Release);
+    }
+    crate::plugins::reap_retired_operations();
+}
+
+pub(crate) fn fresh_load_identity(
+    plugin_id: PluginId,
+    client_id: ClientId,
+) -> (u64, Arc<AtomicBool>) {
+    let generation = NEXT_PLUGIN_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let alive = Arc::new(AtomicBool::new(true));
+    register_plugin_load(plugin_id, client_id, generation, alive.clone());
+    (generation, alive)
+}
+
 pub struct PluginEnv {
     pub plugin_id: PluginId,
     pub plugin: PluginConfig,
@@ -344,6 +481,12 @@ pub struct PluginEnv {
     pub senders: ThreadSenders,
     pub wasi_ctx: WasiCtx,
     pub client_id: ClientId,
+    /// Scheduling generation of this load. A background result carries the
+    /// generation that admitted it and is dropped when a newer load is current.
+    pub generation: u64,
+    /// Cleared when the load is retired. In-flight background work watches this
+    /// instead of taking the guest lock.
+    pub load_alive: Arc<AtomicBool>,
     #[allow(dead_code)]
     pub plugin_own_data_dir: PathBuf,
     pub plugin_own_cache_dir: PathBuf,
@@ -467,6 +610,12 @@ impl<T: Write + Send + 'static> std::io::Write for WriteOutputStream<T> {
     fn flush(&mut self) -> std::io::Result<()> {
         let mut inner = self.0.lock().unwrap();
         inner.flush()
+    }
+}
+
+impl Drop for PluginEnv {
+    fn drop(&mut self) {
+        unregister_plugin_load(self.plugin_id, self.client_id, self.generation);
     }
 }
 
@@ -626,5 +775,43 @@ mod released_contract_detection_tests {
     fn built_in_plugins_are_never_treated_as_built_against_0_45() {
         let built_in = RunPluginLocation::Zellij(PluginTag::new("status-bar"));
         assert!(!lacks_marker(built_in, &["load", "update", "render"]));
+    }
+}
+
+#[cfg(test)]
+mod load_retirement_tests {
+    use super::*;
+
+    #[test]
+    fn reloading_a_client_retires_only_that_clients_older_loads() {
+        let plugin_id = 91_060;
+        let client_a = 1;
+        let client_b = 2;
+        let (old_main, old_main_alive) = fresh_load_identity(plugin_id, client_a);
+        let (old_worker, old_worker_alive) = fresh_load_identity(plugin_id, client_a);
+        let (new_main, new_main_alive) = fresh_load_identity(plugin_id, client_a);
+        let (_new_worker, new_worker_alive) = fresh_load_identity(plugin_id, client_a);
+        let (_other_client, other_alive) = fresh_load_identity(plugin_id, client_b);
+        assert!(old_main < old_worker && old_worker < new_main);
+        retire_older_loads(plugin_id, client_a, new_main);
+        assert!(!old_main_alive.load(Ordering::Acquire));
+        assert!(
+            !old_worker_alive.load(Ordering::Acquire),
+            "a worker from the replaced load is retired with it"
+        );
+        assert!(new_main_alive.load(Ordering::Acquire));
+        assert!(
+            new_worker_alive.load(Ordering::Acquire),
+            "workers registered after the new main generation stay alive"
+        );
+        assert!(
+            other_alive.load(Ordering::Acquire),
+            "another client of the same plugin id keeps its load"
+        );
+        retire_all_loads(plugin_id, client_a);
+        retire_all_loads(plugin_id, client_b);
+        assert!(!new_main_alive.load(Ordering::Acquire));
+        assert!(!new_worker_alive.load(Ordering::Acquire));
+        assert!(!other_alive.load(Ordering::Acquire));
     }
 }

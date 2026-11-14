@@ -1,3 +1,4 @@
+mod background_operations;
 mod pinned_executor;
 mod pipes;
 mod plugin_loader;
@@ -11,6 +12,13 @@ mod watch_filesystem;
 mod zellij_exports;
 use log::info;
 
+pub use background_operations::BackgroundOperationReservation;
+#[cfg(test)]
+pub(crate) use background_operations::{in_flight_for, BackgroundOperationKind};
+pub(crate) use background_operations::{
+    reap_retired_operations, try_acquire_refusal_report, try_acquire_run_command,
+    try_acquire_web_request,
+};
 pub use pinned_executor::PinnedExecutor;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -81,7 +89,17 @@ pub enum PluginInstruction {
     ),
     LoadBackgroundPlugin(RunPluginOrAlias, ClientId),
     Update(Vec<(Option<PluginId>, Option<ClientId>, Event)>), // Focused plugin / broadcast, client_id, event data
-    Unload(PluginId),                                         // plugin_id
+    // Result of a RunCommand, WebRequest, or RunAction. The generation is the
+    // load that scheduled it. The reservation, when present, stays charged
+    // until this instruction is applied or dropped.
+    ApplyLoadResult {
+        plugin_id: PluginId,
+        client_id: ClientId,
+        event: Event,
+        generation: u64,
+        reservation: Option<BackgroundOperationReservation>,
+    },
+    Unload(PluginId), // plugin_id
     Reload(
         Option<bool>,   // should float
         Option<String>, // pane title
@@ -297,6 +315,7 @@ impl From<&PluginInstruction> for PluginContext {
             PluginInstruction::LoadBackgroundPlugin(..) => PluginContext::LoadBackgroundPlugin,
             PluginInstruction::LoadPopup { .. } => PluginContext::LoadPopup,
             PluginInstruction::Update(..) => PluginContext::Update,
+            PluginInstruction::ApplyLoadResult { .. } => PluginContext::Update,
             PluginInstruction::Unload(..) => PluginContext::Unload,
             PluginInstruction::Reload(..) => PluginContext::Reload,
             PluginInstruction::ReloadPluginWithId(..) => PluginContext::ReloadPluginWithId,
@@ -602,6 +621,21 @@ pub(crate) fn plugin_thread_main(
             },
             PluginInstruction::Update(updates) => {
                 wasm_bridge.update_plugins(updates, shutdown_send.clone())?;
+            },
+            PluginInstruction::ApplyLoadResult {
+                plugin_id,
+                client_id,
+                event,
+                generation,
+                reservation: _reservation,
+            } => {
+                // Held until this arm ends, so a stalled plugin thread keeps
+                // the quota charged for a result it has not consumed yet.
+                wasm_bridge.set_scheduled_load_generation(generation);
+                wasm_bridge.update_plugins(
+                    vec![(Some(plugin_id), Some(client_id), event)],
+                    shutdown_send.clone(),
+                )?;
             },
             PluginInstruction::Unload(pid) => {
                 wasm_bridge.unload_plugin(pid)?;

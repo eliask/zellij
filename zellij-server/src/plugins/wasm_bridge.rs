@@ -79,7 +79,7 @@ fn make_plugin_url_path_safe(url: String) -> String {
 
 #[derive(Debug, Clone)]
 pub enum EventOrPipeMessage {
-    Event(Event, Option<ClientId>),
+    Event(Event, Option<ClientId>, Option<u64>),
     PipeMessage(PipeMessage, Option<ClientId>),
 }
 
@@ -320,6 +320,9 @@ pub struct WasmBridge {
     shared_slot_owner: HashMap<PluginId, PluginId>,
     shared_module_kinds: HashMap<String, bool>,
     settings_entries: SettingsEntries,
+    /// Generation of the load-scoped result about to be applied. Consumed by
+    /// the next `update_plugins`. Ordinary updates leave this unset.
+    scheduled_load_generation: Option<u64>,
 }
 
 impl WasmBridge {
@@ -396,7 +399,11 @@ impl WasmBridge {
             shared_slot_owner: HashMap::new(),
             shared_module_kinds: HashMap::new(),
             settings_entries: SettingsEntries::default(),
+            scheduled_load_generation: None,
         }
+    }
+    pub fn set_scheduled_load_generation(&mut self, generation: u64) {
+        self.scheduled_load_generation = Some(generation);
     }
     pub fn load_plugin(
         &mut self,
@@ -1114,6 +1121,9 @@ impl WasmBridge {
         mut updates: Vec<(Option<PluginId>, Option<ClientId>, Event)>,
         shutdown_sender: Sender<()>,
     ) -> Result<()> {
+        // One instruction is applied at a time. Taking the generation here keeps
+        // a load-scoped result from sticking to the next ordinary update.
+        let scheduled_load_generation = self.scheduled_load_generation.take();
         for (plugin_id, client_id, event) in updates.iter() {
             if plugin_id.is_none() && client_id.is_none() {
                 if let Event::HostTerminalThemeChanged(mode) = event {
@@ -1121,7 +1131,11 @@ impl WasmBridge {
                 }
             }
         }
-        updates = self.dispatch_shared_updates(updates, shutdown_sender.clone());
+        updates = self.dispatch_shared_updates(
+            updates,
+            shutdown_sender.clone(),
+            scheduled_load_generation,
+        );
         let plugins_to_update: Vec<(
             PluginId,
             ClientId,
@@ -1197,6 +1211,7 @@ impl WasmBridge {
                                     &mut plugin_render_assets,
                                     senders.clone(),
                                     &plugin_subs,
+                                    scheduled_load_generation,
                                 ) {
                                     Ok(()) => {
                                         let _ = senders.send_to_screen(
@@ -1227,9 +1242,14 @@ impl WasmBridge {
         // loop once more to update the cached events for the pending plugins (probably currently
         // being loaded, we'll send them these events when they load)
         for (pid, cid, event) in updates.drain(..) {
+            let scheduled = if event_is_scoped_to_load(&event) {
+                scheduled_load_generation
+            } else {
+                None
+            };
             for (plugin_id, cached_events) in self.cached_events_for_pending_plugins.iter_mut() {
                 if pid.is_none() || pid.as_ref() == Some(plugin_id) {
-                    cached_events.push(EventOrPipeMessage::Event(event.clone(), cid));
+                    cached_events.push(EventOrPipeMessage::Event(event.clone(), cid, scheduled));
                 }
             }
         }
@@ -1817,7 +1837,7 @@ impl WasmBridge {
         shutdown_sender: Sender<()>,
     ) -> Result<()> {
         if let Some(cached_events) = self.cached_events_for_pending_plugins.get_mut(&plugin_id) {
-            cached_events.insert(0, EventOrPipeMessage::Event(event, Some(client_id)));
+            cached_events.insert(0, EventOrPipeMessage::Event(event, Some(client_id), None));
             return Ok(());
         }
         self.update_plugins(
@@ -1992,7 +2012,11 @@ impl WasmBridge {
                             let _s = _s; // guard to allow the task to complete before cleanup/shutdown
                             for event_or_pipe_message in events_or_pipe_messages {
                                 match event_or_pipe_message {
-                                    EventOrPipeMessage::Event(event, target_client_id) => {
+                                    EventOrPipeMessage::Event(
+                                        event,
+                                        target_client_id,
+                                        scheduled_generation,
+                                    ) => {
                                         if target_client_id
                                             .map(|target| target != client_id)
                                             .unwrap_or(false)
@@ -2017,6 +2041,7 @@ impl WasmBridge {
                                                     &mut plugin_render_assets,
                                                     senders.clone(),
                                                     &subs,
+                                                    scheduled_generation,
                                                 ) {
                                                     Ok(()) => {
                                                         let _ = senders.send_to_screen(
@@ -3265,6 +3290,7 @@ impl WasmBridge {
         &mut self,
         updates: Vec<(Option<PluginId>, Option<ClientId>, Event)>,
         shutdown_sender: Sender<()>,
+        scheduled_generation: Option<u64>,
     ) -> Vec<(Option<PluginId>, Option<ClientId>, Event)> {
         if self.shared_instances.is_empty() {
             return updates;
@@ -3305,7 +3331,13 @@ impl WasmBridge {
                 instance_id,
                 move |senders, plugin_map, _connected_clients, _plugin_cache, _engine| {
                     let _s = _s;
-                    apply_events_job(senders, plugin_map, instance_id, events);
+                    apply_events_job(
+                        senders,
+                        plugin_map,
+                        instance_id,
+                        events,
+                        scheduled_generation,
+                    );
                 },
             );
         }
@@ -3618,6 +3650,25 @@ pub(crate) fn apply_pending_popup_size(running_plugin: &mut RunningPlugin) -> bo
     changed
 }
 
+/// Command, web, and action results name a plugin id without their own
+/// generation. A later load of that id must not observe them. Timers are a
+/// separate mechanism and are not covered here.
+pub(crate) fn event_is_scoped_to_load(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::RunCommandResult(..) | Event::WebRequestResult(..) | Event::ActionComplete(..)
+    )
+}
+
+pub(crate) fn stale_load_result(
+    event: &Event,
+    scheduled_generation: Option<u64>,
+    running_generation: u64,
+) -> bool {
+    event_is_scoped_to_load(event)
+        && scheduled_generation.is_some_and(|scheduled| scheduled < running_generation)
+}
+
 pub fn apply_event_to_plugin(
     plugin_id: PluginId,
     client_id: ClientId,
@@ -3626,7 +3677,18 @@ pub fn apply_event_to_plugin(
     plugin_render_assets: &mut Vec<PluginRenderAsset>,
     senders: ThreadSenders,
     plugin_subscriptions: &HashSet<EventType>,
+    scheduled_generation: Option<u64>,
 ) -> Result<()> {
+    // Drop before the guest update and before stdin is written. The pinned
+    // executor applies this later than the instruction was queued, so the
+    // check has to use the generation captured when the work was scheduled.
+    if stale_load_result(
+        event,
+        scheduled_generation,
+        running_plugin.store.data().generation,
+    ) {
+        return Ok(());
+    }
     let instance = running_plugin.instance.clone();
 
     let err_context = || format!("Failed to apply event to plugin {plugin_id}");
@@ -3814,3 +3876,190 @@ mod hover_merge_tests;
 #[cfg(test)]
 #[path = "unit/startup_tests.rs"]
 mod startup_tests;
+
+#[cfg(test)]
+mod load_result_tests {
+    use super::{apply_event_to_plugin, event_is_scoped_to_load, stale_load_result};
+    use crate::plugins::plugin_loader::PluginLoader;
+    use crate::plugins::plugin_map::{PluginEnv, RunningPlugin};
+    use crate::thread_bus::ThreadSenders;
+    use std::collections::{BTreeMap, HashSet};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use wasmi::{Engine, Linker, Module, Store};
+    use zellij_utils::data::{Event, InputMode, PluginTag};
+    use zellij_utils::input::actions::Action;
+    use zellij_utils::input::layout::{PluginUserConfiguration, RunPluginLocation};
+    use zellij_utils::input::plugins::PluginConfig;
+
+    fn update_trap_module() -> Vec<u8> {
+        // (module (func (export "update") (result i32) unreachable))
+        vec![
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01,
+            0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x0a, 0x01, 0x06, b'u', b'p', b'd', b'a', b't',
+            b'e', 0x00, 0x00, 0x0a, 0x05, 0x01, 0x03, 0x00, 0x00, 0x0b,
+        ]
+    }
+
+    fn running_plugin(generation: u64) -> RunningPlugin {
+        let engine = Engine::default();
+        let module = Module::new(&engine, &update_trap_module()[..]).expect("valid module");
+        let stdin_pipe = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let stdout_pipe = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let dir = std::env::temp_dir();
+        let wasi_ctx = PluginLoader::create_wasi_ctx(
+            &dir,
+            &dir,
+            &dir,
+            &dir,
+            &"zellij:status-bar".to_owned(),
+            1,
+            stdin_pipe.clone(),
+            stdout_pipe.clone(),
+        )
+        .expect("wasi context");
+        let env = PluginEnv {
+            plugin_id: 1,
+            client_id: 1,
+            generation,
+            load_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            plugin: PluginConfig {
+                path: PathBuf::from("status-bar.wasm"),
+                _allow_exec_host_cmd: false,
+                location: RunPluginLocation::Zellij(PluginTag::new("status-bar")),
+                initial_userspace_configuration: PluginUserConfiguration::new(BTreeMap::new()),
+                initial_cwd: None,
+            },
+            permissions: Arc::new(Mutex::new(None)),
+            senders: ThreadSenders {
+                should_silently_fail: true,
+                ..ThreadSenders::default()
+            },
+            wasi_ctx,
+            plugin_own_data_dir: dir.clone(),
+            plugin_own_cache_dir: dir.clone(),
+            path_to_default_shell: dir.clone(),
+            default_shell: None,
+            layout_dir: None,
+            plugin_cwd: dir,
+            session_env_vars: BTreeMap::new(),
+            input_pipes_to_unblock: Arc::new(Mutex::new(HashSet::new())),
+            input_pipes_to_block: Arc::new(Mutex::new(HashSet::new())),
+            default_mode: InputMode::Normal,
+            subscriptions: Arc::new(Mutex::new(HashSet::new())),
+            stdin_pipe,
+            stdout_pipe,
+            keybinds: Arc::new(Default::default()),
+            intercepting_key_presses: false,
+            pending_popup_size: None,
+            store_limits: wasmi::StoreLimitsBuilder::new().build(),
+            shared: None,
+        };
+        let mut store = Store::new(&engine, env);
+        let instance = Linker::new(&engine)
+            .instantiate_and_start(&mut store, &module)
+            .expect("instantiates");
+        RunningPlugin::new(store, instance, 0, 0)
+    }
+
+    fn stdin_len(plugin: &RunningPlugin) -> usize {
+        plugin.store.data().stdin_pipe.lock().unwrap().len()
+    }
+
+    fn clear_stdin(plugin: &RunningPlugin) {
+        plugin.store.data().stdin_pipe.lock().unwrap().clear();
+    }
+
+    fn apply(plugin: &mut RunningPlugin, event: &Event, scheduled: Option<u64>) -> bool {
+        apply_event_to_plugin(
+            1,
+            1,
+            plugin,
+            event,
+            &mut Vec::new(),
+            ThreadSenders {
+                should_silently_fail: true,
+                ..ThreadSenders::default()
+            },
+            &HashSet::new(),
+            scheduled,
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn load_scoped_results_are_command_web_and_action_only() {
+        let command = Event::RunCommandResult(None, Vec::new(), Vec::new(), BTreeMap::new());
+        let web = Event::WebRequestResult(200, BTreeMap::new(), Vec::new(), BTreeMap::new());
+        let action = Event::ActionComplete(
+            Action::SwitchToMode {
+                input_mode: InputMode::Locked,
+            },
+            None,
+            BTreeMap::new(),
+        );
+        assert!(event_is_scoped_to_load(&command));
+        assert!(event_is_scoped_to_load(&web));
+        assert!(event_is_scoped_to_load(&action));
+        assert!(!event_is_scoped_to_load(&Event::InputReceived));
+        assert!(!event_is_scoped_to_load(&Event::Timer(1.0)));
+        assert!(stale_load_result(&command, Some(1), 2));
+        assert!(!stale_load_result(&command, Some(2), 2));
+        assert!(!stale_load_result(&command, None, 9));
+        assert!(!stale_load_result(&Event::Timer(1.0), Some(1), 2));
+        assert!(!stale_load_result(&Event::InputReceived, Some(1), 2));
+    }
+
+    #[test]
+    fn a_result_for_an_older_load_is_not_delivered() {
+        let mut plugin = running_plugin(2);
+        assert!(
+            !plugin.built_against_0_45,
+            "a built-in location must not take the 0.45 event rewrite"
+        );
+        let stale = [
+            Event::RunCommandResult(Some(0), b"out".to_vec(), Vec::new(), BTreeMap::new()),
+            Event::WebRequestResult(200, BTreeMap::new(), b"body".to_vec(), BTreeMap::new()),
+            Event::ActionComplete(
+                Action::SwitchToMode {
+                    input_mode: InputMode::Locked,
+                },
+                None,
+                BTreeMap::new(),
+            ),
+        ];
+        for event in &stale {
+            clear_stdin(&plugin);
+            assert!(
+                apply(&mut plugin, event, Some(1)),
+                "a stale result is dropped, not a guest failure"
+            );
+            assert_eq!(
+                stdin_len(&plugin),
+                0,
+                "a stale result must not be written to the guest"
+            );
+        }
+        clear_stdin(&plugin);
+        let current =
+            Event::RunCommandResult(Some(0), b"now".to_vec(), Vec::new(), BTreeMap::new());
+        // The guest traps after the host writes stdin. That write is the delivery.
+        assert!(!apply(&mut plugin, &current, Some(2)));
+        assert!(
+            stdin_len(&plugin) > 0,
+            "the running generation receives its own result"
+        );
+        clear_stdin(&plugin);
+        assert!(!apply(&mut plugin, &current, None));
+        assert!(
+            stdin_len(&plugin) > 0,
+            "an unscoped update is not treated as stale"
+        );
+        clear_stdin(&plugin);
+        assert!(!apply(&mut plugin, &Event::InputReceived, Some(1)));
+        assert!(
+            stdin_len(&plugin) > 0,
+            "ordinary events are not generation-scoped"
+        );
+    }
+}

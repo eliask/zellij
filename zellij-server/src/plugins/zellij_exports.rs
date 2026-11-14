@@ -1,4 +1,6 @@
-use super::PluginInstruction;
+use super::{
+    try_acquire_refusal_report, try_acquire_run_command, try_acquire_web_request, PluginInstruction,
+};
 use crate::background_jobs::BackgroundJob;
 use crate::global_async_runtime::get_tokio_runtime;
 use crate::plugins::plugin_map::PluginEnv;
@@ -14,7 +16,7 @@ use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashSet},
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
     str::FromStr,
     thread,
@@ -2232,6 +2234,7 @@ fn run_action(env: &PluginEnv, mut action: Action, context: BTreeMap<String, Str
     let action_clone = action.clone();
     let client_id = acting_client(env);
     let plugin_id = env.plugin_id;
+    let scheduled_generation = env.generation;
     let senders = env.senders.clone();
     let default_shell = env.default_shell.clone();
     let default_mode = env.default_mode.clone();
@@ -2265,14 +2268,15 @@ fn run_action(env: &PluginEnv, mut action: Action, context: BTreeMap<String, Str
         // After action completes, send ActionComplete event with context
         // Convert server PaneId to zellij_utils PaneId
         let pane_id_for_event = pane_id.map(|p| p.into());
-        let updates = vec![(
-            Some(plugin_id),
-            Some(client_id),
-            Event::ActionComplete(action_clone, pane_id_for_event, context),
-        )];
-
-        // Send the ActionComplete event back to the plugin
-        if let Err(e) = senders.send_to_plugin(PluginInstruction::Update(updates)) {
+        // The generation stays on the instruction so a replacement load can
+        // drop this result. Run-action permits are a separate cap.
+        if let Err(e) = senders.send_to_plugin(PluginInstruction::ApplyLoadResult {
+            plugin_id,
+            client_id,
+            event: Event::ActionComplete(action_clone, pane_id_for_event, context),
+            generation: scheduled_generation,
+            reservation: None,
+        }) {
             log::error!("Failed to send ActionComplete event: {:?}", e);
         }
     });
@@ -3373,6 +3377,55 @@ fn exec_cmd(env: &PluginEnv, mut command_line: Vec<String>) {
         .non_fatal();
 }
 
+fn map_bytes(map: &BTreeMap<String, String>) -> usize {
+    map.iter().fold(0usize, |bytes, (key, value)| {
+        bytes.saturating_add(key.len()).saturating_add(value.len())
+    })
+}
+
+fn run_command_payload_bytes(
+    command_line: &[String],
+    env_variables: &BTreeMap<String, String>,
+    cwd: &Path,
+    context: &BTreeMap<String, String>,
+) -> usize {
+    command_line
+        .iter()
+        .fold(64usize, |bytes, part| bytes.saturating_add(part.len()))
+        .saturating_add(map_bytes(env_variables))
+        .saturating_add(cwd.as_os_str().len())
+        .saturating_add(map_bytes(context))
+}
+
+fn web_request_payload_bytes(
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+    context: &BTreeMap<String, String>,
+) -> usize {
+    url.len()
+        .saturating_add(map_bytes(headers))
+        .saturating_add(body.len())
+        .saturating_add(map_bytes(context))
+        .saturating_add(64)
+}
+
+fn send_load_result(
+    env: &PluginEnv,
+    event: Event,
+    reservation: Option<super::BackgroundOperationReservation>,
+) {
+    let _ = env
+        .senders
+        .send_to_plugin(PluginInstruction::ApplyLoadResult {
+            plugin_id: env.plugin_id,
+            client_id: acting_client(env),
+            event,
+            generation: env.generation,
+            reservation,
+        });
+}
+
 fn run_command(
     env: &PluginEnv,
     mut command_line: Vec<String>,
@@ -3382,21 +3435,44 @@ fn run_command(
 ) {
     if command_line.is_empty() {
         log::error!("Command cannot be empty");
-    } else {
-        let command = command_line.remove(0);
-        let cwd = translate_plugin_path(env, cwd);
-        let _ = env
-            .senders
-            .send_to_background_jobs(BackgroundJob::RunCommand(
-                env.plugin_id,
-                acting_client(env),
-                command,
-                command_line,
-                env_variables,
-                cwd,
-                context,
-            ));
+        return;
     }
+    let command = command_line.remove(0);
+    let cwd = translate_plugin_path(env, cwd);
+    let plugin_id = env.plugin_id;
+    let payload_bytes = run_command_payload_bytes(&command_line, &env_variables, &cwd, &context);
+    let Some(reservation) =
+        try_acquire_run_command(plugin_id, env.load_alive.clone(), payload_bytes)
+    else {
+        log::warn!(
+            "Not running a command for plugin {}: run-command limit reached",
+            plugin_id
+        );
+        match try_acquire_refusal_report(plugin_id, env.load_alive.clone()) {
+            Some(report) => send_load_result(
+                env,
+                crate::background_jobs::run_command_limit_event(context),
+                Some(report),
+            ),
+            None => log::warn!(
+                "Dropping repeated run-command refusal for plugin {plugin_id}: refusal backlog is full"
+            ),
+        }
+        return;
+    };
+    let _ = env
+        .senders
+        .send_to_background_jobs(BackgroundJob::RunCommand(
+            plugin_id,
+            acting_client(env),
+            command,
+            command_line,
+            env_variables,
+            cwd,
+            context,
+            env.generation,
+            reservation,
+        ));
 }
 
 fn web_request(
@@ -3407,16 +3483,39 @@ fn web_request(
     body: Vec<u8>,
     context: BTreeMap<String, String>,
 ) {
+    let plugin_id = env.plugin_id;
+    let payload_bytes = web_request_payload_bytes(&url, &headers, &body, &context);
+    let Some(reservation) =
+        try_acquire_web_request(plugin_id, env.load_alive.clone(), payload_bytes)
+    else {
+        log::warn!(
+            "Not sending a web request for plugin {}: web-request limit reached",
+            plugin_id
+        );
+        match try_acquire_refusal_report(plugin_id, env.load_alive.clone()) {
+            Some(report) => send_load_result(
+                env,
+                crate::background_jobs::web_request_limit_event(context),
+                Some(report),
+            ),
+            None => log::warn!(
+                "Dropping repeated web-request refusal for plugin {plugin_id}: refusal backlog is full"
+            ),
+        }
+        return;
+    };
     let _ = env
         .senders
         .send_to_background_jobs(BackgroundJob::WebRequest(
-            env.plugin_id,
+            plugin_id,
             acting_client(env),
             url,
             verb,
             headers,
             body,
             context,
+            env.generation,
+            reservation,
         ));
 }
 
@@ -7050,4 +7149,398 @@ fn set_live_view_input(env: &PluginEnv, capture: bool) {
             client_id: acting_client(env),
             capture,
         });
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{run_command, web_request, BackgroundJob, Event, PluginEnv, PluginInstruction};
+    use crate::plugins::background_operations::{
+        in_flight_for, try_acquire_run_command, BackgroundOperationKind,
+        MAX_REFUSAL_REPORTS_PER_PLUGIN, MAX_RUN_COMMANDS_PER_PLUGIN,
+        MAX_RUN_COMMAND_BYTES_PER_PLUGIN, MAX_WEB_REQUESTS_PER_PLUGIN,
+    };
+    use crate::thread_bus::ThreadSenders;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use zellij_utils::channels::{unbounded, Receiver, SenderWithContext};
+    use zellij_utils::data::{HttpVerb, InputMode};
+    use zellij_utils::errors::ErrorContext;
+    use zellij_utils::input::layout::{PluginUserConfiguration, RunPluginLocation};
+    use zellij_utils::input::plugins::PluginConfig;
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct Harness {
+        env: PluginEnv,
+        jobs: Receiver<(BackgroundJob, ErrorContext)>,
+        plugins: Receiver<(PluginInstruction, ErrorContext)>,
+    }
+
+    fn harness(plugin_id: u32, generation: u64, alive: Arc<AtomicBool>) -> Harness {
+        let (job_tx, jobs) = unbounded();
+        let (plugin_tx, plugins) = unbounded();
+        let stdin_pipe = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let stdout_pipe = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let dir = std::env::temp_dir();
+        let wasi_ctx = crate::plugins::plugin_loader::PluginLoader::create_wasi_ctx(
+            &dir,
+            &dir,
+            &dir,
+            &dir,
+            &"zellij:status-bar".to_owned(),
+            plugin_id,
+            stdin_pipe.clone(),
+            stdout_pipe.clone(),
+        )
+        .expect("wasi context");
+        let env = PluginEnv {
+            plugin_id,
+            client_id: 1,
+            generation,
+            load_alive: alive,
+            plugin: PluginConfig {
+                path: PathBuf::from("status-bar.wasm"),
+                _allow_exec_host_cmd: false,
+                location: RunPluginLocation::Zellij(zellij_utils::data::PluginTag::new(
+                    "status-bar",
+                )),
+                initial_userspace_configuration: PluginUserConfiguration::new(BTreeMap::new()),
+                initial_cwd: None,
+            },
+            permissions: Arc::new(Mutex::new(None)),
+            senders: ThreadSenders {
+                to_background_jobs: Some(SenderWithContext::new(job_tx)),
+                to_plugin: Some(SenderWithContext::new(plugin_tx)),
+                should_silently_fail: true,
+                ..ThreadSenders::default()
+            },
+            wasi_ctx,
+            plugin_own_data_dir: dir.clone(),
+            plugin_own_cache_dir: dir.clone(),
+            path_to_default_shell: dir.clone(),
+            default_shell: None,
+            layout_dir: None,
+            plugin_cwd: dir,
+            session_env_vars: BTreeMap::new(),
+            input_pipes_to_unblock: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            input_pipes_to_block: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            default_mode: InputMode::Normal,
+            subscriptions: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            stdin_pipe,
+            stdout_pipe,
+            keybinds: Arc::new(Default::default()),
+            intercepting_key_presses: false,
+            pending_popup_size: None,
+            store_limits: wasmi::StoreLimitsBuilder::new().build(),
+            shared: None,
+        };
+        Harness { env, jobs, plugins }
+    }
+
+    fn command(env: &PluginEnv, context: BTreeMap<String, String>) {
+        run_command(
+            env,
+            vec!["true".to_owned()],
+            BTreeMap::new(),
+            PathBuf::from("/tmp"),
+            context,
+        );
+    }
+
+    fn take_jobs(rx: &Receiver<(BackgroundJob, ErrorContext)>) -> Vec<BackgroundJob> {
+        let mut jobs = Vec::new();
+        while let Ok((job, _)) = rx.try_recv() {
+            jobs.push(job);
+        }
+        jobs
+    }
+
+    fn take_plugins(rx: &Receiver<(PluginInstruction, ErrorContext)>) -> Vec<PluginInstruction> {
+        let mut instructions = Vec::new();
+        while let Ok((instruction, _)) = rx.try_recv() {
+            instructions.push(instruction);
+        }
+        instructions
+    }
+
+    #[test]
+    fn an_empty_command_does_not_take_a_slot() {
+        let _lock = lock();
+        let plugin_id = 8801;
+        let harness = harness(plugin_id, 1, Arc::new(AtomicBool::new(true)));
+        run_command(
+            &harness.env,
+            Vec::new(),
+            BTreeMap::new(),
+            PathBuf::from("/tmp"),
+            BTreeMap::new(),
+        );
+        assert!(harness.jobs.try_recv().is_err());
+        assert!(harness.plugins.try_recv().is_err());
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RunCommand, plugin_id),
+            0
+        );
+    }
+
+    #[test]
+    fn commands_past_the_cap_are_refused_on_a_bounded_stream() {
+        let _lock = lock();
+        let plugin_id = 8802;
+        let harness = harness(plugin_id, 7, Arc::new(AtomicBool::new(true)));
+        for _ in 0..MAX_RUN_COMMANDS_PER_PLUGIN {
+            command(&harness.env, BTreeMap::new());
+        }
+        let jobs = take_jobs(&harness.jobs);
+        assert_eq!(jobs.len(), MAX_RUN_COMMANDS_PER_PLUGIN);
+        for job in &jobs {
+            match job {
+                BackgroundJob::RunCommand(id, _, _, _, _, _, _, generation, _) => {
+                    assert_eq!(*id, plugin_id);
+                    assert_eq!(*generation, 7);
+                },
+                other => panic!("unexpected job {other:?}"),
+            }
+        }
+        for index in 0..(MAX_REFUSAL_REPORTS_PER_PLUGIN + 2) {
+            let mut context = BTreeMap::new();
+            context.insert("n".to_owned(), index.to_string());
+            command(&harness.env, context);
+        }
+        assert!(
+            harness.jobs.try_recv().is_err(),
+            "a refused command must not be queued"
+        );
+        let refusals = take_plugins(&harness.plugins);
+        assert_eq!(refusals.len(), MAX_REFUSAL_REPORTS_PER_PLUGIN);
+        for instruction in &refusals {
+            match instruction {
+                PluginInstruction::ApplyLoadResult {
+                    plugin_id: id,
+                    generation,
+                    event,
+                    reservation,
+                    ..
+                } => {
+                    assert_eq!(*id, plugin_id);
+                    assert_eq!(*generation, 7);
+                    assert!(reservation.is_some());
+                    match event {
+                        Event::RunCommandResult(Some(2), stdout, stderr, _) => {
+                            assert!(stdout.is_empty());
+                            assert_eq!(stderr, b"run-command limit reached");
+                        },
+                        other => panic!("unexpected event {other:?}"),
+                    }
+                },
+                other => panic!("unexpected instruction {other:?}"),
+            }
+        }
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RunCommand, plugin_id),
+            MAX_RUN_COMMANDS_PER_PLUGIN
+        );
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RefusalReport, plugin_id),
+            MAX_REFUSAL_REPORTS_PER_PLUGIN
+        );
+        drop(jobs);
+        drop(refusals);
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RunCommand, plugin_id),
+            0
+        );
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RefusalReport, plugin_id),
+            0
+        );
+    }
+
+    #[test]
+    fn an_oversized_command_is_refused_before_it_is_queued() {
+        let _lock = lock();
+        let plugin_id = 8804;
+        let harness = harness(plugin_id, 1, Arc::new(AtomicBool::new(true)));
+        let huge = "x".repeat(MAX_RUN_COMMAND_BYTES_PER_PLUGIN);
+        run_command(
+            &harness.env,
+            vec!["true".to_owned(), huge],
+            BTreeMap::new(),
+            PathBuf::from("/tmp"),
+            BTreeMap::new(),
+        );
+        assert!(harness.jobs.try_recv().is_err());
+        let refusals = take_plugins(&harness.plugins);
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RunCommand, plugin_id),
+            0
+        );
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RefusalReport, plugin_id),
+            1
+        );
+        drop(refusals);
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RefusalReport, plugin_id),
+            0
+        );
+    }
+
+    #[test]
+    fn web_requests_past_the_cap_are_refused_instead_of_queued() {
+        let _lock = lock();
+        let plugin_id = 8803;
+        let harness = harness(plugin_id, 4, Arc::new(AtomicBool::new(true)));
+        for _ in 0..MAX_WEB_REQUESTS_PER_PLUGIN {
+            web_request(
+                &harness.env,
+                "https://example.test".to_owned(),
+                HttpVerb::Get,
+                BTreeMap::new(),
+                Vec::new(),
+                BTreeMap::new(),
+            );
+        }
+        let jobs = take_jobs(&harness.jobs);
+        assert_eq!(jobs.len(), MAX_WEB_REQUESTS_PER_PLUGIN);
+        web_request(
+            &harness.env,
+            "https://example.test/again".to_owned(),
+            HttpVerb::Post,
+            BTreeMap::new(),
+            b"body".to_vec(),
+            BTreeMap::new(),
+        );
+        assert!(harness.jobs.try_recv().is_err());
+        let refusals = take_plugins(&harness.plugins);
+        assert_eq!(refusals.len(), 1);
+        match &refusals[0] {
+            PluginInstruction::ApplyLoadResult {
+                plugin_id: id,
+                generation,
+                event: Event::WebRequestResult(400, _, body, _),
+                reservation,
+                ..
+            } => {
+                assert_eq!(*id, plugin_id);
+                assert_eq!(*generation, 4);
+                assert_eq!(body, b"web-request limit reached");
+                assert!(reservation.is_some());
+            },
+            other => panic!("unexpected instruction {other:?}"),
+        }
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::WebRequest, plugin_id),
+            MAX_WEB_REQUESTS_PER_PLUGIN
+        );
+        drop(jobs);
+        drop(refusals);
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::WebRequest, plugin_id),
+            0
+        );
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RefusalReport, plugin_id),
+            0
+        );
+    }
+
+    #[test]
+    fn a_finished_command_keeps_its_slot_until_the_result_is_dropped() {
+        let _lock = lock();
+        let plugin_id = 8811;
+        let alive = Arc::new(AtomicBool::new(true));
+        let harness = harness(plugin_id, 3, alive.clone());
+        let reservation = try_acquire_run_command(plugin_id, alive, 32).expect("command admission");
+        crate::global_async_runtime::get_tokio_runtime().block_on(
+            crate::background_jobs::perform_run_command(
+                plugin_id,
+                1,
+                "true".to_owned(),
+                Vec::new(),
+                BTreeMap::new(),
+                std::env::temp_dir(),
+                BTreeMap::new(),
+                3,
+                harness.env.senders.clone(),
+                reservation,
+            ),
+        );
+        let (instruction, _) = harness
+            .plugins
+            .recv_timeout(Duration::from_secs(3))
+            .expect("command result");
+        assert!(matches!(
+            instruction,
+            PluginInstruction::ApplyLoadResult {
+                generation: 3,
+                reservation: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RunCommand, plugin_id),
+            1,
+            "the result message still holds the slot"
+        );
+        drop(instruction);
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RunCommand, plugin_id),
+            0
+        );
+    }
+
+    #[test]
+    fn a_retired_result_keeps_its_slot_while_the_consumer_is_stalled() {
+        let _lock = lock();
+        let plugin_id = 8812;
+        let alive = Arc::new(AtomicBool::new(true));
+        let harness = harness(plugin_id, 2, alive.clone());
+        let reservation =
+            try_acquire_run_command(plugin_id, alive.clone(), 32).expect("command admission");
+        crate::global_async_runtime::get_tokio_runtime().block_on(
+            crate::background_jobs::perform_run_command(
+                plugin_id,
+                1,
+                "true".to_owned(),
+                Vec::new(),
+                BTreeMap::new(),
+                std::env::temp_dir(),
+                BTreeMap::new(),
+                2,
+                harness.env.senders.clone(),
+                reservation,
+            ),
+        );
+        let (instruction, _) = harness
+            .plugins
+            .recv_timeout(Duration::from_secs(3))
+            .expect("command result");
+        alive.store(false, Ordering::Release);
+        crate::plugins::reap_retired_operations();
+        match &instruction {
+            PluginInstruction::ApplyLoadResult {
+                reservation: Some(reservation),
+                ..
+            } => assert!(reservation.is_cancelled()),
+            other => panic!("unexpected instruction {other:?}"),
+        }
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RunCommand, plugin_id),
+            1,
+            "cancellation must not release a result the consumer has not dropped"
+        );
+        drop(instruction);
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RunCommand, plugin_id),
+            0
+        );
+    }
 }

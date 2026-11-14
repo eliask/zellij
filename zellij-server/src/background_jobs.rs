@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use crate::os_input_output::PaneEnv;
 use crate::panes::PaneId;
-use crate::plugins::{PluginId, PluginInstruction};
+use crate::plugins::{BackgroundOperationReservation, PluginId, PluginInstruction};
 use crate::pty::PtyInstruction;
 use crate::screen::ScreenInstruction;
 use crate::thread_bus::Bus;
@@ -55,7 +55,9 @@ pub enum BackgroundJob {
         BTreeMap<String, String>,
         PathBuf,
         BTreeMap<String, String>,
-    ), // command, args, env_variables, cwd, context
+        u64, // generation of the load that scheduled the command
+        BackgroundOperationReservation,
+    ), // command, args, env_variables, cwd, context, generation, reservation
     RunInBackground {
         command: PathBuf,
         args: Vec<String>,
@@ -70,6 +72,8 @@ pub enum BackgroundJob {
         BTreeMap<String, String>, // headers
         Vec<u8>,                  // body
         BTreeMap<String, String>, // context
+        u64,                      // generation of the load that scheduled the request
+        BackgroundOperationReservation,
     ),
     HighlightPanesWithMessage(Vec<PaneId>, String),
     RenderToClients,
@@ -541,44 +545,26 @@ pub(crate) fn background_jobs_main(
                 env_variables,
                 cwd,
                 context,
+                generation,
+                reservation,
             ) => {
-                runtime.spawn({
-                    let senders = bus.senders.clone();
-                    async move {
-                        let output = run_background_command(BackgroundCommand {
-                            program: command,
-                            args,
-                            env: env_variables,
-                            cwd: Some(cwd),
-                            input: None,
-                            timeout: None,
-                        })
-                        .await;
-                        match output {
-                            Ok(output) => {
-                                let stdout = output.stdout;
-                                let stderr = output.stderr;
-                                let exit_code = output.exit_code;
-                                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                    Some(plugin_id),
-                                    Some(client_id),
-                                    Event::RunCommandResult(exit_code, stdout, stderr, context),
-                                )]));
-                            },
-                            Err(e) => {
-                                log::error!("Failed to run command: {}", e);
-                                let stdout = vec![];
-                                let stderr = format!("{}", e).as_bytes().to_vec();
-                                let exit_code = Some(2);
-                                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                    Some(plugin_id),
-                                    Some(client_id),
-                                    Event::RunCommandResult(exit_code, stdout, stderr, context),
-                                )]));
-                            },
-                        }
-                    }
-                });
+                if reservation.is_cancelled() {
+                    continue;
+                }
+                let senders = bus.senders.clone();
+                let task = runtime.spawn(perform_run_command(
+                    plugin_id,
+                    client_id,
+                    command,
+                    args,
+                    env_variables,
+                    cwd,
+                    context,
+                    generation,
+                    senders,
+                    reservation.clone(),
+                ));
+                reservation.register_abort_handle(task.abort_handle());
             },
             BackgroundJob::RunInBackground {
                 command,
@@ -588,87 +574,36 @@ pub(crate) fn background_jobs_main(
             } => {
                 runtime.spawn(run_in_background(command, args, cwd, env));
             },
-            BackgroundJob::WebRequest(plugin_id, client_id, url, verb, headers, body, context) => {
-                runtime.spawn({
-                    let senders = bus.senders.clone();
-                    let http_client = http_client.clone();
-                    async move {
-                        async fn web_request(
-                            url: String,
-                            verb: HttpVerb,
-                            headers: BTreeMap<String, String>,
-                            body: Vec<u8>,
-                            http_client: HttpClient,
-                        ) -> Result<
-                            (u16, BTreeMap<String, String>, Vec<u8>), // status_code, headers, body
-                            isahc::Error,
-                        > {
-                            let mut request = match verb {
-                                HttpVerb::Get => Request::get(url),
-                                HttpVerb::Post => Request::post(url),
-                                HttpVerb::Put => Request::put(url),
-                                HttpVerb::Delete => Request::delete(url),
-                            };
-                            for (header, value) in headers {
-                                request = request.header(header.as_str(), value);
-                            }
-                            let mut res = if !body.is_empty() {
-                                let req = request.body(body)?;
-                                http_client.send_async(req).await?
-                            } else {
-                                let req = request.body(())?;
-                                http_client.send_async(req).await?
-                            };
-
-                            let status_code = res.status();
-                            let headers: BTreeMap<String, String> = res
-                                .headers()
-                                .iter()
-                                .filter_map(|(name, value)| match value.to_str() {
-                                    Ok(value) => Some((name.to_string(), value.to_string())),
-                                    Err(e) => {
-                                        log::error!(
-                                            "Failed to convert header {:?} to string: {:?}",
-                                            name,
-                                            e
-                                        );
-                                        None
-                                    },
-                                })
-                                .collect();
-                            let body = res.bytes().await?;
-                            Ok((status_code.as_u16(), headers, body))
-                        }
-                        let Some(http_client) = http_client else {
-                            log::error!("Cannot perform http request, likely due to a misconfigured http client");
-                            return;
-                        };
-
-                        match web_request(url, verb, headers, body, http_client).await {
-                            Ok((status, headers, body)) => {
-                                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                    Some(plugin_id),
-                                    Some(client_id),
-                                    Event::WebRequestResult(status, headers, body, context),
-                                )]));
-                            },
-                            Err(e) => {
-                                log::error!("Failed to send web request: {}", e);
-                                let error_body = e.to_string().as_bytes().to_vec();
-                                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                    Some(plugin_id),
-                                    Some(client_id),
-                                    Event::WebRequestResult(
-                                        400,
-                                        BTreeMap::new(),
-                                        error_body,
-                                        context,
-                                    ),
-                                )]));
-                            },
-                        }
-                    }
-                });
+            BackgroundJob::WebRequest(
+                plugin_id,
+                client_id,
+                url,
+                verb,
+                headers,
+                body,
+                context,
+                generation,
+                reservation,
+            ) => {
+                if reservation.is_cancelled() {
+                    continue;
+                }
+                let senders = bus.senders.clone();
+                let http_client = http_client.clone();
+                let task = runtime.spawn(perform_web_request(
+                    plugin_id,
+                    client_id,
+                    url,
+                    verb,
+                    headers,
+                    body,
+                    context,
+                    generation,
+                    http_client,
+                    senders,
+                    reservation.clone(),
+                ));
+                reservation.register_abort_handle(task.abort_handle());
             },
             BackgroundJob::QueryZellijWebServerStatus => {
                 #[cfg(feature = "web_server_capability")]
@@ -1692,6 +1627,186 @@ pub struct BackgroundCommand {
     pub timeout: Option<Duration>,
 }
 
+/// Cap rejection uses the same `RunCommandResult` shape as a failed command.
+pub(crate) fn run_command_limit_event(context: BTreeMap<String, String>) -> Event {
+    Event::RunCommandResult(
+        Some(2),
+        Vec::new(),
+        b"run-command limit reached".to_vec(),
+        context,
+    )
+}
+
+/// Cap rejection uses the same `WebRequestResult` shape as a failed request.
+pub(crate) fn web_request_limit_event(context: BTreeMap<String, String>) -> Event {
+    Event::WebRequestResult(
+        400,
+        BTreeMap::new(),
+        b"web-request limit reached".to_vec(),
+        context,
+    )
+}
+
+fn send_load_result(
+    senders: &crate::thread_bus::ThreadSenders,
+    plugin_id: PluginId,
+    client_id: ClientId,
+    event: Event,
+    generation: u64,
+    reservation: Option<BackgroundOperationReservation>,
+) {
+    let _ = senders.send_to_plugin(PluginInstruction::ApplyLoadResult {
+        plugin_id,
+        client_id,
+        event,
+        generation,
+        reservation,
+    });
+}
+
+/// Runs one admitted `RunCommand`. The reservation moves into the result
+/// message, so the cap still covers the result while it waits to be applied.
+pub(crate) async fn perform_run_command(
+    plugin_id: PluginId,
+    client_id: ClientId,
+    command: String,
+    args: Vec<String>,
+    env_variables: BTreeMap<String, String>,
+    cwd: PathBuf,
+    context: BTreeMap<String, String>,
+    generation: u64,
+    senders: crate::thread_bus::ThreadSenders,
+    reservation: BackgroundOperationReservation,
+) {
+    if reservation.is_cancelled() {
+        return;
+    }
+    let output = run_background_command(BackgroundCommand {
+        program: command,
+        args,
+        env: env_variables,
+        cwd: Some(cwd),
+        input: None,
+        timeout: None,
+    })
+    .await;
+    // Retirement while the child ran must not deliver the result, and must
+    // not free the quota until this reservation actually drops.
+    if reservation.is_cancelled() {
+        return;
+    }
+    let event = match output {
+        Ok(output) => {
+            Event::RunCommandResult(output.exit_code, output.stdout, output.stderr, context)
+        },
+        Err(e) => {
+            log::error!("Failed to run command: {}", e);
+            Event::RunCommandResult(Some(2), Vec::new(), format!("{}", e).into_bytes(), context)
+        },
+    };
+    send_load_result(
+        &senders,
+        plugin_id,
+        client_id,
+        event,
+        generation,
+        Some(reservation),
+    );
+}
+
+/// Runs one admitted `WebRequest`. The reservation moves into the result
+/// message, so the cap still covers the result while it waits to be applied.
+pub(crate) async fn perform_web_request(
+    plugin_id: PluginId,
+    client_id: ClientId,
+    url: String,
+    verb: HttpVerb,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+    context: BTreeMap<String, String>,
+    generation: u64,
+    http_client: Option<HttpClient>,
+    senders: crate::thread_bus::ThreadSenders,
+    reservation: BackgroundOperationReservation,
+) {
+    if reservation.is_cancelled() {
+        return;
+    }
+    async fn web_request(
+        url: String,
+        verb: HttpVerb,
+        headers: BTreeMap<String, String>,
+        body: Vec<u8>,
+        http_client: HttpClient,
+    ) -> Result<(u16, BTreeMap<String, String>, Vec<u8>), isahc::Error> {
+        let mut request = match verb {
+            HttpVerb::Get => Request::get(url),
+            HttpVerb::Post => Request::post(url),
+            HttpVerb::Put => Request::put(url),
+            HttpVerb::Delete => Request::delete(url),
+        };
+        for (header, value) in headers {
+            request = request.header(header.as_str(), value);
+        }
+        let mut res = if !body.is_empty() {
+            let req = request.body(body)?;
+            http_client.send_async(req).await?
+        } else {
+            let req = request.body(())?;
+            http_client.send_async(req).await?
+        };
+
+        let status_code = res.status();
+        let headers: BTreeMap<String, String> = res
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| match value.to_str() {
+                Ok(value) => Some((name.to_string(), value.to_string())),
+                Err(e) => {
+                    log::error!("Failed to convert header {:?} to string: {:?}", name, e);
+                    None
+                },
+            })
+            .collect();
+        let body = res.bytes().await?;
+        Ok((status_code.as_u16(), headers, body))
+    }
+    let Some(http_client) = http_client else {
+        log::error!("Cannot perform http request, likely due to a misconfigured http client");
+        return;
+    };
+
+    match web_request(url, verb, headers, body, http_client).await {
+        Ok((status, headers, body)) => {
+            if reservation.is_cancelled() {
+                return;
+            }
+            send_load_result(
+                &senders,
+                plugin_id,
+                client_id,
+                Event::WebRequestResult(status, headers, body, context),
+                generation,
+                Some(reservation),
+            );
+        },
+        Err(e) => {
+            if reservation.is_cancelled() {
+                return;
+            }
+            log::error!("Failed to send web request: {}", e);
+            send_load_result(
+                &senders,
+                plugin_id,
+                client_id,
+                Event::WebRequestResult(400, BTreeMap::new(), e.to_string().into_bytes(), context),
+                generation,
+                Some(reservation),
+            );
+        },
+    }
+}
+
 pub async fn run_background_command(
     command: BackgroundCommand,
 ) -> std::result::Result<BackgroundCommandOutput, BackgroundCommandError> {
@@ -1703,6 +1818,12 @@ pub async fn run_background_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Leave the server's process group. Dropping the task kills this child
+    // through kill_on_drop, which is how a cancelled command is reaped.
+    #[cfg(unix)]
+    {
+        process.process_group(0);
+    }
     if let Some(cwd) = &command.cwd {
         process.current_dir(cwd);
     }
@@ -1738,4 +1859,117 @@ pub fn run_background_command_blocking(
     command: BackgroundCommand,
 ) -> std::result::Result<BackgroundCommandOutput, BackgroundCommandError> {
     crate::global_async_runtime::get_tokio_runtime().block_on(run_background_command(command))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cancelled_child_tests {
+    use super::*;
+    use crate::plugins::{
+        in_flight_for, reap_retired_operations, try_acquire_run_command, BackgroundOperationKind,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn child_state(pid: i32) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("State:")
+                        .map(|state| state.trim().to_owned())
+                })
+            })
+    }
+
+    /// A killed child can linger as a zombie until the runtime collects it.
+    /// That is no longer running work.
+    fn child_alive(pid: i32) -> bool {
+        match child_state(pid).as_deref() {
+            None => false,
+            Some(state) => !state.starts_with('Z') && !state.starts_with('X'),
+        }
+    }
+
+    #[test]
+    fn a_cancelled_command_reaps_its_child_and_keeps_a_retained_charge() {
+        let plugin_id = 91_050;
+        let alive = Arc::new(AtomicBool::new(true));
+        let reservation =
+            try_acquire_run_command(plugin_id, alive.clone(), 32).expect("command admission");
+        let retained = reservation.clone();
+        let pid_file = std::env::temp_dir().join(format!(
+            "zellij-p06-child-{}-{}.pid",
+            std::process::id(),
+            reservation_id(&reservation)
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        let runtime = crate::global_async_runtime::get_tokio_runtime();
+        let task = runtime.spawn(perform_run_command(
+            plugin_id,
+            1,
+            "sh".to_owned(),
+            vec!["-c".to_owned(), script],
+            BTreeMap::new(),
+            std::env::temp_dir(),
+            BTreeMap::new(),
+            1,
+            crate::thread_bus::ThreadSenders {
+                should_silently_fail: true,
+                ..Default::default()
+            },
+            reservation,
+        ));
+        retained.register_abort_handle(task.abort_handle());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    if child_alive(pid) {
+                        break pid;
+                    }
+                }
+            }
+            if Instant::now() > deadline {
+                let _ = task.abort();
+                panic!("the command child did not start");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        alive.store(false, Ordering::Release);
+        reap_retired_operations();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child_alive(pid) {
+            if Instant::now() > deadline {
+                let state = child_state(pid);
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+                panic!("cancelling the command left child {pid} running (state {state:?})");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RunCommand, plugin_id),
+            1,
+            "a retained reservation stays charged after the child is reaped"
+        );
+        drop(retained);
+        assert_eq!(
+            in_flight_for(BackgroundOperationKind::RunCommand, plugin_id),
+            0
+        );
+        let _ = std::fs::remove_file(&pid_file);
+        let _ = runtime.block_on(task);
+    }
+
+    fn reservation_id(reservation: &BackgroundOperationReservation) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        reservation.hash(&mut hasher);
+        hasher.finish()
+    }
 }

@@ -13829,6 +13829,8 @@ fn plugin_env_without_read_pane_contents() -> super::plugin_map::PluginEnv {
     super::plugin_map::PluginEnv {
         plugin_id: 1,
         client_id: 1,
+        generation: 1,
+        load_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         plugin: zellij_utils::input::plugins::PluginConfig {
             path: PathBuf::from("/tmp/third-party.wasm"),
             _allow_exec_host_cmd: false,

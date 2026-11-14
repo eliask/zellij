@@ -1,6 +1,6 @@
 use crate::plugins::plugin_map::{
-    PluginEnv, PluginMap, PluginMetadata, RunningPlugin, SharedEnv, VecDequeInputStream,
-    WriteOutputStream,
+    fresh_load_identity, PluginEnv, PluginMap, PluginMetadata, RunningPlugin, SharedEnv,
+    VecDequeInputStream, WriteOutputStream,
 };
 use crate::plugins::plugin_worker::{plugin_worker, RunningWorker};
 use crate::plugins::wasm_bridge::{LoadingContext, PluginCache};
@@ -297,9 +297,12 @@ impl<'a> PluginLoader<'a> {
             stdout_pipe.clone(),
         )?;
         let plugin_path = self.plugin_config.path.clone();
+        let (generation, load_alive) = fresh_load_identity(self.plugin_id, self.client_id);
         let plugin_env = PluginEnv {
             plugin_id: self.plugin_id,
             client_id: self.client_id,
+            generation,
+            load_alive,
             plugin: self.plugin_config.clone(), // TODO: change field name in PluginEnv to plugin_config
             permissions: Arc::new(Mutex::new(None)),
             senders: self.senders.clone(),
@@ -410,9 +413,12 @@ impl<'a> PluginLoader<'a> {
             stdout_pipe.clone(),
         )?;
         let plugin_config = self.plugin_config.clone();
+        let (generation, load_alive) = fresh_load_identity(self.plugin_id, self.client_id);
         let plugin_env = PluginEnv {
             plugin_id: self.plugin_id,
             client_id: self.client_id,
+            generation,
+            load_alive,
             plugin: plugin_config,
             permissions: Arc::new(Mutex::new(None)),
             senders: self.senders.clone(),

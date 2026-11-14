@@ -6,8 +6,8 @@ use crate::plugins::plugin_map::{PluginMap, RunningPlugin, SharedSlot, Subscript
 use crate::plugins::plugin_worker::MessageToWorker;
 use crate::plugins::wasm_bridge::{
     check_event_permission, handle_plugin_crash, handle_plugin_loading_failure,
-    handle_plugin_successful_loading, subscription_event_type, LoadingContext, PluginCache,
-    PluginRenderAsset,
+    handle_plugin_successful_loading, stale_load_result, subscription_event_type, LoadingContext,
+    PluginCache, PluginRenderAsset,
 };
 use crate::plugins::zellij_exports::{wasi_read_bytes, wasi_read_string, wasi_write_object};
 use crate::plugins::PluginInstruction;
@@ -448,6 +448,7 @@ pub fn apply_events_job(
     plugin_map: Arc<Mutex<PluginMap>>,
     instance_id: PluginId,
     events: Vec<SharedEventBatchEntry>,
+    scheduled_generation: Option<u64>,
 ) {
     let Some((running_plugin, subscriptions)) = lookup(&plugin_map, instance_id) else {
         return;
@@ -457,6 +458,13 @@ pub fn apply_events_job(
     let mut render = RenderResponse::Nothing;
     let strip_keybinds = subscriptions.contains(&EventType::InitialKeybinds);
     for (mut event, context, mut keybinds) in events {
+        if stale_load_result(
+            &event,
+            scheduled_generation,
+            running_plugin.store.data().generation,
+        ) {
+            continue;
+        }
         let Ok(event_type) = subscription_event_type(&event) else {
             continue;
         };
