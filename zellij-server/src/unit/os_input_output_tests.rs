@@ -1,5 +1,6 @@
 use super::*;
-use zellij_utils::input::command::RunCommand;
+use zellij_utils::errors::ZellijError;
+use zellij_utils::input::command::{RunCommand, TerminalAction};
 
 fn make_server() -> ServerOsInputOutput {
     get_server_os_input().expect("failed to create server os input")
@@ -408,4 +409,77 @@ fn the_pane_environment_is_added_to_and_removed_from_the_child_environment() {
     });
     assert!(output.contains(expected), "got: '{}'", output);
     assert!(std::env::var("ZELLIJ_PANE_ENV_TEST").is_err());
+}
+
+#[cfg(target_os = "linux")]
+fn open_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn command_not_found_does_not_leak_pty_descriptors() {
+    let _admission = crate::screen::lock_admission_for_test();
+    crate::screen::clear_admitted_uninstalled_terminals();
+    let server = make_server();
+    let before = open_fd_count();
+    let spawned = server.spawn_terminal(
+        TerminalAction::RunCommand(RunCommand::new(std::path::PathBuf::from(
+            "zellij-no-such-command-r04",
+        ))),
+        Box::new(|_, _, _| {}),
+        None,
+        &PaneEnv::new(),
+    );
+    let err = match spawned {
+        Err(err) => err,
+        Ok(_) => panic!("a missing command opened a terminal"),
+    };
+    let terminal_id = err
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<ZellijError>() {
+            Some(ZellijError::CommandNotFound { terminal_id, .. }) => Some(*terminal_id),
+            _ => None,
+        });
+    let terminal_id = terminal_id.expect("command not found should name its terminal id");
+    server.clear_terminal_id(terminal_id).unwrap();
+    crate::screen::release_uninstalled_terminal(terminal_id);
+    assert_eq!(
+        before,
+        open_fd_count(),
+        "command-not-found leaked pty descriptors"
+    );
+    crate::screen::clear_admitted_uninstalled_terminals();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn admission_refusal_does_not_open_a_pty() {
+    let _admission = crate::screen::lock_admission_for_test();
+    crate::screen::clear_admitted_uninstalled_terminals();
+    for terminal_id in 1_000_000..1_000_000 + crate::screen::MAX_UNINSTALLED_TERMINALS {
+        assert!(crate::screen::try_admit_uninstalled_terminal(
+            terminal_id as u32
+        ));
+    }
+    let server = make_server();
+    let before = open_fd_count();
+    let spawned = server.spawn_terminal(
+        TerminalAction::RunCommand(RunCommand::new(std::path::PathBuf::from("/bin/true"))),
+        Box::new(|_, _, _| {}),
+        None,
+        &PaneEnv::new(),
+    );
+    let err = match spawned {
+        Err(err) => err,
+        Ok(_) => panic!("a full admission set still opened a terminal"),
+    };
+    assert!(
+        format!("{err:#}").contains("too many panes are still opening"),
+        "{err:#}"
+    );
+    assert_eq!(before, open_fd_count(), "a refused spawn opened a pty");
+    crate::screen::clear_admitted_uninstalled_terminals();
 }

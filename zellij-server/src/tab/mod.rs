@@ -8268,6 +8268,11 @@ impl Tab {
         self.is_pending
     }
 
+    pub(crate) fn abandon_pending_layout(&mut self) {
+        self.is_pending = false;
+        self.pending_instructions.clear();
+    }
+
     pub fn add_red_pane_frame_color_override(
         &mut self,
         pane_id: PaneId,

@@ -2,6 +2,7 @@ use crate::background_jobs::write_session_state_to_disk;
 use crate::background_jobs::BackgroundJob;
 use crate::global_async_runtime::get_tokio_runtime as async_runtime;
 use crate::os_input_output::{env_value, AsyncReader, NullAsyncReader, PaneEnv};
+use crate::pty_writer::PtyWriteInstruction;
 use crate::route::NotificationEnd;
 use crate::session_suggestions::{ContextTrigger, SessionSuggestionsJob};
 use crate::terminal_bytes::TerminalBytes;
@@ -38,6 +39,29 @@ use zellij_utils::{
 
 pub type VteBytes = Vec<u8>;
 pub type TabIndex = u32;
+
+type StagedTerminal = (u32, bool, Option<RunCommand>, Result<Box<dyn AsyncReader>>);
+
+fn command_not_found_id(err: &anyhow::Error) -> Option<u32> {
+    err.chain()
+        .find_map(|cause| match cause.downcast_ref::<ZellijError>() {
+            Some(ZellijError::CommandNotFound { terminal_id, .. }) => Some(*terminal_id),
+            _ => None,
+        })
+}
+
+fn hold_commands_for_screen(staged: &[StagedTerminal]) -> Vec<(u32, Option<RunCommand>)> {
+    staged
+        .iter()
+        .map(|(terminal_id, starts_held, run_command, _)| {
+            if *starts_held {
+                (*terminal_id, run_command.clone())
+            } else {
+                (*terminal_id, None)
+            }
+        })
+        .collect()
+}
 
 const ORIGIN_PANE_ID_ENV_VAR: &str = "ZELLIJ_ORIGIN_PANE_ID";
 const PANE_ID_ENV_VAR: &str = "ZELLIJ_PANE_ID";
@@ -559,7 +583,7 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: Str
                 } else {
                     floating_panes_layout
                 };
-                pty.spawn_terminals_for_layout(
+                if let Err(err) = pty.spawn_terminals_for_layout(
                     cwd,
                     tab_layout.unwrap_or_else(|| layout.new_tab().0),
                     floating_panes_layout,
@@ -571,8 +595,9 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: Str
                     should_change_focus_to_new_tab,
                     client_id_and_is_web_client,
                     completion_tx,
-                )
-                .with_context(err_context)?;
+                ) {
+                    Err::<(), _>(err).with_context(err_context).non_fatal();
+                }
             },
             PtyInstruction::OverrideLayout(
                 cwd,
@@ -615,17 +640,35 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: Str
                     }
                 }
 
-                // Send all results back to screen in one message
-                pty.bus
-                    .senders
-                    .send_to_screen(ScreenInstruction::OverrideLayoutComplete(
-                        all_tab_results,
-                        retain_existing_terminal_panes,
-                        retain_existing_plugin_panes,
-                        client_id,
-                        completion_tx,
-                    ))
-                    .with_context(err_context)?;
+                // Readers are already running. If the screen never accepts the batch,
+                // stop those children and drop their ids before the thread continues.
+                let terminal_ids: Vec<u32> = all_tab_results
+                    .iter()
+                    .flat_map(|tab| {
+                        tab.new_terminal_pids
+                            .iter()
+                            .map(|(terminal_id, _)| *terminal_id)
+                            .chain(
+                                tab.new_floating_pane_pids
+                                    .iter()
+                                    .map(|(terminal_id, _)| *terminal_id),
+                            )
+                    })
+                    .collect();
+                if let Err(err) =
+                    pty.bus
+                        .senders
+                        .send_to_screen(ScreenInstruction::OverrideLayoutComplete(
+                            all_tab_results,
+                            retain_existing_terminal_panes,
+                            retain_existing_plugin_panes,
+                            client_id,
+                            completion_tx,
+                        ))
+                {
+                    pty.rollback_unapplied_layout_terminals(terminal_ids);
+                    Err::<(), _>(err).with_context(err_context).non_fatal();
+                }
             },
             PtyInstruction::ClosePane(id, completion_tx) => {
                 let close_result = pty.close_pane(id);
@@ -1327,6 +1370,123 @@ impl Pty {
         let starts_held = false;
         Ok((terminal_id, starts_held))
     }
+
+    fn stage_layout_terminals(
+        &mut self,
+        run_instructions: impl IntoIterator<Item = Option<Run>>,
+        default_shell: &TerminalAction,
+        staged: &mut Vec<StagedTerminal>,
+        originating_plugins_to_inform: &mut Vec<(u32, OriginatingPlugin)>,
+    ) -> Result<()> {
+        for run_instruction in run_instructions {
+            let originating_plugin = run_instruction.as_ref().and_then(|run| match run {
+                Run::Command(run_command) => run_command.originating_plugin.clone(),
+                _ => None,
+            });
+            if let Some(staged_terminal) =
+                self.apply_run_instruction(run_instruction, default_shell.clone())?
+            {
+                let terminal_id = staged_terminal.0;
+                staged.push(staged_terminal);
+                if let Some(originating_plugin) = originating_plugin {
+                    originating_plugins_to_inform.push((terminal_id, originating_plugin));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_unapplied_layout_terminals(&mut self, terminal_ids: impl IntoIterator<Item = u32>) {
+        for terminal_id in terminal_ids {
+            if let Err(err) = self.close_pane(PaneId::Terminal(terminal_id)) {
+                log::error!(
+                    "failed to release terminal {terminal_id} while rolling back a layout: {err:#}"
+                );
+            }
+        }
+    }
+
+    fn fail_uncommitted_layout(
+        &mut self,
+        tab_index: usize,
+        error: &anyhow::Error,
+        completion_tx: &mut Option<NotificationEnd>,
+        terminal_ids: impl IntoIterator<Item = u32>,
+    ) {
+        self.rollback_unapplied_layout_terminals(terminal_ids);
+        let _ = self
+            .bus
+            .senders
+            .send_to_screen(ScreenInstruction::LayoutSpawnFailed(tab_index));
+        if let Some(completion) = completion_tx.as_mut() {
+            completion.set_error_message(format!("{error:#}"));
+            completion.set_exit_status(1);
+        }
+    }
+
+    fn start_committed_layout_terminals(&mut self, staged: Vec<StagedTerminal>) {
+        let err_context = || "failed to finish a committed layout pane";
+        for (terminal_id, starts_held, run_command, reader_result) in staged {
+            if starts_held {
+                continue;
+            }
+            match reader_result {
+                Ok(reader) => {
+                    let activity_flag =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let terminal_bytes = async_runtime().spawn({
+                        let senders = self.bus.senders.clone();
+                        let debug_to_file = self.debug_to_file;
+                        let activity_flag = activity_flag.clone();
+                        async move {
+                            TerminalBytes::new(
+                                terminal_id,
+                                reader,
+                                senders,
+                                debug_to_file,
+                                activity_flag,
+                            )
+                            .listen()
+                            .await
+                            .context("failed to spawn terminals for layout")
+                            .fatal();
+                        }
+                    });
+                    self.task_handles.insert(terminal_id, terminal_bytes);
+                    self.pane_activity_flags.insert(terminal_id, activity_flag);
+                },
+                Err(_) => match run_command {
+                    Some(run_command) if run_command.hold_on_close => {
+                        send_command_not_found_to_screen(
+                            self.bus.senders.clone(),
+                            terminal_id,
+                            run_command,
+                        )
+                        .with_context(err_context)
+                        .non_fatal();
+                    },
+                    _ => {
+                        if let Err(err) = self.close_pane(PaneId::Terminal(terminal_id)) {
+                            log::error!(
+                                "failed to close unstarted layout pane {terminal_id}: {err:#}"
+                            );
+                        }
+                        self.bus
+                            .senders
+                            .send_to_screen(ScreenInstruction::ClosePane(
+                                PaneId::Terminal(terminal_id),
+                                None,
+                                None,
+                                Some(2),
+                            ))
+                            .with_context(err_context)
+                            .non_fatal();
+                    },
+                },
+            }
+        }
+    }
+
     pub fn spawn_terminals_for_layout(
         &mut self,
         cwd: Option<PathBuf>,
@@ -1339,7 +1499,7 @@ impl Pty {
         block_on_first_terminal: bool,
         should_change_focus_to_new_tab: bool,
         client_id_and_is_web_client: (ClientId, bool),
-        completion_tx: Option<NotificationEnd>,
+        mut completion_tx: Option<NotificationEnd>,
     ) -> Result<()> {
         let err_context = || format!("failed to spawn terminals for layout for");
 
@@ -1394,68 +1554,37 @@ impl Pty {
 
         let mut originating_plugins_to_inform = vec![];
 
-        for run_instruction in extracted_run_instructions {
-            let originating_plugin = run_instruction.as_ref().and_then(|r| {
-                if let Run::Command(run_command) = r {
-                    run_command.originating_plugin.clone()
-                } else {
-                    None
-                }
-            });
-            let mut terminal_id = None;
-            if let Some(new_pane_data) =
-                self.apply_run_instruction(run_instruction, default_shell.clone())?
-            {
-                terminal_id = Some(new_pane_data.0);
-                new_pane_pids.push(new_pane_data);
-            }
-            if let (Some(originating_plugin), Some(terminal_id)) = (originating_plugin, terminal_id)
-            {
-                originating_plugins_to_inform.push((terminal_id, originating_plugin));
-            }
+        if let Err(err) = self.stage_layout_terminals(
+            extracted_run_instructions,
+            &default_shell,
+            &mut new_pane_pids,
+            &mut originating_plugins_to_inform,
+        ) {
+            self.fail_uncommitted_layout(
+                tab_index,
+                &err,
+                &mut completion_tx,
+                new_pane_pids.iter().map(|terminal| terminal.0),
+            );
+            return Err(err).with_context(err_context);
         }
-        for run_instruction in extracted_floating_run_instructions {
-            let originating_plugin = run_instruction.as_ref().and_then(|r| {
-                if let Run::Command(run_command) = r {
-                    run_command.originating_plugin.clone()
-                } else {
-                    None
-                }
-            });
-            let mut terminal_id = None;
-            if let Some(new_pane_data) =
-                self.apply_run_instruction(run_instruction, default_shell.clone())?
-            {
-                terminal_id = Some(new_pane_data.0);
-                new_floating_panes_pids.push(new_pane_data);
-            }
-            if let (Some(originating_plugin), Some(terminal_id)) = (originating_plugin, terminal_id)
-            {
-                originating_plugins_to_inform.push((terminal_id, originating_plugin));
-            }
+        if let Err(err) = self.stage_layout_terminals(
+            extracted_floating_run_instructions,
+            &default_shell,
+            &mut new_floating_panes_pids,
+            &mut originating_plugins_to_inform,
+        ) {
+            let terminal_ids = new_pane_pids
+                .iter()
+                .chain(new_floating_panes_pids.iter())
+                .map(|terminal| terminal.0);
+            self.fail_uncommitted_layout(tab_index, &err, &mut completion_tx, terminal_ids);
+            return Err(err).with_context(err_context);
         }
 
         // Option<RunCommand> should only be Some if the pane starts held
-        let new_tab_pane_ids: Vec<(u32, Option<RunCommand>)> = new_pane_pids
-            .iter()
-            .map(|(terminal_id, starts_held, run_command, _)| {
-                if *starts_held {
-                    (*terminal_id, run_command.clone())
-                } else {
-                    (*terminal_id, None)
-                }
-            })
-            .collect();
-        let new_tab_floating_pane_ids: Vec<(u32, Option<RunCommand>)> = new_floating_panes_pids
-            .iter()
-            .map(|(terminal_id, starts_held, run_command, _)| {
-                if *starts_held {
-                    (*terminal_id, run_command.clone())
-                } else {
-                    (*terminal_id, None)
-                }
-            })
-            .collect();
+        let new_tab_pane_ids = hold_commands_for_screen(&new_pane_pids);
+        let new_tab_floating_pane_ids = hold_commands_for_screen(&new_floating_panes_pids);
 
         // Track the first terminal_id if blocking is requested
         let first_initial_pane_terminal_id = if block_on_first_terminal && !new_pane_pids.is_empty()
@@ -1478,13 +1607,14 @@ impl Pty {
             new_tab_pane_ids.len(),
             new_tab_floating_pane_ids.len()
         );
-        self.bus
+        if let Err(err) = self
+            .bus
             .senders
             .send_to_screen(ScreenInstruction::ApplyLayout(
                 layout,
                 floating_panes_layout,
-                new_tab_pane_ids.clone(),
-                new_tab_floating_pane_ids.clone(),
+                new_tab_pane_ids,
+                new_tab_floating_pane_ids,
                 plugin_ids,
                 tab_index,
                 should_change_focus_to_new_tab,
@@ -1492,62 +1622,17 @@ impl Pty {
                 direct_completion_tx,
                 blocking_terminal,
             ))
-            .with_context(err_context)?;
-        let mut terminals_to_start = vec![];
-
-        terminals_to_start.append(&mut new_pane_pids);
-        terminals_to_start.append(&mut new_floating_panes_pids);
-        for (terminal_id, starts_held, run_command, reader_result) in terminals_to_start {
-            if starts_held {
-                // we do not run a command or start listening for bytes on held panes
-                continue;
-            }
-            match reader_result {
-                Ok(reader) => {
-                    let activity_flag =
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let terminal_bytes = async_runtime().spawn({
-                        let senders = self.bus.senders.clone();
-                        let debug_to_file = self.debug_to_file;
-                        let activity_flag = activity_flag.clone();
-                        async move {
-                            TerminalBytes::new(
-                                terminal_id,
-                                reader,
-                                senders,
-                                debug_to_file,
-                                activity_flag,
-                            )
-                            .listen()
-                            .await
-                            .context("failed to spawn terminals for layout")
-                            .fatal();
-                        }
-                    });
-                    self.task_handles.insert(terminal_id, terminal_bytes);
-                    self.pane_activity_flags.insert(terminal_id, activity_flag);
-                },
-                _ => match run_command {
-                    Some(run_command) => {
-                        if run_command.hold_on_close {
-                            send_command_not_found_to_screen(
-                                self.bus.senders.clone(),
-                                terminal_id,
-                                run_command.clone(),
-                            )
-                            .with_context(err_context)?;
-                        } else {
-                            self.close_pane(PaneId::Terminal(terminal_id))
-                                .with_context(err_context)?;
-                        }
-                    },
-                    None => {
-                        self.close_pane(PaneId::Terminal(terminal_id))
-                            .with_context(err_context)?;
-                    },
-                },
-            }
+        {
+            let terminal_ids = new_pane_pids
+                .iter()
+                .chain(new_floating_panes_pids.iter())
+                .map(|terminal| terminal.0);
+            // The completion moved into ApplyLayout and was dropped with the failed send.
+            self.fail_uncommitted_layout(tab_index, &err, &mut None, terminal_ids);
+            return Err(err).with_context(err_context);
         }
+        self.start_committed_layout_terminals(new_pane_pids);
+        self.start_committed_layout_terminals(new_floating_panes_pids);
         for (terminal_id, originating_plugin) in originating_plugins_to_inform {
             self.inform_originating_plugin_of_open(terminal_id, originating_plugin);
         }
@@ -1596,68 +1681,34 @@ impl Pty {
 
         let mut originating_plugins_to_inform = vec![];
 
-        for run_instruction in extracted_run_instructions {
-            let originating_plugin = run_instruction.as_ref().and_then(|r| {
-                if let Run::Command(run_command) = r {
-                    run_command.originating_plugin.clone()
-                } else {
-                    None
-                }
-            });
-            let mut terminal_id = None;
-            if let Some(new_pane_data) =
-                self.apply_run_instruction(run_instruction, default_shell.clone())?
-            {
-                terminal_id = Some(new_pane_data.0);
-                new_pane_pids.push(new_pane_data);
-            }
-            if let (Some(originating_plugin), Some(terminal_id)) = (originating_plugin, terminal_id)
-            {
-                originating_plugins_to_inform.push((terminal_id, originating_plugin));
-            }
+        if let Err(err) = self.stage_layout_terminals(
+            extracted_run_instructions,
+            &default_shell,
+            &mut new_pane_pids,
+            &mut originating_plugins_to_inform,
+        ) {
+            self.rollback_unapplied_layout_terminals(
+                new_pane_pids.iter().map(|terminal| terminal.0),
+            );
+            return Err(err).with_context(err_context);
         }
-        for run_instruction in extracted_floating_run_instructions {
-            let originating_plugin = run_instruction.as_ref().and_then(|r| {
-                if let Run::Command(run_command) = r {
-                    run_command.originating_plugin.clone()
-                } else {
-                    None
-                }
-            });
-            let mut terminal_id = None;
-            if let Some(new_pane_data) =
-                self.apply_run_instruction(run_instruction, default_shell.clone())?
-            {
-                terminal_id = Some(new_pane_data.0);
-                new_floating_panes_pids.push(new_pane_data);
-            }
-            if let (Some(originating_plugin), Some(terminal_id)) = (originating_plugin, terminal_id)
-            {
-                originating_plugins_to_inform.push((terminal_id, originating_plugin));
-            }
+        if let Err(err) = self.stage_layout_terminals(
+            extracted_floating_run_instructions,
+            &default_shell,
+            &mut new_floating_panes_pids,
+            &mut originating_plugins_to_inform,
+        ) {
+            let terminal_ids = new_pane_pids
+                .iter()
+                .chain(new_floating_panes_pids.iter())
+                .map(|terminal| terminal.0);
+            self.rollback_unapplied_layout_terminals(terminal_ids);
+            return Err(err).with_context(err_context);
         }
 
         // Option<RunCommand> should only be Some if the pane starts held
-        let new_tab_pane_ids: Vec<(u32, Option<RunCommand>)> = new_pane_pids
-            .iter()
-            .map(|(terminal_id, starts_held, run_command, _)| {
-                if *starts_held {
-                    (*terminal_id, run_command.clone())
-                } else {
-                    (*terminal_id, None)
-                }
-            })
-            .collect();
-        let new_tab_floating_pane_ids: Vec<(u32, Option<RunCommand>)> = new_floating_panes_pids
-            .iter()
-            .map(|(terminal_id, starts_held, run_command, _)| {
-                if *starts_held {
-                    (*terminal_id, run_command.clone())
-                } else {
-                    (*terminal_id, None)
-                }
-            })
-            .collect();
+        let new_tab_pane_ids = hold_commands_for_screen(&new_pane_pids);
+        let new_tab_floating_pane_ids = hold_commands_for_screen(&new_floating_panes_pids);
 
         let tab_result = TabOverrideResult {
             tab_index,
@@ -1671,61 +1722,8 @@ impl Pty {
             plugin_ids,
         };
 
-        let mut terminals_to_start = vec![];
-
-        terminals_to_start.append(&mut new_pane_pids);
-        terminals_to_start.append(&mut new_floating_panes_pids);
-        for (terminal_id, starts_held, run_command, reader_result) in terminals_to_start {
-            if starts_held {
-                // we do not run a command or start listening for bytes on held panes
-                continue;
-            }
-            match reader_result {
-                Ok(reader) => {
-                    let activity_flag =
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let terminal_bytes = async_runtime().spawn({
-                        let senders = self.bus.senders.clone();
-                        let debug_to_file = self.debug_to_file;
-                        let activity_flag = activity_flag.clone();
-                        async move {
-                            TerminalBytes::new(
-                                terminal_id,
-                                reader,
-                                senders,
-                                debug_to_file,
-                                activity_flag,
-                            )
-                            .listen()
-                            .await
-                            .context("failed to spawn terminals for layout")
-                            .fatal();
-                        }
-                    });
-                    self.task_handles.insert(terminal_id, terminal_bytes);
-                    self.pane_activity_flags.insert(terminal_id, activity_flag);
-                },
-                _ => match run_command {
-                    Some(run_command) => {
-                        if run_command.hold_on_close {
-                            send_command_not_found_to_screen(
-                                self.bus.senders.clone(),
-                                terminal_id,
-                                run_command.clone(),
-                            )
-                            .with_context(err_context)?;
-                        } else {
-                            self.close_pane(PaneId::Terminal(terminal_id))
-                                .with_context(err_context)?;
-                        }
-                    },
-                    None => {
-                        self.close_pane(PaneId::Terminal(terminal_id))
-                            .with_context(err_context)?;
-                    },
-                },
-            }
-        }
+        self.start_committed_layout_terminals(new_pane_pids);
+        self.start_committed_layout_terminals(new_floating_panes_pids);
         for (terminal_id, originating_plugin) in originating_plugins_to_inform {
             self.inform_originating_plugin_of_open(terminal_id, originating_plugin);
         }
@@ -1870,13 +1868,14 @@ impl Pty {
                                 Ok(reader),
                             )))
                         },
-                        Err(err) => {
-                            match err.downcast_ref::<ZellijError>() {
-                                Some(ZellijError::CommandNotFound { terminal_id, .. }) => Ok(Some(
-                                    (*terminal_id, starts_held, Some(command.clone()), Err(err)),
-                                )),
-                                _ => Err(err),
-                            }
+                        Err(err) => match command_not_found_id(&err) {
+                            Some(terminal_id) => Ok(Some((
+                                terminal_id,
+                                starts_held,
+                                Some(command.clone()),
+                                Err(err),
+                            ))),
+                            None => Err(err),
                         },
                     }
                 }
@@ -1905,11 +1904,9 @@ impl Pty {
                         }
                         Ok(Some((terminal_id, starts_held, None, Ok(reader))))
                     },
-                    Err(err) => match err.downcast_ref::<ZellijError>() {
-                        Some(ZellijError::CommandNotFound { terminal_id, .. }) => {
-                            Ok(Some((*terminal_id, starts_held, None, Err(err))))
-                        },
-                        _ => Err(err),
+                    Err(err) => match command_not_found_id(&err) {
+                        Some(terminal_id) => Ok(Some((terminal_id, starts_held, None, Err(err)))),
+                        None => Err(err),
                     },
                 }
             },
@@ -1940,11 +1937,9 @@ impl Pty {
                         }
                         Ok(Some((terminal_id, starts_held, None, Ok(reader))))
                     },
-                    Err(err) => match err.downcast_ref::<ZellijError>() {
-                        Some(ZellijError::CommandNotFound { terminal_id, .. }) => {
-                            Ok(Some((*terminal_id, starts_held, None, Err(err))))
-                        },
-                        _ => Err(err),
+                    Err(err) => match command_not_found_id(&err) {
+                        Some(terminal_id) => Ok(Some((terminal_id, starts_held, None, Err(err)))),
+                        None => Err(err),
                     },
                 }
             },
@@ -1971,11 +1966,9 @@ impl Pty {
                         }
                         Ok(Some((terminal_id, starts_held, None, Ok(reader))))
                     },
-                    Err(err) => match err.downcast_ref::<ZellijError>() {
-                        Some(ZellijError::CommandNotFound { terminal_id, .. }) => {
-                            Ok(Some((*terminal_id, starts_held, None, Err(err))))
-                        },
-                        _ => Err(err),
+                    Err(err) => match command_not_found_id(&err) {
+                        Some(terminal_id) => Ok(Some((terminal_id, starts_held, None, Err(err)))),
+                        None => Err(err),
                     },
                 }
             },
@@ -1987,6 +1980,11 @@ impl Pty {
         let err_context = || format!("failed to close for pane {id:?}");
         match id {
             PaneId::Terminal(id) => {
+                let _ = self
+                    .bus
+                    .senders
+                    .send_to_pty_writer(PtyWriteInstruction::DropTerminal(id));
+                crate::screen::release_uninstalled_terminal(id);
                 if let Some(handle) = self.task_handles.remove(&id) {
                     handle.abort();
                 }

@@ -1,23 +1,36 @@
 use super::*;
 use crate::os_input_output::ServerOsApi;
 use crate::plugins::PluginInstruction;
+use crate::pty_writer::PtyWriteInstruction;
+use crate::screen::ScreenInstruction;
 use crate::thread_bus::Bus;
 use interprocess::local_socket::Stream as LocalSocketStream;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use zellij_utils::channels::{self, SenderWithContext};
 use zellij_utils::data::{Event, Palette};
-use zellij_utils::errors::ErrorContext;
+use zellij_utils::errors::{ErrorContext, ZellijError};
 use zellij_utils::input::command::RunCommand;
+use zellij_utils::input::layout::{Layout, Run, SplitDirection, TiledPaneLayout};
 use zellij_utils::ipc::{ClientToServerMsg, IpcReceiverWithContext, ServerToClientMsg};
+
+#[derive(Clone)]
+enum PlannedSpawn {
+    Success { terminal_id: u32, child_pid: u32 },
+    Error(String),
+    CommandNotFound { terminal_id: u32, command: String },
+}
 
 #[derive(Clone)]
 struct MockOsApi {
     cwds: Arc<Mutex<HashMap<u32, PathBuf>>>,
     cmds: Arc<Mutex<HashMap<u32, Vec<String>>>>,
     cmds_by_ppid: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    plans: Arc<Mutex<VecDeque<PlannedSpawn>>>,
+    killed: Arc<Mutex<Vec<u32>>>,
+    cleared: Arc<Mutex<Vec<u32>>>,
 }
 
 impl MockOsApi {
@@ -26,7 +39,26 @@ impl MockOsApi {
             cwds: Arc::new(Mutex::new(HashMap::new())),
             cmds: Arc::new(Mutex::new(HashMap::new())),
             cmds_by_ppid: Arc::new(Mutex::new(HashMap::new())),
+            plans: Arc::new(Mutex::new(VecDeque::new())),
+            killed: Arc::new(Mutex::new(Vec::new())),
+            cleared: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+    fn plan(&self, spawn: PlannedSpawn) {
+        self.plans.lock().unwrap().push_back(spawn);
+    }
+    fn killed_pids(&self) -> Vec<u32> {
+        self.killed.lock().unwrap().clone()
+    }
+    fn cleared_ids(&self) -> Vec<u32> {
+        self.cleared.lock().unwrap().clone()
+    }
+    fn next_plan(&self) -> anyhow::Result<PlannedSpawn> {
+        self.plans
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("no planned spawn"))
     }
     fn set_cwd(&self, pid: u32, path: PathBuf) {
         self.cwds.lock().unwrap().insert(pid, path);
@@ -63,7 +95,43 @@ impl ServerOsApi for MockOsApi {
         _: Option<PathBuf>,
         _pane_env: &crate::os_input_output::PaneEnv,
     ) -> anyhow::Result<(u32, Box<dyn AsyncReader>, Option<u32>)> {
-        unimplemented!()
+        match self.next_plan()? {
+            PlannedSpawn::Success {
+                terminal_id,
+                child_pid,
+            } => {
+                if !crate::screen::try_admit_uninstalled_terminal(terminal_id) {
+                    return Err(anyhow::anyhow!("too many panes are still opening"));
+                }
+                Ok((terminal_id, Box::new(NullAsyncReader), Some(child_pid)))
+            },
+            PlannedSpawn::Error(message) => Err(anyhow::anyhow!(message)),
+            PlannedSpawn::CommandNotFound {
+                terminal_id,
+                command,
+            } => {
+                if !crate::screen::try_admit_uninstalled_terminal(terminal_id) {
+                    return Err(anyhow::anyhow!("too many panes are still opening"));
+                }
+                Err(anyhow::Error::from(ZellijError::CommandNotFound {
+                    terminal_id,
+                    command,
+                }))
+                .context("command was not found")
+            },
+        }
+    }
+    fn reserve_terminal_id(&self) -> anyhow::Result<u32> {
+        match self.next_plan()? {
+            PlannedSpawn::Success { terminal_id, .. }
+            | PlannedSpawn::CommandNotFound { terminal_id, .. } => {
+                if !crate::screen::try_admit_uninstalled_terminal(terminal_id) {
+                    return Err(anyhow::anyhow!("too many panes are still opening"));
+                }
+                Ok(terminal_id)
+            },
+            PlannedSpawn::Error(message) => Err(anyhow::anyhow!(message)),
+        }
     }
     fn write_to_tty_stdin(&self, _: u32, buf: &[u8]) -> anyhow::Result<usize> {
         Ok(buf.len())
@@ -71,7 +139,8 @@ impl ServerOsApi for MockOsApi {
     fn tcdrain(&self, _: u32) -> anyhow::Result<()> {
         Ok(())
     }
-    fn kill(&self, _: u32) -> anyhow::Result<()> {
+    fn kill(&self, pid: u32) -> anyhow::Result<()> {
+        self.killed.lock().unwrap().push(pid);
         Ok(())
     }
     fn force_kill(&self, _: u32) -> anyhow::Result<()> {
@@ -152,7 +221,8 @@ impl ServerOsApi for MockOsApi {
     ) -> anyhow::Result<(Box<dyn AsyncReader>, Option<u32>)> {
         unimplemented!()
     }
-    fn clear_terminal_id(&self, _: u32) -> anyhow::Result<()> {
+    fn clear_terminal_id(&self, terminal_id: u32) -> anyhow::Result<()> {
+        self.cleared.lock().unwrap().push(terminal_id);
         Ok(())
     }
 }
@@ -646,4 +716,339 @@ fn resurrect_command_for_unknown_terminal_is_rejected() {
 
     assert!(result.is_err());
     assert!(pty.resurrect_commands.is_empty());
+}
+
+fn command_layout(commands: Vec<RunCommand>) -> TiledPaneLayout {
+    let mut layout = TiledPaneLayout::default();
+    layout.children_split_direction = SplitDirection::Vertical;
+    layout.children = commands
+        .into_iter()
+        .map(|command| {
+            let mut child = TiledPaneLayout::default();
+            child.run = Some(Run::Command(command));
+            child
+        })
+        .collect();
+    layout
+}
+
+fn bare_layout() -> Layout {
+    Layout {
+        tabs: vec![],
+        focused_tab_index: None,
+        template: Some((TiledPaneLayout::default(), vec![])),
+        swap_layouts: vec![],
+        swap_tiled_layouts: vec![],
+        swap_floating_layouts: vec![],
+        session_attention_muted: false,
+    }
+}
+
+fn drain<T>(receiver: &channels::Receiver<(T, ErrorContext)>) -> Vec<T> {
+    let mut events = Vec::new();
+    while let Ok((event, _)) = receiver.try_recv() {
+        events.push(event);
+    }
+    events
+}
+
+struct LayoutEnds {
+    screen_rx: channels::Receiver<(ScreenInstruction, ErrorContext)>,
+    writer_rx: channels::Receiver<(PtyWriteInstruction, ErrorContext)>,
+}
+
+fn pty_for_layout(mock: MockOsApi, connected_screen: bool) -> (Pty, LayoutEnds) {
+    let (screen_tx, screen_rx) = channels::unbounded();
+    let screen_sender = SenderWithContext::new(screen_tx);
+    let (writer_tx, writer_rx) = channels::unbounded();
+    let writer_sender = SenderWithContext::new(writer_tx);
+    let screen_rx = if connected_screen {
+        screen_rx
+    } else {
+        drop(screen_rx);
+        channels::unbounded().1
+    };
+    let bus = Bus::new(
+        vec![],
+        Some(&screen_sender),
+        None,
+        None,
+        None,
+        Some(&writer_sender),
+        None,
+        Some(Box::new(mock)),
+    );
+    let pty = Pty::new(bus, false, None, None, Default::default());
+    (
+        pty,
+        LayoutEnds {
+            screen_rx,
+            writer_rx,
+        },
+    )
+}
+
+fn spawn_two_commands(pty: &mut Pty, commands: Vec<RunCommand>, tab_index: usize) -> Result<()> {
+    pty.spawn_terminals_for_layout(
+        None,
+        command_layout(commands),
+        vec![],
+        None,
+        HashMap::new(),
+        None,
+        tab_index,
+        false,
+        false,
+        (1, false),
+        None,
+    )
+}
+
+#[test]
+fn a_mid_layout_spawn_failure_rolls_everything_back_without_stopping_the_pty_thread() {
+    let _admission = crate::screen::lock_admission_for_test();
+    crate::screen::clear_admitted_uninstalled_terminals();
+    let mock = MockOsApi::new();
+    mock.plan(PlannedSpawn::Success {
+        terminal_id: 7,
+        child_pid: 4242,
+    });
+    mock.plan(PlannedSpawn::Error(
+        "simulated layout spawn failure".to_owned(),
+    ));
+
+    let (screen_tx, screen_rx) = channels::unbounded();
+    let screen_sender = SenderWithContext::new(screen_tx);
+    let (writer_tx, writer_rx) = channels::unbounded();
+    let writer_sender = SenderWithContext::new(writer_tx);
+    let (pty_tx, pty_rx) = channels::unbounded();
+    let pty_sender = SenderWithContext::new(pty_tx);
+    let bus = Bus::new(
+        vec![pty_rx],
+        Some(&screen_sender),
+        Some(&pty_sender),
+        None,
+        None,
+        Some(&writer_sender),
+        None,
+        Some(Box::new(mock.clone())),
+    );
+    let pty = Pty::new(bus, false, None, None, Default::default());
+    let thread =
+        std::thread::spawn(move || pty_thread_main(pty, Box::new(bare_layout()), "r04".to_owned()));
+
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    pty_sender
+        .send(PtyInstruction::NewTab(
+            None,
+            None,
+            Some(command_layout(vec![
+                RunCommand::new(PathBuf::from("echo")),
+                RunCommand::new(PathBuf::from("echo")),
+            ])),
+            vec![],
+            3,
+            HashMap::new(),
+            None,
+            false,
+            false,
+            (1, false),
+            Some(crate::route::NotificationEnd::new(completion_tx)),
+        ))
+        .unwrap();
+
+    let result = completion_rx.blocking_recv().unwrap();
+    let message = result.error_message.clone().unwrap_or_default();
+    assert!(
+        message.contains("simulated layout spawn failure"),
+        "completion was {result:?}"
+    );
+    assert_eq!(result.exit_status, Some(1));
+    assert_eq!(mock.killed_pids(), vec![4242]);
+    assert_eq!(mock.cleared_ids(), vec![7]);
+    let screen = drain(&screen_rx);
+    assert!(screen
+        .iter()
+        .any(|event| matches!(event, ScreenInstruction::LayoutSpawnFailed(3))));
+    assert!(!screen
+        .iter()
+        .any(|event| matches!(event, ScreenInstruction::ApplyLayout(..))));
+    let writer = drain(&writer_rx);
+    assert!(writer
+        .iter()
+        .any(|event| matches!(event, PtyWriteInstruction::DropTerminal(7))));
+
+    pty_sender.send(PtyInstruction::Exit).unwrap();
+    thread.join().unwrap().unwrap();
+    crate::screen::clear_admitted_uninstalled_terminals();
+}
+
+#[test]
+fn an_admission_refusal_rolls_the_partial_layout_back() {
+    let _admission = crate::screen::lock_admission_for_test();
+    crate::screen::clear_admitted_uninstalled_terminals();
+    for terminal_id in 1_000_000..1_000_000 + crate::screen::MAX_UNINSTALLED_TERMINALS - 1 {
+        assert!(crate::screen::try_admit_uninstalled_terminal(
+            terminal_id as u32
+        ));
+    }
+    let mock = MockOsApi::new();
+    mock.plan(PlannedSpawn::Success {
+        terminal_id: 7,
+        child_pid: 11,
+    });
+    mock.plan(PlannedSpawn::Success {
+        terminal_id: 8,
+        child_pid: 12,
+    });
+    let (mut pty, ends) = pty_for_layout(mock.clone(), true);
+    let err = spawn_two_commands(
+        &mut pty,
+        vec![
+            RunCommand::new(PathBuf::from("echo")),
+            RunCommand::new(PathBuf::from("echo")),
+        ],
+        4,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("too many panes are still opening"),
+        "{err:#}"
+    );
+    assert_eq!(mock.killed_pids(), vec![11]);
+    assert_eq!(mock.cleared_ids(), vec![7]);
+    let screen = drain(&ends.screen_rx);
+    assert!(screen
+        .iter()
+        .any(|event| matches!(event, ScreenInstruction::LayoutSpawnFailed(4))));
+    assert!(!screen
+        .iter()
+        .any(|event| matches!(event, ScreenInstruction::ApplyLayout(..))));
+    crate::screen::clear_admitted_uninstalled_terminals();
+}
+
+#[test]
+fn a_failed_layout_publication_rolls_staged_panes_back() {
+    let _admission = crate::screen::lock_admission_for_test();
+    crate::screen::clear_admitted_uninstalled_terminals();
+    let mock = MockOsApi::new();
+    mock.plan(PlannedSpawn::Success {
+        terminal_id: 7,
+        child_pid: 4242,
+    });
+    mock.plan(PlannedSpawn::Success {
+        terminal_id: 8,
+        child_pid: 4243,
+    });
+    let (mut pty, _ends) = pty_for_layout(mock.clone(), false);
+    let err = spawn_two_commands(
+        &mut pty,
+        vec![
+            RunCommand::new(PathBuf::from("echo")),
+            RunCommand::new(PathBuf::from("echo")),
+        ],
+        5,
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("failed to send"), "{err:#}");
+    assert_eq!(mock.killed_pids(), vec![4242, 4243]);
+    assert_eq!(mock.cleared_ids(), vec![7, 8]);
+    crate::screen::clear_admitted_uninstalled_terminals();
+}
+
+#[test]
+fn a_successful_layout_publishes_every_staged_pane() {
+    let _admission = crate::screen::lock_admission_for_test();
+    crate::screen::clear_admitted_uninstalled_terminals();
+    let mock = MockOsApi::new();
+    mock.plan(PlannedSpawn::Success {
+        terminal_id: 7,
+        child_pid: 100,
+    });
+    mock.plan(PlannedSpawn::Success {
+        terminal_id: 8,
+        child_pid: 101,
+    });
+    let (mut pty, ends) = pty_for_layout(mock.clone(), true);
+    // Committed readers hit EOF at once. Swallow the follow-up screen send so
+    // dropping the receiver at the end of this test does not abort the process.
+    pty.bus.senders.should_silently_fail = true;
+    spawn_two_commands(
+        &mut pty,
+        vec![
+            RunCommand::new(PathBuf::from("echo")),
+            RunCommand::new(PathBuf::from("echo")),
+        ],
+        6,
+    )
+    .unwrap();
+    assert!(mock.killed_pids().is_empty());
+    assert!(mock.cleared_ids().is_empty());
+    let screen = drain(&ends.screen_rx);
+    let published = screen.iter().any(|event| {
+        matches!(
+            event,
+            ScreenInstruction::ApplyLayout(_, _, panes, floating, _, 6, _, _, _, _)
+                if panes.iter().map(|(id, _)| *id).collect::<Vec<_>>() == vec![7, 8]
+                    && floating.is_empty()
+        )
+    });
+    assert!(published, "screen events did not publish both panes");
+    assert!(!screen
+        .iter()
+        .any(|event| matches!(event, ScreenInstruction::LayoutSpawnFailed(_))));
+    crate::screen::clear_admitted_uninstalled_terminals();
+}
+
+#[test]
+fn command_not_found_layout_panes_stay_in_the_committed_layout() {
+    let _admission = crate::screen::lock_admission_for_test();
+    crate::screen::clear_admitted_uninstalled_terminals();
+    let mock = MockOsApi::new();
+    mock.plan(PlannedSpawn::CommandNotFound {
+        terminal_id: 7,
+        command: "missing-held".to_owned(),
+    });
+    mock.plan(PlannedSpawn::CommandNotFound {
+        terminal_id: 8,
+        command: "missing-close".to_owned(),
+    });
+    let mut held = RunCommand::new(PathBuf::from("missing-held"));
+    held.hold_on_close = true;
+    let closing = RunCommand::new(PathBuf::from("missing-close"));
+    let (mut pty, ends) = pty_for_layout(mock.clone(), true);
+    spawn_two_commands(&mut pty, vec![held, closing], 9).unwrap();
+
+    assert!(mock.killed_pids().is_empty());
+    assert_eq!(mock.cleared_ids(), vec![8]);
+    let screen = drain(&ends.screen_rx);
+    assert!(screen.iter().any(|event| {
+        matches!(
+            event,
+            ScreenInstruction::ApplyLayout(_, _, panes, _, _, 9, _, _, _, _)
+                if panes.iter().map(|(id, _)| *id).collect::<Vec<_>>() == vec![7, 8]
+        )
+    }));
+    assert!(screen
+        .iter()
+        .any(|event| matches!(event, ScreenInstruction::PtyBytes(7, _))));
+    assert!(screen.iter().any(|event| matches!(
+        event,
+        ScreenInstruction::HoldPane(PaneId::Terminal(7), Some(2), _)
+    )));
+    assert!(screen.iter().any(|event| matches!(
+        event,
+        ScreenInstruction::ClosePane(PaneId::Terminal(8), None, None, Some(2))
+    )));
+    assert!(!screen
+        .iter()
+        .any(|event| matches!(event, ScreenInstruction::LayoutSpawnFailed(_))));
+    let writer = drain(&ends.writer_rx);
+    assert!(writer
+        .iter()
+        .any(|event| matches!(event, PtyWriteInstruction::DropTerminal(8))));
+    assert!(!writer
+        .iter()
+        .any(|event| matches!(event, PtyWriteInstruction::DropTerminal(7))));
+    crate::screen::clear_admitted_uninstalled_terminals();
 }

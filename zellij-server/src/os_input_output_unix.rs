@@ -213,10 +213,8 @@ fn handle_openpty(
         )
     };
 
-    // primary side of pty and child fd
-    let pid_primary = open_pty_res.master.into_raw_fd();
-    let pid_secondary = open_pty_res.slave.into_raw_fd();
-
+    // Reject a missing command before the PTY fds are detached from `OpenptyResult`.
+    // Dropping that result closes both sides. `into_raw_fd` would leak them.
     if !command_exists(&cmd, pane_env) {
         return Err(ZellijError::CommandNotFound {
             terminal_id,
@@ -224,6 +222,10 @@ fn handle_openpty(
         })
         .with_context(|| err_context(&cmd));
     }
+
+    // primary side of pty and child fd
+    let pid_primary = open_pty_res.master.into_raw_fd();
+    let pid_secondary = open_pty_res.slave.into_raw_fd();
 
     let mut child = unsafe {
         let cmd = cmd.clone();

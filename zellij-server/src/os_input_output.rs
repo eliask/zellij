@@ -445,6 +445,29 @@ pub trait ServerOsApi: Send + Sync {
     fn apply_cached_resizes(&mut self) {}
 }
 
+fn error_is_command_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ZellijError>(),
+            Some(ZellijError::CommandNotFound { .. })
+        )
+    })
+}
+
+impl ServerOsInputOutput {
+    fn reserve_admitted_terminal_id(&self, exhausted: &str) -> Result<u32> {
+        let terminal_id = self
+            .pty_backend
+            .next_terminal_id()
+            .context(exhausted.to_owned())?;
+        if !crate::screen::try_admit_uninstalled_terminal(terminal_id) {
+            anyhow::bail!("too many panes are still opening");
+        }
+        self.pty_backend.reserve_terminal_id(terminal_id);
+        Ok(terminal_id)
+    }
+}
+
 impl ServerOsApi for ServerOsInputOutput {
     fn set_terminal_size_using_terminal_id(
         &self,
@@ -470,29 +493,29 @@ impl ServerOsApi for ServerOsInputOutput {
     ) -> Result<(u32, Box<dyn AsyncReader>, Option<u32>)> {
         let err_context = || "failed to spawn terminal".to_string();
 
-        let terminal_id = self
-            .pty_backend
-            .next_terminal_id()
-            .context("no more terminal IDs left to allocate")?;
-
-        self.pty_backend.reserve_terminal_id(terminal_id);
-
+        let terminal_id =
+            self.reserve_admitted_terminal_id("no more terminal IDs left to allocate")?;
         let (cmd, failover_cmd) = build_command(terminal_action, default_editor, pane_env);
 
-        let (async_reader, child_fd) = self
+        match self
             .pty_backend
             .spawn_terminal(cmd, failover_cmd, quit_cb, terminal_id, pane_env)
-            .with_context(err_context)?;
-
-        Ok((terminal_id, async_reader, Some(child_fd as u32)))
+        {
+            Ok((async_reader, child_fd)) => Ok((terminal_id, async_reader, Some(child_fd as u32))),
+            Err(err) => {
+                // A missing command still owns its id: the layout publishes that pane.
+                // Any other failure never produced a pane, so the id and the admission
+                // slot go back before the error leaves this function.
+                if !error_is_command_not_found(&err) {
+                    self.pty_backend.clear_terminal_id(terminal_id);
+                    crate::screen::release_uninstalled_terminal(terminal_id);
+                }
+                Err(err).with_context(err_context)
+            },
+        }
     }
     fn reserve_terminal_id(&self) -> Result<u32> {
-        let terminal_id = self
-            .pty_backend
-            .next_terminal_id()
-            .context("no more terminal IDs available")?;
-        self.pty_backend.reserve_terminal_id(terminal_id);
-        Ok(terminal_id)
+        self.reserve_admitted_terminal_id("no more terminal IDs available")
     }
     fn write_to_tty_stdin(&self, terminal_id: u32, buf: &[u8]) -> Result<usize> {
         self.pty_backend.write_to_tty_stdin(terminal_id, buf)

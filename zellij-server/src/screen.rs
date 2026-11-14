@@ -34,7 +34,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::str;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::route::NotificationEnd;
@@ -541,6 +541,9 @@ pub enum ScreenInstruction {
         Option<NotificationEnd>,        // regular completion signal
         Option<(u32, NotificationEnd)>, // blocking_terminal (terminal_id, completion_tx)
     ),
+    /// The layout spawn that was supposed to install this tab failed.
+    /// `usize` is the same stable tab id `NewTab` inserted into `pending_tab_ids`.
+    LayoutSpawnFailed(usize),
     SwitchTabNext(ClientId, Option<NotificationEnd>),
     SwitchTabPrev(ClientId, Option<NotificationEnd>),
     ToggleActiveSyncTab(ClientId, Option<NotificationEnd>),
@@ -1369,6 +1372,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::UndoRenamePane(..) => ScreenContext::UndoRenamePane,
             ScreenInstruction::NewTab(..) => ScreenContext::NewTab,
             ScreenInstruction::ApplyLayout(..) => ScreenContext::ApplyLayout,
+            ScreenInstruction::LayoutSpawnFailed(..) => ScreenContext::ApplyLayout,
             ScreenInstruction::SwitchTabNext(..) => ScreenContext::SwitchTabNext,
             ScreenInstruction::SwitchTabPrev(..) => ScreenContext::SwitchTabPrev,
             ScreenInstruction::CloseTab(..) => ScreenContext::CloseTab,
@@ -6647,6 +6651,13 @@ impl Screen {
         self.tabs.insert(tab_id, tab);
         Ok(())
     }
+
+    fn abandon_failed_layout_tab(&mut self, tab_id: usize) {
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            tab.abandon_pending_layout();
+        }
+    }
+
     pub fn apply_layout(
         &mut self,
         layout: TiledPaneLayout,
@@ -6659,6 +6670,12 @@ impl Screen {
         client_id_and_is_web_client: (ClientId, bool),
         blocking_terminal: Option<(u32, NotificationEnd)>,
     ) -> Result<()> {
+        for (terminal_id, _) in new_terminal_ids
+            .iter()
+            .chain(new_floating_terminal_ids.iter())
+        {
+            release_uninstalled_terminal(*terminal_id);
+        }
         if self.tabs.get(&tab_id).is_none() {
             // TODO: we should prevent this situation with a UI - eg. cannot close tabs with a
             // pending state
@@ -9352,6 +9369,9 @@ impl Screen {
         completion: &mut Option<NotificationEnd>,
         pending_events_waiting_for_pane: &mut HashMap<PaneId, Vec<ScreenInstruction>>,
     ) {
+        if let PaneId::Terminal(terminal_id) = pid {
+            release_uninstalled_terminal(terminal_id);
+        }
         if self.has_pane_with_pid(&pid) {
             self.pane_not_created_reasons.remove(&pid);
             for tab in self.tabs.values_mut() {
@@ -10812,6 +10832,79 @@ fn mark_action_as_failed(completion: &mut Option<NotificationEnd>, error_message
     if let Some(completion) = completion.as_mut() {
         completion.set_exit_status(1);
         completion.set_error_message(error_message.to_owned());
+    }
+}
+
+pub(crate) const MAX_UNINSTALLED_TERMINALS: usize = 1024;
+
+fn admitted_uninstalled_terminals() -> &'static Mutex<HashSet<u32>> {
+    static ADMITTED: LazyLock<Mutex<HashSet<u32>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    &ADMITTED
+}
+
+fn with_admitted_terminals<T>(body: impl FnOnce(&mut HashSet<u32>) -> T) -> T {
+    let mut admitted = admitted_uninstalled_terminals()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    body(&mut admitted)
+}
+
+/// Reserve a slot for a terminal id that has not been installed on the screen yet.
+/// An id that is already reserved keeps its slot.
+pub(crate) fn try_admit_uninstalled_terminal(terminal_id: u32) -> bool {
+    with_admitted_terminals(|admitted| {
+        if admitted.contains(&terminal_id) {
+            return true;
+        }
+        if admitted.len() >= MAX_UNINSTALLED_TERMINALS {
+            return false;
+        }
+        admitted.insert(terminal_id);
+        true
+    })
+}
+
+pub(crate) fn release_uninstalled_terminal(terminal_id: u32) {
+    with_admitted_terminals(|admitted| {
+        admitted.remove(&terminal_id);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn clear_admitted_uninstalled_terminals() {
+    with_admitted_terminals(|admitted| admitted.clear());
+}
+
+#[cfg(test)]
+pub(crate) fn lock_admission_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) struct RecoveredPendingTabWaits {
+    pub events: Vec<ScreenInstruction>,
+    pub switches: Vec<(usize, ClientId)>,
+}
+
+/// Drop `tab_index` from the pending-tab set. Waits are returned only once no tab is still pending,
+/// matching the moment `ApplyLayout` replays them.
+pub(crate) fn recover_pending_tab_waits(
+    pending_tab_ids: &mut HashSet<usize>,
+    pending_events_waiting_for_tab: &mut Vec<ScreenInstruction>,
+    pending_tab_switches: &mut HashSet<(usize, ClientId)>,
+    tab_index: usize,
+) -> RecoveredPendingTabWaits {
+    pending_tab_ids.remove(&tab_index);
+    if pending_tab_ids.is_empty() {
+        RecoveredPendingTabWaits {
+            events: pending_events_waiting_for_tab.drain(..).collect(),
+            switches: pending_tab_switches.drain().collect(),
+        }
+    } else {
+        RecoveredPendingTabWaits {
+            events: Vec::new(),
+            switches: Vec::new(),
+        }
     }
 }
 
@@ -12953,6 +13046,22 @@ pub(crate) fn screen_thread_main(
                     screen.bus.senders.send_to_screen(event).non_fatal();
                 }
 
+                screen.render(None)?;
+            },
+            ScreenInstruction::LayoutSpawnFailed(tab_index) => {
+                screen.abandon_failed_layout_tab(tab_index);
+                let recovered = recover_pending_tab_waits(
+                    &mut pending_tab_ids,
+                    &mut pending_events_waiting_for_tab,
+                    &mut pending_tab_switches,
+                    tab_index,
+                );
+                for event in recovered.events {
+                    screen.bus.senders.send_to_screen(event).non_fatal();
+                }
+                for (tab_index, client_id) in recovered.switches {
+                    screen.go_to_tab(tab_index + 1, client_id)?;
+                }
                 screen.render(None)?;
             },
             ScreenInstruction::GoToTab(

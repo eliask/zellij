@@ -1,5 +1,7 @@
 use super::{
-    screen_thread_main, CopyOptions, Screen, ScreenInstruction, MAX_REMEMBERED_PANES_NEVER_CREATED,
+    clear_admitted_uninstalled_terminals, lock_admission_for_test, recover_pending_tab_waits,
+    screen_thread_main, try_admit_uninstalled_terminal, CopyOptions, Screen, ScreenInstruction,
+    MAX_REMEMBERED_PANES_NEVER_CREATED, MAX_UNINSTALLED_TERMINALS,
 };
 use crate::panes::kitty_graphics::{KittyHostCapability, KittyImageStore};
 use crate::panes::PaneId;
@@ -20408,4 +20410,82 @@ fn a_client_following_row_shifts_ends_up_with_the_same_screen_as_a_full_repaint(
         "a shifted frame must not resend every row"
     );
     assert_eq!(client.screen(), expected.screen());
+}
+
+#[test]
+fn pending_tab_waits_stay_queued_until_the_last_pending_tab_fails() {
+    let mut pending_tab_ids = HashSet::from([1, 2]);
+    let mut events = vec![ScreenInstruction::MoveTabLeft(1, None)];
+    let mut switches = HashSet::from([(4, 1)]);
+
+    let recovered = recover_pending_tab_waits(&mut pending_tab_ids, &mut events, &mut switches, 1);
+    assert_eq!(pending_tab_ids, HashSet::from([2]));
+    assert!(recovered.events.is_empty());
+    assert!(recovered.switches.is_empty());
+    assert_eq!(events.len(), 1);
+    assert_eq!(switches.len(), 1);
+
+    let recovered = recover_pending_tab_waits(&mut pending_tab_ids, &mut events, &mut switches, 2);
+    assert!(pending_tab_ids.is_empty());
+    assert!(events.is_empty());
+    assert!(switches.is_empty());
+    assert!(matches!(
+        recovered.events.as_slice(),
+        [ScreenInstruction::MoveTabLeft(1, None)]
+    ));
+    assert_eq!(recovered.switches, vec![(4, 1)]);
+}
+
+#[test]
+fn a_failed_layout_abandons_the_pending_tab_so_the_next_render_closes_it() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, false, false);
+    screen
+        .new_tab(0, (vec![], vec![]), None, Some(1))
+        .expect("new tab");
+    assert!(screen.tabs.get(&0).unwrap().is_pending());
+    screen.add_client(1, false).expect("add client");
+    screen.abandon_failed_layout_tab(0);
+    assert!(!screen.tabs.get(&0).unwrap().is_pending());
+    screen.render_to_clients().expect("render");
+    assert!(
+        screen.tabs.get(&0).is_none(),
+        "an abandoned empty tab stays on screen"
+    );
+}
+
+#[test]
+fn applying_a_layout_releases_terminals_admitted_before_install() {
+    let _admission = lock_admission_for_test();
+    clear_admitted_uninstalled_terminals();
+    assert!(try_admit_uninstalled_terminal(7));
+    assert!(try_admit_uninstalled_terminal(8));
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, false, false);
+    screen
+        .apply_layout(
+            TiledPaneLayout::default(),
+            vec![],
+            vec![(7, None), (8, None)],
+            vec![],
+            HashMap::new(),
+            99,
+            false,
+            (1, false),
+            None,
+        )
+        .expect("missing tab still returns after releasing ids");
+    for terminal_id in 1_000_000..1_000_000 + MAX_UNINSTALLED_TERMINALS {
+        assert!(
+            try_admit_uninstalled_terminal(terminal_id as u32),
+            "terminal {terminal_id} was refused, so a layout id was still admitted"
+        );
+    }
+    clear_admitted_uninstalled_terminals();
 }

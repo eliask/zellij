@@ -23,6 +23,8 @@ enum WriteBehavior {
     AcceptAtMost(usize),
     /// Accept zero bytes (simulates EAGAIN / full buffer).
     AcceptNone,
+    /// Reject the first write, then accept later ones.
+    AcceptNoneOnce,
     /// Return an error (simulates EBADF, EIO, etc).
     Error,
 }
@@ -106,6 +108,13 @@ impl ServerOsApi for MockServerOsApi {
                 Ok(n)
             },
             WriteBehavior::AcceptNone => Ok(0),
+            WriteBehavior::AcceptNoneOnce => {
+                self.write_behavior
+                    .lock()
+                    .unwrap()
+                    .insert(terminal_id, WriteBehavior::AcceptAll);
+                Ok(0)
+            },
             WriteBehavior::Error => Err(anyhow::anyhow!(
                 "simulated write error for terminal {}",
                 terminal_id
@@ -354,4 +363,24 @@ fn write_error_clears_terminal_queue() {
     // Terminal 2 should be unaffected
     let written_2 = mock_clone.get_written_bytes(2);
     assert_eq!(written_2, b"should work");
+}
+
+#[test]
+fn dropping_a_terminal_discards_bytes_queued_before_it_was_installed() {
+    let mock = MockServerOsApi::new();
+    mock.set_behavior(1, WriteBehavior::AcceptNoneOnce);
+    let mock_clone = mock.clone();
+
+    let (bus, sender) = make_test_bus(mock);
+    run_pty_writer(
+        bus,
+        sender,
+        vec![
+            PtyWriteInstruction::Write(b"stale".to_vec(), 1, None),
+            PtyWriteInstruction::DropTerminal(1),
+            PtyWriteInstruction::Write(b"fresh".to_vec(), 1, None),
+        ],
+    );
+
+    assert_eq!(mock_clone.get_written_bytes(1), b"fresh");
 }

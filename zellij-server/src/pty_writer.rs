@@ -14,6 +14,8 @@ use crate::thread_bus::Bus;
 #[derive(Debug, Clone)]
 pub enum PtyWriteInstruction {
     Write(Vec<u8>, u32, Option<NotificationEnd>),
+    /// Drop bytes queued for a terminal that will not be installed.
+    DropTerminal(u32),
     ResizePty(u32, u16, u16, Option<u16>, Option<u16>),
     StartCachingResizes,
     ApplyCachedResizes,
@@ -24,6 +26,7 @@ impl From<&PtyWriteInstruction> for PtyWriteContext {
     fn from(tty_write_instruction: &PtyWriteInstruction) -> Self {
         match *tty_write_instruction {
             PtyWriteInstruction::Write(..) => PtyWriteContext::Write,
+            PtyWriteInstruction::DropTerminal(..) => PtyWriteContext::Write,
             PtyWriteInstruction::ResizePty(..) => PtyWriteContext::ResizePty,
             PtyWriteInstruction::ApplyCachedResizes => PtyWriteContext::ApplyCachedResizes,
             PtyWriteInstruction::StartCachingResizes => PtyWriteContext::StartCachingResizes,
@@ -101,6 +104,9 @@ pub(crate) fn pty_writer_main(bus: Bus<PtyWriteInstruction>) -> Result<()> {
                             _completion: completion,
                         });
                     }
+                },
+                PtyWriteInstruction::DropTerminal(terminal_id) => {
+                    pending.remove(&terminal_id);
                 },
                 PtyWriteInstruction::ResizePty(
                     terminal_id,
