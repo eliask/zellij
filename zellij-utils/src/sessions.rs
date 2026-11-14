@@ -61,16 +61,22 @@ pub fn register_session(name: &str) -> String {
 }
 
 /// Record a session's new name. Its socket and cache folder keep their id-based names.
-pub fn rename_session(session_id: &str, new_name: &str) {
-    if let Err(e) = SessionIndex::open_default()
+/// A name another session already owns is an error and that session's row is left in place.
+pub fn rename_session(session_id: &str, new_name: &str) -> Result<(), String> {
+    SessionIndex::open_default()
         .and_then(|index| index.rename_by_id(session_id, new_name, now_secs()))
-    {
-        log::error!(
-            "Failed to record the new name of session {:?} in the session index: {}",
-            session_id,
-            e
-        );
-    }
+        .map_err(|e| {
+            format!(
+                "Failed to record the new name of session {:?} in the session index: {}",
+                session_id, e
+            )
+        })
+        .and_then(|outcome| match outcome {
+            session_index::RenameOutcome::Renamed => Ok(()),
+            session_index::RenameOutcome::Conflict => {
+                Err("A session by this name already exists.".to_owned())
+            },
+        })
 }
 
 /// The id of the session with this name, if the session index knows it. Callers fall back to the

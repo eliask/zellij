@@ -20136,6 +20136,40 @@ mod session_rename {
             .collect()
     }
 
+    fn screen_rename_bus(
+        screen: &mut Screen,
+    ) -> (
+        crate::channels::SenderWithContext<ScreenInstruction>,
+        Receiver<(ScreenInstruction, ErrorContext)>,
+    ) {
+        let (sender, receiver) = channels::unbounded();
+        let sender = crate::channels::SenderWithContext::new(sender);
+        screen.bus.senders.to_screen = Some(sender.clone());
+        (sender, receiver)
+    }
+
+    fn apply_discovered_rename(
+        screen: &mut Screen,
+        receiver: &Receiver<(ScreenInstruction, ErrorContext)>,
+    ) {
+        let (instruction, _) = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("session rename discovery");
+        match instruction {
+            ScreenInstruction::CommitSessionRename(commit) => {
+                screen.commit_session_rename(*commit).expect("TEST");
+            },
+            other => panic!("expected session rename commit, got {other:?}"),
+        }
+    }
+
+    fn quiet_discovery() -> super::super::SessionRenameDiscovery {
+        super::super::SessionRenameDiscovery {
+            resurrectable_sessions: std::collections::BTreeMap::new(),
+            running_session_exists: Ok(false),
+        }
+    }
+
     fn start_renaming(h: &mut Harness, client_id: ClientId) {
         h.screen
             .change_mode(InputMode::RenameSession, Some(InputMode::Normal), client_id)
@@ -20185,12 +20219,17 @@ mod session_rename {
         h.screen
             .peer_sessions_cache
             .insert("taken".to_owned(), SessionInfo::new("taken".to_owned()));
+        h.screen.session_rename_discovery = super::super::SessionRenameDiscoveryHook::Override(
+            std::sync::Arc::new(|_current, _new| quiet_discovery()),
+        );
         start_renaming(&mut h, 1);
         type_text(&mut h, 1, "taken");
         assert_eq!(shown_name(&h.screen, 1).as_deref(), Some("taken"));
+        let (_sender, receiver) = screen_rename_bus(&mut h.screen);
         h.screen
             .change_mode(InputMode::Normal, Some(InputMode::Normal), 1)
             .expect("TEST");
+        apply_discovered_rename(&mut h.screen, &receiver);
         assert_eq!(h.screen.session_name, "zellij-test");
         assert_eq!(shown_name(&h.screen, 1).as_deref(), Some("zellij-test"));
         let prompts = prompts(&h);
@@ -20237,6 +20276,482 @@ mod session_rename {
         type_text(&mut h, 1, "stray");
         assert_ne!(shown_name(&h.screen, 1).as_deref(), Some("stray"));
         assert!(h.screen.session_rename_drafts.is_empty());
+    }
+
+    struct DiscoveryGate {
+        entered: Mutex<bool>,
+        entered_cv: std::sync::Condvar,
+        release: Mutex<bool>,
+        release_cv: std::sync::Condvar,
+    }
+
+    impl DiscoveryGate {
+        fn new() -> Self {
+            DiscoveryGate {
+                entered: Mutex::new(false),
+                entered_cv: std::sync::Condvar::new(),
+                release: Mutex::new(false),
+                release_cv: std::sync::Condvar::new(),
+            }
+        }
+
+        fn block(&self) {
+            {
+                let mut entered = self.entered.lock().unwrap();
+                *entered = true;
+                self.entered_cv.notify_all();
+            }
+            let mut release = self.release.lock().unwrap();
+            let started = std::time::Instant::now();
+            while !*release {
+                let remaining = std::time::Duration::from_secs(5).saturating_sub(started.elapsed());
+                assert!(!remaining.is_zero(), "discovery was not released");
+                let (guard, timeout) = self.release_cv.wait_timeout(release, remaining).unwrap();
+                release = guard;
+                if timeout.timed_out() && !*release {
+                    panic!("discovery was not released");
+                }
+            }
+        }
+
+        fn wait_until_entered(&self) {
+            let entered = self.entered.lock().unwrap();
+            let (entered, timeout) = self
+                .entered_cv
+                .wait_timeout_while(entered, std::time::Duration::from_secs(2), |entered| {
+                    !*entered
+                })
+                .unwrap();
+            assert!(*entered && !timeout.timed_out(), "discovery never started");
+        }
+
+        fn is_released(&self) -> bool {
+            *self.release.lock().unwrap()
+        }
+
+        fn release(&self) {
+            let mut release = self.release.lock().unwrap();
+            *release = true;
+            self.release_cv.notify_all();
+        }
+    }
+
+    struct ReleaseDiscovery(std::sync::Arc<DiscoveryGate>);
+
+    impl Drop for ReleaseDiscovery {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    #[test]
+    fn a_busy_rename_discovery_worker_refuses_new_requests_without_blocking_screen() {
+        let mut h = harness();
+        let gate = std::sync::Arc::new(DiscoveryGate::new());
+        let _release = ReleaseDiscovery(std::sync::Arc::clone(&gate));
+        let (_sender, _receiver) = screen_rename_bus(&mut h.screen);
+        let worker_gate = std::sync::Arc::clone(&gate);
+        h.screen.session_rename_discovery = super::super::SessionRenameDiscoveryHook::Override(
+            std::sync::Arc::new(move |_current, _new| {
+                worker_gate.block();
+                quiet_discovery()
+            }),
+        );
+
+        let (first_tx, mut first_rx) = tokio::sync::oneshot::channel();
+        h.screen
+            .begin_session_rename(
+                "one".to_owned(),
+                1,
+                false,
+                Some(crate::route::NotificationEnd::new(first_tx)),
+            )
+            .expect("TEST");
+        gate.wait_until_entered();
+        assert!(
+            matches!(
+                first_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the in-flight rename must not complete before discovery finishes"
+        );
+
+        let (queued_tx, mut queued_rx) = tokio::sync::oneshot::channel();
+        h.screen
+            .begin_session_rename(
+                "two".to_owned(),
+                1,
+                false,
+                Some(crate::route::NotificationEnd::new(queued_tx)),
+            )
+            .expect("TEST");
+        assert!(
+            matches!(
+                queued_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the one queued rename must stay open"
+        );
+
+        let (refused_tx, mut refused_rx) = tokio::sync::oneshot::channel();
+        h.screen
+            .begin_session_rename(
+                "three".to_owned(),
+                1,
+                false,
+                Some(crate::route::NotificationEnd::new(refused_tx)),
+            )
+            .expect("TEST");
+        let refused = refused_rx
+            .try_recv()
+            .expect("a request beyond the worker and its one queued job is refused");
+        assert_eq!(refused.exit_status, Some(1), "{refused:?}");
+        assert!(
+            refused
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("already being checked")),
+            "{refused:?}"
+        );
+        assert_eq!(h.screen.session_name, "zellij-test");
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ScreenSaw {
+        HandlerReturned,
+        CacheUpdated,
+        Committed(String),
+    }
+
+    #[test]
+    fn the_screen_thread_is_not_inside_peer_discovery_while_it_blocks() {
+        let gate = std::sync::Arc::new(DiscoveryGate::new());
+        let _release_on_drop = ReleaseDiscovery(std::sync::Arc::clone(&gate));
+        let discovery_thread_id = std::sync::Arc::new(Mutex::new(None));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let gate_for_worker = std::sync::Arc::clone(&gate);
+        let discovery_thread_id_for_worker = std::sync::Arc::clone(&discovery_thread_id);
+        let worker = std::thread::spawn(move || {
+            let mut h = harness();
+            assert!(
+                matches!(
+                    &h.screen.session_rename_discovery,
+                    super::super::SessionRenameDiscoveryHook::Production
+                ),
+                "production rename must keep the real session scan"
+            );
+            let fake = super::FakeInputOutput::default();
+            let client_messages = fake.server_to_client_messages.clone();
+            h.screen.bus.os_input = Some(Box::new(fake));
+            let (sender, receiver) = screen_rename_bus(&mut h.screen);
+            let gate = gate_for_worker;
+            let discovery_thread_id = discovery_thread_id_for_worker;
+            h.screen.session_rename_discovery = super::super::SessionRenameDiscoveryHook::Override(
+                std::sync::Arc::new(move |_current, _new| {
+                    *discovery_thread_id.lock().unwrap() = Some(std::thread::current().id());
+                    gate.block();
+                    quiet_discovery()
+                }),
+            );
+            let screen_thread_id = std::thread::current().id();
+            ready_tx
+                .send((sender, client_messages, screen_thread_id))
+                .expect("TEST");
+            let mut screen = h.screen;
+            loop {
+                let Ok((instruction, _)) = receiver.recv_timeout(std::time::Duration::from_secs(5))
+                else {
+                    break;
+                };
+                match instruction {
+                    ScreenInstruction::RenameSession(name, client_id, completion) => {
+                        screen
+                            .begin_session_rename(name, client_id, false, completion)
+                            .expect("TEST");
+                        progress_tx.send(ScreenSaw::HandlerReturned).expect("TEST");
+                    },
+                    ScreenInstruction::CommitSessionRename(commit) => {
+                        screen.commit_session_rename(*commit).expect("TEST");
+                        progress_tx
+                            .send(ScreenSaw::Committed(screen.session_name.clone()))
+                            .expect("TEST");
+                        break;
+                    },
+                    ScreenInstruction::UpdateSessionInfos(infos, resurrectable, plugin) => {
+                        screen
+                            .update_session_infos(infos, resurrectable, plugin)
+                            .expect("TEST");
+                        progress_tx.send(ScreenSaw::CacheUpdated).expect("TEST");
+                    },
+                    other => panic!("unexpected screen instruction: {other:?}"),
+                }
+            }
+            (
+                screen.session_name.clone(),
+                screen.peer_sessions_cache.contains_key("offscreen-peer"),
+            )
+        });
+
+        let (sender, client_messages, screen_thread_id) = ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("screen thread");
+        sender
+            .send(ScreenInstruction::RenameSession(
+                "offscreen-peer".to_owned(),
+                1,
+                None,
+            ))
+            .expect("TEST");
+        gate.wait_until_entered();
+        assert_eq!(
+            progress_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("handler returned"),
+            ScreenSaw::HandlerReturned
+        );
+        let discovery_id = discovery_thread_id
+            .lock()
+            .unwrap()
+            .expect("discovery thread id");
+        assert_ne!(
+            discovery_id, screen_thread_id,
+            "peer discovery ran on the screen thread"
+        );
+        assert!(!gate.is_released());
+
+        let mut infos = std::collections::BTreeMap::new();
+        infos.insert(
+            "offscreen-peer".to_owned(),
+            SessionInfo::new("offscreen-peer".to_owned()),
+        );
+        sender
+            .send(ScreenInstruction::UpdateSessionInfos(
+                infos,
+                std::collections::BTreeMap::new(),
+                None,
+            ))
+            .expect("TEST");
+        assert_eq!(
+            progress_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("cache update"),
+            ScreenSaw::CacheUpdated
+        );
+        assert!(!gate.is_released(), "screen work waited for peer discovery");
+
+        gate.release();
+        assert_eq!(
+            progress_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("commit"),
+            ScreenSaw::Committed("zellij-test".to_owned())
+        );
+        let (session_name, peer_was_cached) = worker.join().expect("screen thread");
+        assert_eq!(session_name, "zellij-test");
+        assert!(peer_was_cached);
+        let messages = client_messages.lock().unwrap();
+        let lines = messages.get(&1).expect("rename failure was reported");
+        assert!(
+            lines.iter().any(|message| matches!(
+                message,
+                ServerToClientMsg::LogError { lines }
+                    if lines.iter().any(|line| line.contains("already exists"))
+            )),
+            "commit did not recheck the peer cache: {lines:?}"
+        );
+    }
+
+    struct ForgetSessionName(String);
+
+    impl Drop for ForgetSessionName {
+        fn drop(&mut self) {
+            if let Ok(index) = zellij_utils::session_index::SessionIndex::open_default() {
+                let _ = index.delete(&self.0);
+            }
+        }
+    }
+
+    struct ForgetSocketFile(std::path::PathBuf);
+
+    impl Drop for ForgetSocketFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn refuse_discovered_rename(
+        screen: &mut Screen,
+        name: &str,
+    ) -> crate::route::ActionCompletionResult {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        screen
+            .commit_session_rename(super::super::SessionRenameCommit {
+                name: name.to_owned(),
+                client_id: 1,
+                discovery: quiet_discovery(),
+                popup_on_error: false,
+                completion: Some(crate::route::NotificationEnd::new(sender)),
+            })
+            .expect("TEST");
+        receiver.blocking_recv().expect("rename completion")
+    }
+
+    #[test]
+    fn a_name_taken_after_discovery_is_refused_at_commit() {
+        let mut h = harness();
+        let indexed_name = format!("s03-rename-id-{}", std::process::id());
+        let _forget_indexed = ForgetSessionName(indexed_name.clone());
+        let indexed_id = zellij_utils::sessions::register_session(&indexed_name);
+        let resolved = zellij_utils::sessions::resolve_session_id(&indexed_name);
+        assert_eq!(
+            resolved.as_deref(),
+            Some(indexed_id.as_str()),
+            "registered name is not in the index"
+        );
+        assert_ne!(indexed_id, h.screen.session_id);
+
+        let result = refuse_discovered_rename(&mut h.screen, &indexed_name);
+        assert_eq!(h.screen.session_name, "zellij-test");
+        assert_eq!(result.exit_status, Some(1), "{result:?}");
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("already exists")),
+            "{result:?}"
+        );
+        assert_eq!(
+            zellij_utils::sessions::resolve_session_id(&indexed_name).as_deref(),
+            Some(indexed_id.as_str()),
+            "commit deleted the other session's index row"
+        );
+
+        let socket_name = format!("s03-rename-sock-{}", std::process::id());
+        let _forget_socket_row = ForgetSessionName(socket_name.clone());
+        let socket_path = zellij_utils::consts::ZELLIJ_SOCK_DIR.join(&socket_name);
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent).expect("socket dir");
+        }
+        std::fs::write(&socket_path, b"").expect("socket marker");
+        let _forget_socket = ForgetSocketFile(socket_path);
+        assert_eq!(
+            zellij_utils::sessions::resolve_session_id(&socket_name),
+            None
+        );
+
+        let result = refuse_discovered_rename(&mut h.screen, &socket_name);
+        assert_eq!(h.screen.session_name, "zellij-test");
+        assert_eq!(result.exit_status, Some(1), "{result:?}");
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("already exists")),
+            "{result:?}"
+        );
+        assert_eq!(
+            zellij_utils::sessions::resolve_session_id(&socket_name),
+            None,
+            "commit claimed a name whose socket already exists"
+        );
+    }
+
+    #[test]
+    fn an_index_write_failure_leaves_the_display_and_completes_the_request() {
+        let mut h = harness();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_hook = std::sync::Arc::clone(&calls);
+        h.screen.session_rename_index = super::super::SessionRenameIndexHook::Override(
+            std::sync::Arc::new(move |_id, _name| {
+                calls_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("index write failed".to_owned())
+            }),
+        );
+        let name = format!("s03-index-failure-{}", std::process::id());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        h.screen
+            .commit_session_rename(super::super::SessionRenameCommit {
+                name,
+                client_id: 1,
+                discovery: quiet_discovery(),
+                popup_on_error: false,
+                completion: Some(crate::route::NotificationEnd::new(sender)),
+            })
+            .expect("TEST");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(h.screen.session_name, "zellij-test");
+        assert_eq!(
+            h.screen.default_mode_info.session_name.as_deref(),
+            Some("zellij-test")
+        );
+        let result = receiver.blocking_recv().expect("rename completion");
+        assert_eq!(result.exit_status, Some(1), "{result:?}");
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("index write failed")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_display_update_rolls_the_name_and_the_index_back() {
+        let mut h = harness();
+        let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let calls_hook = std::sync::Arc::clone(&calls);
+        h.screen.session_rename_index = super::super::SessionRenameIndexHook::Override(
+            std::sync::Arc::new(move |session_id, new_name| {
+                calls_hook
+                    .lock()
+                    .unwrap()
+                    .push((session_id.to_owned(), new_name.to_owned()));
+                Ok(())
+            }),
+        );
+        h.screen.fail_session_rename_display = true;
+        let name = format!("s03-display-rollback-{}", std::process::id());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let error = h
+            .screen
+            .commit_session_rename(super::super::SessionRenameCommit {
+                name: name.clone(),
+                client_id: 1,
+                discovery: quiet_discovery(),
+                popup_on_error: false,
+                completion: Some(crate::route::NotificationEnd::new(sender)),
+            })
+            .expect_err("display apply must fail");
+        assert!(
+            error.to_string().contains("display apply failed"),
+            "{error}"
+        );
+        assert_eq!(h.screen.session_name, "zellij-test");
+        assert_eq!(
+            h.screen.default_mode_info.session_name.as_deref(),
+            Some("zellij-test")
+        );
+        assert!(h.screen.mode_info.values().all(|mode_info| {
+            mode_info.session_name.as_deref() == Some("zellij-test")
+                || mode_info.session_name.is_none()
+        }));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                (h.screen.session_id.clone(), name),
+                (h.screen.session_id.clone(), "zellij-test".to_owned()),
+            ]
+        );
+        let result = receiver.blocking_recv().expect("rename completion");
+        assert_eq!(result.exit_status, Some(1), "{result:?}");
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("display apply failed")),
+            "{result:?}"
+        );
     }
 }
 

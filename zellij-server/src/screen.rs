@@ -365,6 +365,84 @@ pub struct TabOverrideResult {
     pub plugin_ids: HashMap<RunPluginOrAlias, Vec<u32>>,
 }
 
+/// What an off-screen session-rename probe found. The screen thread rechecks
+/// this against its caches and the index at commit; it is not a second unlocked preflight.
+#[derive(Debug, Clone)]
+pub struct SessionRenameDiscovery {
+    pub resurrectable_sessions: BTreeMap<String, Duration>,
+    pub running_session_exists: std::result::Result<bool, String>,
+}
+
+/// One rename request's discovery, applied later on the screen thread.
+#[derive(Debug, Clone)]
+pub struct SessionRenameCommit {
+    pub name: String,
+    pub client_id: ClientId,
+    pub discovery: SessionRenameDiscovery,
+    pub popup_on_error: bool,
+    pub completion: Option<NotificationEnd>,
+}
+
+struct SessionRenameDiscoveryJob {
+    name: String,
+    current_session_name: String,
+    client_id: ClientId,
+    discovery: SessionRenameDiscoveryHook,
+    popup_on_error: bool,
+    completion: Option<NotificationEnd>,
+}
+
+#[derive(Clone)]
+enum SessionRenameDiscoveryHook {
+    /// [`discover_session_rename_conflicts`], which calls the real session scan.
+    Production,
+    #[cfg(test)]
+    Override(Arc<dyn Fn(&str, &str) -> SessionRenameDiscovery + Send + Sync>),
+}
+
+impl SessionRenameDiscoveryHook {
+    fn discover(&self, current_session_name: &str, new_name: &str) -> SessionRenameDiscovery {
+        match self {
+            SessionRenameDiscoveryHook::Production => {
+                discover_session_rename_conflicts(current_session_name, new_name)
+            },
+            #[cfg(test)]
+            SessionRenameDiscoveryHook::Override(discover) => {
+                discover(current_session_name, new_name)
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+enum SessionRenameIndexHook {
+    Production,
+    Override(Arc<dyn Fn(&str, &str) -> std::result::Result<(), String> + Send + Sync>),
+}
+
+/// Peer scan and `session_exists` for a rename. Both can block on an
+/// unresponsive socket, so the screen thread must not call this inline.
+fn discover_session_rename_conflicts(
+    current_session_name: &str,
+    new_name: &str,
+) -> SessionRenameDiscovery {
+    let (_, resurrectable_sessions) = crate::background_jobs::scan_session_list_default_dirs(
+        current_session_name,
+        &[],
+        &BTreeMap::new(),
+    );
+    let running_session_exists = match zellij_utils::sessions::session_exists(new_name) {
+        Ok(exists) => Ok(exists),
+        Err(error) => Err(format!(
+            "Could not check whether a session by this name exists: {error:?}"
+        )),
+    };
+    SessionRenameDiscovery {
+        resurrectable_sessions,
+        running_session_exists,
+    }
+}
+
 /// Instructions that can be sent to the [`Screen`].
 #[derive(Debug, Clone)]
 pub enum ScreenInstruction {
@@ -845,6 +923,8 @@ pub enum ScreenInstruction {
     ),
     SerializeLayoutForResurrection,
     RenameSession(String, ClientId, Option<NotificationEnd>), // String -> new name
+    /// Off-screen discovery for one [`ScreenInstruction::RenameSession`] finished.
+    CommitSessionRename(Box<SessionRenameCommit>),
     UpdateSessionNameDraft(Vec<u8>, ClientId, Option<NotificationEnd>),
     UndoRenameSession(ClientId, Option<NotificationEnd>),
     ListClientsMetadata(Option<PathBuf>, ClientId, Option<NotificationEnd>), // Option<PathBuf> - default shell
@@ -1518,7 +1598,9 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::SerializeLayoutForResurrection => {
                 ScreenContext::SerializeLayoutForResurrection
             },
-            ScreenInstruction::RenameSession(..) => ScreenContext::RenameSession,
+            ScreenInstruction::RenameSession(..) | ScreenInstruction::CommitSessionRename(..) => {
+                ScreenContext::RenameSession
+            },
             ScreenInstruction::UpdateSessionNameDraft(..) => ScreenContext::UpdateSessionNameDraft,
             ScreenInstruction::UndoRenameSession(..) => ScreenContext::UndoRenameSession,
             ScreenInstruction::ListClientsMetadata(..) => ScreenContext::ListClientsMetadata,
@@ -2098,6 +2180,12 @@ pub(crate) struct Screen {
     rename_pane_targets: HashMap<ClientId, PaneId>,
     rename_tab_targets: HashMap<ClientId, usize>,
     session_rename_drafts: HashMap<ClientId, String>,
+    session_rename_discovery: SessionRenameDiscoveryHook,
+    session_rename_worker: Option<std::sync::mpsc::SyncSender<SessionRenameDiscoveryJob>>,
+    #[cfg(test)]
+    session_rename_index: SessionRenameIndexHook,
+    #[cfg(test)]
+    fail_session_rename_display: bool,
     style: Style,
     pane_frame_style: PaneFrameStyle,
     auto_layout: bool,
@@ -2478,6 +2566,12 @@ impl Screen {
             rename_pane_targets: HashMap::new(),
             rename_tab_targets: HashMap::new(),
             session_rename_drafts: HashMap::new(),
+            session_rename_discovery: SessionRenameDiscoveryHook::Production,
+            session_rename_worker: None,
+            #[cfg(test)]
+            session_rename_index: SessionRenameIndexHook::Production,
+            #[cfg(test)]
+            fail_session_rename_display: false,
             default_mode_info: mode_info,
             pane_frame_style,
             auto_layout,
@@ -8150,12 +8244,17 @@ impl Screen {
             }
             None
         } else {
-            self.session_rename_drafts.remove(&client_id)
+            self.session_rename_drafts.get(&client_id).cloned()
         };
-        let session_rename_error = match pending_session_rename {
-            Some(new_name) if new_name != self.session_name => self.rename_session(new_name)?.err(),
-            _ => None,
-        };
+        if let Some(new_name) = pending_session_rename {
+            if new_name != self.session_name {
+                self.begin_session_rename(new_name, client_id, true, None)?;
+            } else {
+                self.session_rename_drafts.remove(&client_id);
+            }
+        } else if new_mode != InputMode::RenameSession {
+            self.session_rename_drafts.remove(&client_id);
+        }
         let displayed_session_name = self.displayed_session_name(client_id);
         if mode_info.session_name.as_ref() != Some(&displayed_session_name) {
             mode_info.session_name = Some(displayed_session_name);
@@ -8199,10 +8298,6 @@ impl Screen {
 
         self.style = mode_info.style;
         self.propagate_mode_info(mode_info, client_id)?;
-        if let Some(error_text) = session_rename_error {
-            log::error!("{}", error_text);
-            self.show_session_rename_error(client_id, error_text);
-        }
         Ok(())
     }
 
@@ -8257,47 +8352,292 @@ impl Screen {
         Ok(())
     }
 
-    pub fn rename_session(&mut self, name: String) -> Result<std::result::Result<(), String>> {
+    fn begin_session_rename(
+        &mut self,
+        name: String,
+        client_id: ClientId,
+        popup_on_error: bool,
+        completion: Option<NotificationEnd>,
+    ) -> Result<()> {
         if let Err(error_text) = zellij_utils::sessions::validate_session_name(&name) {
-            return Ok(Err(error_text));
+            self.session_rename_drafts.remove(&client_id);
+            self.refresh_displayed_session_name(client_id).non_fatal();
+            self.report_session_rename_failure(client_id, popup_on_error, error_text.clone());
+            if let Some(completion) = completion {
+                let mut completion = completion;
+                completion.set_exit_status(1);
+                completion.set_error_message(error_text);
+            }
+            return Ok(());
         }
-        let (_, resurrectable_sessions) = crate::background_jobs::scan_session_list_default_dirs(
-            &self.session_name,
-            &[],
-            &BTreeMap::new(),
+        let hook = self.session_rename_discovery.clone();
+        let current_session_name = self.session_name.clone();
+        let worker = match self.session_rename_worker() {
+            Ok(worker) => worker,
+            Err(error) => {
+                let error_text =
+                    format!("Could not check whether a session by this name exists: {error}");
+                self.report_session_rename_failure(client_id, popup_on_error, error_text.clone());
+                if let Some(mut completion) = completion {
+                    completion.set_exit_status(1);
+                    completion.set_error_message(error_text);
+                }
+                return Ok(());
+            },
+        };
+        let job = SessionRenameDiscoveryJob {
+            name,
+            current_session_name,
+            client_id,
+            discovery: hook,
+            popup_on_error,
+            completion,
+        };
+        match worker.try_send(job) {
+            Ok(()) => {},
+            Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                let error_text =
+                    "Could not rename the session: another rename is already being checked";
+                self.reject_session_rename_job(job, error_text);
+            },
+            Err(std::sync::mpsc::TrySendError::Disconnected(job)) => {
+                self.session_rename_worker = None;
+                let error_text =
+                    "Could not check whether a session by this name exists: discovery worker stopped";
+                self.reject_session_rename_job(job, error_text);
+            },
+        }
+        Ok(())
+    }
+
+    fn session_rename_worker(
+        &mut self,
+    ) -> Result<std::sync::mpsc::SyncSender<SessionRenameDiscoveryJob>> {
+        if let Some(worker) = self.session_rename_worker.as_ref() {
+            return Ok(worker.clone());
+        }
+        let (worker, jobs) = std::sync::mpsc::sync_channel::<SessionRenameDiscoveryJob>(1);
+        let senders = self.bus.senders.clone();
+        std::thread::Builder::new()
+            .name("session-rename-discovery".to_owned())
+            .spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    let discovery = job.discovery.discover(&job.current_session_name, &job.name);
+                    let commit = SessionRenameCommit {
+                        name: job.name,
+                        client_id: job.client_id,
+                        discovery,
+                        popup_on_error: job.popup_on_error,
+                        completion: job.completion,
+                    };
+                    if senders
+                        .send_to_screen(ScreenInstruction::CommitSessionRename(Box::new(commit)))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .with_context(|| "failed to start session-rename discovery worker")?;
+        self.session_rename_worker = Some(worker.clone());
+        Ok(worker)
+    }
+
+    fn reject_session_rename_job(&mut self, job: SessionRenameDiscoveryJob, error_text: &str) {
+        self.session_rename_drafts.remove(&job.client_id);
+        self.refresh_displayed_session_name(job.client_id)
+            .non_fatal();
+        self.report_session_rename_failure(
+            job.client_id,
+            job.popup_on_error,
+            error_text.to_owned(),
         );
-        let running_session_exists = zellij_utils::sessions::get_sessions()
-            .map(|sessions| sessions.iter().any(|(session, _)| session == &name))
-            .unwrap_or(false);
+        if let Some(mut completion) = job.completion {
+            completion.set_exit_status(1);
+            completion.set_error_message(error_text.to_owned());
+        }
+    }
+
+    fn commit_session_rename(&mut self, commit: SessionRenameCommit) -> Result<()> {
+        let SessionRenameCommit {
+            name,
+            client_id,
+            discovery,
+            popup_on_error,
+            completion,
+        } = commit;
+        let mut completion = completion;
+        match self.apply_discovered_session_rename(name, discovery) {
+            Ok(Ok(())) => {
+                self.session_rename_drafts.remove(&client_id);
+            },
+            Ok(Err(error_text)) => {
+                self.session_rename_drafts.remove(&client_id);
+                self.refresh_displayed_session_name(client_id).non_fatal();
+                if let Some(completion) = completion.as_mut() {
+                    completion.set_exit_status(1);
+                    completion.set_error_message(error_text.clone());
+                }
+                self.report_session_rename_failure(client_id, popup_on_error, error_text);
+            },
+            Err(error) => {
+                self.session_rename_drafts.remove(&client_id);
+                self.refresh_displayed_session_name(client_id).non_fatal();
+                if let Some(completion) = completion.as_mut() {
+                    completion.set_exit_status(1);
+                    completion.set_error_message(error.to_string());
+                }
+                return Err(error);
+            },
+        }
+        self.render(None)?;
+        Ok(())
+    }
+
+    fn report_session_rename_failure(
+        &mut self,
+        client_id: ClientId,
+        popup_on_error: bool,
+        error_text: String,
+    ) {
+        log::error!("{}", error_text);
+        if popup_on_error {
+            self.show_session_rename_error(client_id, error_text);
+            return;
+        }
+        if let Some(os_input) = &mut self.bus.os_input {
+            let _ = os_input.send_to_client(
+                client_id,
+                ServerToClientMsg::LogError {
+                    lines: vec![error_text],
+                },
+            );
+        }
+    }
+
+    /// The off-screen probe can be stale, so read the index and the socket
+    /// path here too. The index transaction makes the final decision; this
+    /// check only gives the user an earlier, clearer error. A read error is a
+    /// failure. This does not call `session_exists`.
+    fn rename_target_is_taken(&self, name: &str) -> std::result::Result<bool, String> {
+        let indexed_id = match zellij_utils::session_index::SessionIndex::open_default()
+            .and_then(|index| index.session_id(name))
+        {
+            Ok(id) => id,
+            Err(error) => {
+                return Err(format!(
+                    "Could not check whether a session by this name exists: {error}"
+                ));
+            },
+        };
+        if indexed_id.as_deref() == Some(self.session_id.as_str()) {
+            return Ok(false);
+        }
+        if indexed_id.is_some() {
+            return Ok(true);
+        }
+        let socket_path = zellij_utils::consts::session_socket_path_in(
+            &zellij_utils::consts::ZELLIJ_SOCK_DIR,
+            name,
+        );
+        if socket_path == zellij_utils::consts::session_id_socket_path(&self.session_id) {
+            return Ok(false);
+        }
+        match socket_path.try_exists() {
+            Ok(exists) => Ok(exists),
+            Err(error) => Err(format!(
+                "Could not check whether a session by this name exists: {error}"
+            )),
+        }
+    }
+
+    fn write_session_rename(
+        &self,
+        session_id: &str,
+        new_name: &str,
+    ) -> std::result::Result<(), String> {
+        #[cfg(test)]
+        if let SessionRenameIndexHook::Override(write) = &self.session_rename_index {
+            return write(session_id, new_name);
+        }
+        zellij_utils::sessions::rename_session(session_id, new_name)
+    }
+
+    /// Conflict checks and the index write. Discovery already ran off this
+    /// thread; caches and the index are read again here so a session that
+    /// appeared while the probe was in flight is still rejected. This
+    /// function does not probe sockets.
+    fn apply_discovered_session_rename(
+        &mut self,
+        name: String,
+        discovery: SessionRenameDiscovery,
+    ) -> Result<std::result::Result<(), String>> {
+        let running_session_exists = match discovery.running_session_exists {
+            Ok(exists) => exists,
+            Err(message) => return Ok(Err(message)),
+        };
         if self.peer_sessions_cache.contains_key(&name) || running_session_exists {
             return Ok(Err("A session by this name already exists.".to_owned()));
         }
         if self.resurrectable_sessions_cache.contains_key(&name)
-            || resurrectable_sessions.contains_key(&name)
+            || discovery.resurrectable_sessions.contains_key(&name)
         {
             return Ok(Err(
                 "A resurrectable session by this name exists, cannot use this name.".to_owned(),
             ));
         }
+        match self.rename_target_is_taken(&name) {
+            Ok(true) => return Ok(Err("A session by this name already exists.".to_owned())),
+            Ok(false) => {},
+            Err(message) => return Ok(Err(message)),
+        }
         let err_context = || format!("Failed to rename session");
         let old_session_name = self.session_name.clone();
 
-        self.session_name = name.clone();
-        self.default_mode_info.session_name = Some(name.clone());
-        for (_client_id, mode_info) in self.mode_info.iter_mut() {
-            mode_info.session_name = Some(name.clone());
+        if let Err(error) = self.write_session_rename(&self.session_id, &name) {
+            return Ok(Err(error));
         }
-        for (_, tab) in self.tabs.iter_mut() {
-            tab.rename_session(name.clone()).with_context(err_context)?;
+        let apply_rename = (|| -> Result<()> {
+            self.session_name = name.clone();
+            self.default_mode_info.session_name = Some(name.clone());
+            for (_client_id, mode_info) in self.mode_info.iter_mut() {
+                mode_info.session_name = Some(name.clone());
+            }
+            #[cfg(test)]
+            if self.fail_session_rename_display {
+                self.fail_session_rename_display = false;
+                bail!("display apply failed");
+            }
+            for (_, tab) in self.tabs.iter_mut() {
+                tab.rename_session(name.clone()).with_context(err_context)?;
+            }
+            let clients_with_drafts: Vec<ClientId> =
+                self.session_rename_drafts.keys().copied().collect();
+            for client_id in clients_with_drafts {
+                self.refresh_displayed_session_name(client_id)
+                    .with_context(err_context)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = apply_rename {
+            self.session_name = old_session_name.clone();
+            self.default_mode_info.session_name = Some(old_session_name.clone());
+            for (_client_id, mode_info) in self.mode_info.iter_mut() {
+                mode_info.session_name = Some(old_session_name.clone());
+            }
+            for (_, tab) in self.tabs.iter_mut() {
+                let _ = tab.rename_session(old_session_name.clone());
+            }
+            if let Err(rollback_error) =
+                self.write_session_rename(&self.session_id, &old_session_name)
+            {
+                log::error!(
+                    "Failed to roll back session index after a failed rename: {}",
+                    rollback_error
+                );
+            }
+            return Err(error);
         }
-        let clients_with_drafts: Vec<ClientId> =
-            self.session_rename_drafts.keys().copied().collect();
-        for client_id in clients_with_drafts {
-            self.refresh_displayed_session_name(client_id)
-                .with_context(err_context)?;
-        }
-
-        zellij_utils::sessions::rename_session(&self.session_id, &name);
 
         self.peer_sessions_cache.remove(&old_session_name);
         self.log_and_report_session_state()
@@ -14733,18 +15073,11 @@ pub(crate) fn screen_thread_main(
                     })
                     .with_context(err_context)?;
             },
-            ScreenInstruction::RenameSession(name, client_id, _completion_tx) => {
-                if let Err(error_text) = screen.rename_session(name)? {
-                    log::error!("{}", error_text);
-                    if let Some(os_input) = &mut screen.bus.os_input {
-                        let _ = os_input.send_to_client(
-                            client_id,
-                            ServerToClientMsg::LogError {
-                                lines: vec![error_text],
-                            },
-                        );
-                    }
-                }
+            ScreenInstruction::RenameSession(name, client_id, completion) => {
+                screen.begin_session_rename(name, client_id, false, completion)?;
+            },
+            ScreenInstruction::CommitSessionRename(commit) => {
+                screen.commit_session_rename(*commit)?;
             },
             ScreenInstruction::UpdateSessionNameDraft(input, client_id, _completion_tx) => {
                 screen.update_session_name_draft(input, client_id)?;

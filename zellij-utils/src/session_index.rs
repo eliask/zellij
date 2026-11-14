@@ -355,6 +355,34 @@ pub struct SessionIndex {
     indexed_facts: HashSet<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameOutcome {
+    Renamed,
+    Conflict,
+}
+
+// Runs inside `rename_by_id`, after the ownership check and before the update,
+// while the immediate transaction still holds the write lock.
+#[cfg(test)]
+thread_local! {
+    static RENAME_BEFORE_CLAIM: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_rename_before_claim_hook() {
+    RENAME_BEFORE_CLAIM.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
+}
+
+#[cfg(test)]
+fn set_rename_before_claim_hook(hook: Option<Box<dyn Fn()>>) {
+    RENAME_BEFORE_CLAIM.with(|slot| *slot.borrow_mut() = hook);
+}
+
 fn sanitize_identifier(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -584,10 +612,7 @@ impl SessionIndex {
 
     pub fn rename(&self, old_name: &str, new_name: &str) -> Result<bool> {
         match self.session_id(old_name)? {
-            Some(id) => {
-                self.rename_by_id(&id, new_name, now_secs())?;
-                Ok(true)
-            },
+            Some(id) => Ok(self.rename_by_id(&id, new_name, now_secs())? == RenameOutcome::Renamed),
             None => Ok(false),
         }
     }
@@ -628,14 +653,23 @@ impl SessionIndex {
     }
 
     /// Give the session with this id a new name. Nothing on disk is renamed: the socket and the
-    /// cache folder stay named by the id.
-    pub fn rename_by_id(&self, id: &str, new_name: &str, now: u64) -> Result<()> {
+    /// cache folder stay named by the id. A name owned by any other row is a conflict; this does
+    /// not delete that row.
+    pub fn rename_by_id(&self, id: &str, new_name: &str, now: u64) -> Result<RenameOutcome> {
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        // A row left under the new name by a session that no longer exists gives way.
-        transaction.execute(
-            "DELETE FROM sessions WHERE name = ?1 AND COALESCE(id, name) <> ?2",
+        let target_is_owned = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sessions
+                WHERE name = ?1 AND COALESCE(id, name) <> ?2
+            )",
             params![new_name, id],
+            |row| row.get::<_, bool>(0),
         )?;
+        if target_is_owned {
+            return Ok(RenameOutcome::Conflict);
+        }
+        #[cfg(test)]
+        run_rename_before_claim_hook();
         // Pinning the id keeps a session from before ids existed (no id, named on disk by its old
         // name) reachable under its new name.
         let renamed = transaction.execute(
@@ -652,7 +686,7 @@ impl SessionIndex {
             )?;
         }
         transaction.commit()?;
-        Ok(())
+        Ok(RenameOutcome::Renamed)
     }
 
     /// The id of the session with this name, if the index knows the session.
@@ -1772,6 +1806,111 @@ mod tests {
             test.index.session_name(&id).unwrap(),
             Some("after".to_owned())
         );
+    }
+
+    #[test]
+    fn renaming_onto_a_name_owned_by_another_session_is_a_conflict() {
+        let test = TestIndex::new();
+        let first = test.index.register("first", 10).unwrap();
+        let second = test.index.register("second", 11).unwrap();
+
+        assert_eq!(
+            test.index.rename_by_id(&first, "second", 20).unwrap(),
+            RenameOutcome::Conflict
+        );
+        assert!(
+            !test.index.rename("first", "second").unwrap(),
+            "rename by the old name must not claim a name another session owns"
+        );
+        assert_eq!(
+            test.index.session_id("first").unwrap(),
+            Some(first),
+            "the source session must keep its name"
+        );
+        assert_eq!(
+            test.index.session_id("second").unwrap(),
+            Some(second.clone()),
+            "the session that already owns the target name must be untouched"
+        );
+        let rows: i64 = test
+            .index
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(
+            test.index.session_name(&second).unwrap().as_deref(),
+            Some("second")
+        );
+    }
+
+    struct ClearRenameHook;
+
+    impl Drop for ClearRenameHook {
+        fn drop(&mut self) {
+            set_rename_before_claim_hook(None);
+        }
+    }
+
+    #[test]
+    fn a_writer_in_the_check_claim_window_cannot_take_the_name() {
+        let test = TestIndex::new();
+        let first = test.index.register("first", 10).unwrap();
+        let second = test.index.register("second", 11).unwrap();
+        let path = test.root.path().join("index.sqlite");
+        let raced: std::sync::Arc<std::sync::Mutex<Option<std::result::Result<usize, String>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let raced_hook = std::sync::Arc::clone(&raced);
+        let second_hook = second.clone();
+        set_rename_before_claim_hook(Some(Box::new(move || {
+            let conn = Connection::open(&path).unwrap();
+            conn.busy_timeout(Duration::from_millis(50)).unwrap();
+            let result = conn.execute(
+                "UPDATE sessions SET name = 'raced' WHERE COALESCE(id, name) = ?1",
+                [&second_hook],
+            );
+            *raced_hook.lock().unwrap() = Some(result.map_err(|error| error.to_string()));
+        })));
+        let _clear = ClearRenameHook;
+
+        assert_eq!(
+            test.index.rename_by_id(&first, "raced", 20).unwrap(),
+            RenameOutcome::Renamed
+        );
+        let raced = raced.lock().unwrap().clone().expect("competing write ran");
+        let error = raced.expect_err("a write inside the claim window must fail");
+        let error = error.to_lowercase();
+        assert!(
+            error.contains("busy") || error.contains("locked"),
+            "competing write was not rejected by the claim lock: {error}"
+        );
+        assert_eq!(test.index.session_id("raced").unwrap(), Some(first));
+        assert_eq!(
+            test.index.session_id("second").unwrap(),
+            Some(second),
+            "the competing session must keep its name"
+        );
+        assert_eq!(test.index.session_id("first").unwrap(), None);
+    }
+
+    #[test]
+    fn a_failed_rename_write_leaves_both_names_unchanged() {
+        let test = TestIndex::new();
+        let id = test.index.register("before", 1).unwrap();
+        test.index
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER abort_rename BEFORE UPDATE OF name ON sessions
+                 BEGIN SELECT RAISE(ABORT, 'index write failed'); END;",
+            )
+            .unwrap();
+        let error = test
+            .index
+            .rename_by_id(&id, "after", 2)
+            .expect_err("the aborted update must fail the claim");
+        assert!(error.to_string().contains("index write failed"), "{error}");
+        assert_eq!(test.index.session_id("before").unwrap(), Some(id));
+        assert_eq!(test.index.session_id("after").unwrap(), None);
     }
 
     #[test]
