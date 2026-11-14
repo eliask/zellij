@@ -29,6 +29,7 @@ mod protobuf_conversion;
 mod tests;
 
 type SessionId = u64;
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 /// A bidirectional byte stream that supports cloning for simultaneous read/write.
 pub trait IpcStream: Read + Write + Send + 'static {
@@ -435,38 +436,53 @@ There are a few things you can try now:
 
 /// Sends messages on a stream socket, along with an [`ErrorContext`].
 pub struct IpcSenderWithContext<T: Serialize> {
-    sender: io::BufWriter<Box<dyn IpcStream>>,
+    sender: Option<io::BufWriter<Box<dyn IpcStream>>>,
     _phantom: PhantomData<T>,
 }
 
 impl<T: Serialize> IpcSenderWithContext<T> {
     /// Returns a sender to the given [LocalSocketStream](interprocess::local_socket::LocalSocketStream).
     pub fn new(sender: LocalSocketStream) -> Self {
+        Self::from_boxed(Box::new(sender))
+    }
+
+    pub fn from_boxed(sender: Box<dyn IpcStream>) -> Self {
         Self {
-            sender: io::BufWriter::new(Box::new(sender)),
+            sender: Some(io::BufWriter::new(sender)),
             _phantom: PhantomData,
         }
     }
 
-    fn from_boxed(sender: Box<dyn IpcStream>) -> Self {
-        Self {
-            sender: io::BufWriter::new(sender),
-            _phantom: PhantomData,
-        }
+    fn open_sender(&mut self) -> Result<&mut io::BufWriter<Box<dyn IpcStream>>> {
+        self.sender
+            .as_mut()
+            .ok_or_else(|| anyhow!("ipc sender is closed"))
     }
 
     pub fn send_client_msg(&mut self, msg: ClientToServerMsg) -> Result<()> {
+        let sender = self.open_sender()?;
         let proto_msg: ProtoClientToServerMsg = msg.into();
-        write_protobuf_message(&mut self.sender, &proto_msg)?;
-        let _ = self.sender.flush();
+        write_protobuf_message(sender, &proto_msg)?;
+        sender.flush()?;
         Ok(())
     }
 
     pub fn send_server_msg(&mut self, msg: ServerToClientMsg) -> Result<()> {
+        let sender = self.open_sender()?;
         let proto_msg: ProtoServerToClientMsg = msg.into();
-        write_protobuf_message(&mut self.sender, &proto_msg)?;
-        let _ = self.sender.flush();
+        write_protobuf_message(sender, &proto_msg)?;
+        sender.flush()?;
         Ok(())
+    }
+
+    /// Drop a frame left buffered by a failed write or flush. `BufWriter`'s
+    /// destructor would flush it again, so the frame could be delivered after
+    /// the send was reported as a failure, or the drop could block.
+    pub fn abandon(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let (stream, _buffered) = sender.into_parts();
+            drop(stream);
+        }
     }
 
     /// Returns an [`IpcReceiverWithContext`] with the same socket as this sender.
@@ -474,8 +490,20 @@ impl<T: Serialize> IpcSenderWithContext<T> {
     where
         F: for<'de> Deserialize<'de> + Serialize,
     {
-        let socket = self.sender.get_ref().try_clone_stream().unwrap();
+        let socket = self
+            .sender
+            .as_ref()
+            .expect("ipc sender is closed")
+            .get_ref()
+            .try_clone_stream()
+            .unwrap();
         IpcReceiverWithContext::from_boxed(socket)
+    }
+}
+
+impl<T: Serialize> Drop for IpcSenderWithContext<T> {
+    fn drop(&mut self) {
+        self.abandon();
     }
 }
 
@@ -574,6 +602,10 @@ fn read_protobuf_message<T: Message + Default>(
         .read_exact(&mut len_bytes)
         .map_err(|_| IpcReceiveError::Disconnected)?;
     let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > MAX_FRAME_BYTES {
+        // The payload is left unread, so the stream cannot be resynchronized.
+        return Err(IpcReceiveError::Disconnected);
+    }
 
     let mut buf = vec![0u8; len];
     reader
@@ -585,6 +617,7 @@ fn read_protobuf_message<T: Message + Default>(
 
 fn write_protobuf_message<T: Message>(writer: &mut impl Write, msg: &T) -> Result<()> {
     let encoded = msg.encode_to_vec();
+    validate_frame_length(encoded.len())?;
     let len = encoded.len() as u32;
 
     // we measure the length of the message and transmit it first so that the reader will be able
@@ -596,14 +629,23 @@ fn write_protobuf_message<T: Message>(writer: &mut impl Write, msg: &T) -> Resul
     Ok(())
 }
 
+fn validate_frame_length(len: usize) -> Result<()> {
+    if len > MAX_FRAME_BYTES {
+        return Err(anyhow!("encoded IPC frame exceeds the maximum frame size"));
+    }
+    u32::try_from(len).map_err(|_| anyhow!("encoded IPC frame exceeds the u32 prefix"))?;
+    Ok(())
+}
+
 // Protobuf helper functions
 pub fn send_protobuf_client_to_server(
     sender: &mut IpcSenderWithContext<ClientToServerMsg>,
     msg: ClientToServerMsg,
 ) -> Result<()> {
     let proto_msg: ProtoClientToServerMsg = msg.into();
-    write_protobuf_message(&mut sender.sender, &proto_msg)?;
-    let _ = sender.sender.flush();
+    let writer = sender.open_sender()?;
+    write_protobuf_message(writer, &proto_msg)?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -612,8 +654,9 @@ pub fn send_protobuf_server_to_client(
     msg: ServerToClientMsg,
 ) -> Result<()> {
     let proto_msg: ProtoServerToClientMsg = msg.into();
-    write_protobuf_message(&mut sender.sender, &proto_msg)?;
-    let _ = sender.sender.flush();
+    let writer = sender.open_sender()?;
+    write_protobuf_message(writer, &proto_msg)?;
+    writer.flush()?;
     Ok(())
 }
 

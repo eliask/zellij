@@ -1,14 +1,230 @@
 use crate::ipc::{
-    ClientToServerMsg, IpcReceiveError, IpcReceiverWithContext, IpcSenderWithContext,
+    ClientToServerMsg, IpcReceiveError, IpcReceiverWithContext, IpcSenderWithContext, IpcStream,
     ServerToClientMsg,
 };
 use crate::pane_size::Size;
 use interprocess::local_socket::{prelude::*, ListenerOptions};
 
-use std::io::Write;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 static IPC_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+struct FlushFailureStream {
+    flushes: Arc<AtomicUsize>,
+}
+
+impl Read for FlushFailureStream {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("read not supported"))
+    }
+}
+
+impl Write for FlushFailureStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flushes.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::Error::other("flush failed"))
+    }
+}
+
+impl IpcStream for FlushFailureStream {
+    fn try_clone_stream(&self) -> std::io::Result<Box<dyn IpcStream>> {
+        Err(std::io::Error::other("clone not supported"))
+    }
+    fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn counted_flush_failure() -> (Box<dyn IpcStream>, Arc<AtomicUsize>) {
+    let flushes = Arc::new(AtomicUsize::new(0));
+    let stream = Box::new(FlushFailureStream {
+        flushes: Arc::clone(&flushes),
+    });
+    (stream, flushes)
+}
+
+fn assert_one_flush_then_no_retry<T>(flushes: &AtomicUsize, sender: T) {
+    drop(sender);
+    assert_eq!(
+        flushes.load(Ordering::SeqCst),
+        1,
+        "dropping a failed sender must not retry the flush"
+    );
+}
+
+#[test]
+fn send_reports_flush_failure() {
+    let (stream, flushes) = counted_flush_failure();
+    let mut sender = IpcSenderWithContext::<ClientToServerMsg>::from_boxed(stream);
+    assert!(
+        sender
+            .send_client_msg(ClientToServerMsg::ConnStatus)
+            .is_err(),
+        "a failed flush must not be reported as a successful send"
+    );
+    assert_one_flush_then_no_retry(&flushes, sender);
+
+    let (stream, flushes) = counted_flush_failure();
+    let mut sender = IpcSenderWithContext::<ServerToClientMsg>::from_boxed(stream);
+    assert!(sender
+        .send_server_msg(ServerToClientMsg::Connected)
+        .is_err());
+    assert_one_flush_then_no_retry(&flushes, sender);
+
+    let (stream, flushes) = counted_flush_failure();
+    let mut sender = IpcSenderWithContext::<ClientToServerMsg>::from_boxed(stream);
+    assert!(
+        crate::ipc::send_protobuf_client_to_server(&mut sender, ClientToServerMsg::ConnStatus)
+            .is_err()
+    );
+    assert_one_flush_then_no_retry(&flushes, sender);
+
+    let (stream, flushes) = counted_flush_failure();
+    let mut sender = IpcSenderWithContext::<ServerToClientMsg>::from_boxed(stream);
+    assert!(
+        crate::ipc::send_protobuf_server_to_client(&mut sender, ServerToClientMsg::Connected)
+            .is_err()
+    );
+    assert_one_flush_then_no_retry(&flushes, sender);
+}
+
+struct ShortWriteStream {
+    buf: Arc<Mutex<Vec<u8>>>,
+    writes: Arc<AtomicUsize>,
+}
+
+impl Read for ShortWriteStream {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("read not supported"))
+    }
+}
+
+impl Write for ShortWriteStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.buf.lock().unwrap().push(buf[0]);
+        Ok(1)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl IpcStream for ShortWriteStream {
+    fn try_clone_stream(&self) -> std::io::Result<Box<dyn IpcStream>> {
+        Err(std::io::Error::other("clone not supported"))
+    }
+    fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn short_writes_deliver_one_frame_and_a_later_error_is_not_success() {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut sender =
+        IpcSenderWithContext::<ClientToServerMsg>::from_boxed(Box::new(ShortWriteStream {
+            buf: Arc::clone(&buf),
+            writes: Arc::clone(&writes),
+        }));
+    sender
+        .send_client_msg(ClientToServerMsg::ConnStatus)
+        .expect("short writes must still deliver the frame");
+    assert!(
+        writes.load(Ordering::SeqCst) > 1,
+        "a one-byte write must be retried until the frame is complete"
+    );
+    let bytes = buf.lock().unwrap().clone();
+    let proto = crate::ipc::read_protobuf_message::<crate::ipc::ProtoClientToServerMsg>(
+        &mut std::io::Cursor::new(bytes),
+    )
+    .expect("the short writes must form one frame");
+    let msg: ClientToServerMsg = proto.try_into().expect("frame should decode");
+    assert!(matches!(msg, ClientToServerMsg::ConnStatus));
+
+    let mut sender =
+        IpcSenderWithContext::<ClientToServerMsg>::from_boxed(Box::new(ShortThenError {
+            accepted: false,
+        }));
+    assert!(
+        sender
+            .send_client_msg(ClientToServerMsg::ConnStatus)
+            .is_err(),
+        "a short write that then fails must not be reported as delivered"
+    );
+}
+
+struct ShortThenError {
+    accepted: bool,
+}
+
+impl Read for ShortThenError {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("read not supported"))
+    }
+}
+
+impl Write for ShortThenError {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.accepted || buf.is_empty() {
+            return Err(std::io::Error::other("short write failed"));
+        }
+        self.accepted = true;
+        Ok(1)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl IpcStream for ShortThenError {
+    fn try_clone_stream(&self) -> std::io::Result<Box<dyn IpcStream>> {
+        Err(std::io::Error::other("clone not supported"))
+    }
+    fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn oversized_advertised_frames_are_rejected_before_allocation() {
+    // The unread payload would otherwise be parsed as the next frames, so
+    // the stream is treated as disconnected rather than skipped over.
+    let advertised_len = (crate::ipc::MAX_FRAME_BYTES + 1) as u32;
+    let mut bytes = advertised_len.to_le_bytes().to_vec();
+    // Bytes that a reader attempting the allocation-and-read would consume.
+    bytes.extend_from_slice(&[0u8; 64]);
+    let mut frame = std::io::Cursor::new(bytes);
+
+    assert!(matches!(
+        crate::ipc::read_protobuf_message::<crate::ipc::ProtoClientToServerMsg>(&mut frame),
+        Err(IpcReceiveError::Disconnected)
+    ));
+    // Without the limit check the reader would allocate the advertised
+    // buffer and read (part of) the payload before failing with the same
+    // error, so the error alone cannot show the limit was applied. The
+    // reader must have stopped right after the length prefix.
+    assert_eq!(
+        frame.position(),
+        4,
+        "the oversized payload must not be read"
+    );
+}
+
+#[test]
+fn outgoing_frames_enforce_the_same_size_limit() {
+    assert!(crate::ipc::validate_frame_length(crate::ipc::MAX_FRAME_BYTES).is_ok());
+    assert!(crate::ipc::validate_frame_length(crate::ipc::MAX_FRAME_BYTES + 1).is_err());
+}
 
 // --- Cross-platform IPC helpers ---
 // On Unix: use filesystem-based sockets (TempDir + PathBuf + GenericFilePath)

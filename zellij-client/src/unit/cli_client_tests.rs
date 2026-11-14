@@ -5,11 +5,11 @@ use crate::os_input_output::ClientOsApi;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
-use zellij_utils::cli::PromptCli;
+use zellij_utils::cli::{PromptCli, SubscribeCli, SubscribeFormat};
 use zellij_utils::data::Palette;
 use zellij_utils::errors::ErrorContext;
 use zellij_utils::input::actions::Action;
-use zellij_utils::ipc::{ClientToServerMsg, ServerToClientMsg};
+use zellij_utils::ipc::{ClientToServerMsg, ExitReason, ServerToClientMsg};
 use zellij_utils::pane_size::Size;
 use zellij_utils::prompt::PromptElement;
 
@@ -19,7 +19,9 @@ struct ScriptedOsApi {
     replies: Arc<Mutex<VecDeque<Vec<ServerToClientMsg>>>>,
     inbox: Arc<Mutex<VecDeque<ServerToClientMsg>>>,
     sent_payloads: Arc<Mutex<Vec<Option<String>>>>,
+    sent: Arc<Mutex<Vec<ClientToServerMsg>>>,
     stdout: Arc<Mutex<Vec<u8>>>,
+    closed: bool,
 }
 
 impl ScriptedOsApi {
@@ -77,6 +79,7 @@ impl ClientOsApi for ScriptedOsApi {
         Box::new(self.clone())
     }
     fn send_to_server(&self, msg: ClientToServerMsg) {
+        self.sent.lock().unwrap().push(msg.clone());
         if let ClientToServerMsg::Action {
             action: Action::CliPipe { payload, .. },
             ..
@@ -89,6 +92,9 @@ impl ClientOsApi for ScriptedOsApi {
         }
     }
     fn recv_from_server(&self) -> Option<(ServerToClientMsg, ErrorContext)> {
+        if self.closed {
+            return None;
+        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if let Some(msg) = self.inbox.lock().unwrap().pop_front() {
@@ -627,4 +633,133 @@ fn queued_prompt_lines_are_sent_together_but_pipe_lines_are_not() {
         crate::cli_client::next_payload(&mut queued, false),
         Some(Some("a\n".to_owned()))
     );
+}
+
+#[test]
+fn piped_stdin_batches_stay_under_the_host_frame() {
+    let chunk = "x".repeat(20 * 1024);
+    let mut queued: std::collections::VecDeque<Option<String>> =
+        vec![Some(chunk.clone()), Some(chunk.clone()), None]
+            .into_iter()
+            .collect();
+    let first = crate::cli_client::next_payload(&mut queued, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first.len(),
+        20 * 1024,
+        "two raw chunks past 32 KiB must not be merged; JSON expansion would pass 256 KiB"
+    );
+    let second = crate::cli_client::next_payload(&mut queued, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.len(), 20 * 1024);
+}
+
+#[test]
+fn subscriber_reports_terminal_outcomes() {
+    fn subscribe_cli() -> SubscribeCli {
+        SubscribeCli {
+            pane_id: vec!["terminal_1".to_owned()],
+            scrollback: None,
+            format: SubscribeFormat::Raw,
+            ansi: false,
+        }
+    }
+    fn exits(api: &ScriptedOsApi) -> usize {
+        api.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|msg| matches!(msg, ClientToServerMsg::ClientExited))
+            .count()
+    }
+    fn run(mut prepare: impl FnMut(&ScriptedOsApi)) -> (i32, usize) {
+        let api = ScriptedOsApi::new(None, vec![]);
+        prepare(&api);
+        let code = crate::cli_client::start_subscribe_client(
+            Box::new(api.clone()),
+            "subscriber-outcome",
+            subscribe_cli(),
+        );
+        (code, exits(&api))
+    }
+
+    let (code, exited) = run(|api| {
+        api.inbox
+            .lock()
+            .unwrap()
+            .push_back(ServerToClientMsg::Exit {
+                exit_reason: ExitReason::Disconnect,
+            });
+    });
+    assert_eq!(code, 1);
+    assert_eq!(exited, 1, "ClientExited is sent once on disconnect");
+
+    let (code, exited) = run(|api| {
+        api.inbox
+            .lock()
+            .unwrap()
+            .push_back(ServerToClientMsg::Exit {
+                exit_reason: ExitReason::Normal,
+            });
+    });
+    assert_eq!(code, 0);
+    assert_eq!(exited, 1);
+
+    let (code, exited) = run(|api| {
+        api.inbox
+            .lock()
+            .unwrap()
+            .push_back(ServerToClientMsg::Exit {
+                exit_reason: ExitReason::CustomExitStatus(7),
+            });
+    });
+    assert_eq!(code, 7);
+    assert_eq!(exited, 1);
+
+    let (code, exited) = run(|api| {
+        api.inbox
+            .lock()
+            .unwrap()
+            .push_back(ServerToClientMsg::Exit {
+                exit_reason: ExitReason::Error("session failed".to_owned()),
+            });
+    });
+    assert_eq!(code, 1);
+    assert_eq!(exited, 1);
+
+    let (code, exited) = run(|api| {
+        api.inbox
+            .lock()
+            .unwrap()
+            .push_back(ServerToClientMsg::LogError {
+                lines: vec!["plugin failed".to_owned()],
+            });
+    });
+    assert_eq!(code, 2);
+    assert_eq!(exited, 1);
+
+    let (code, exited) = run(|api| {
+        api.inbox
+            .lock()
+            .unwrap()
+            .push_back(ServerToClientMsg::SubscribedPaneClosed {
+                pane_id: zellij_utils::data::PaneId::Terminal(1),
+            });
+    });
+    assert_eq!(code, 0);
+    assert_eq!(exited, 1);
+
+    let api = ScriptedOsApi {
+        closed: true,
+        ..ScriptedOsApi::new(None, vec![])
+    };
+    let code = crate::cli_client::start_subscribe_client(
+        Box::new(api.clone()),
+        "subscriber-outcome",
+        subscribe_cli(),
+    );
+    assert_eq!(code, 1);
+    assert_eq!(exits(&api), 1);
 }

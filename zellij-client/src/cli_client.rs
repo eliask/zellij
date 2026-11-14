@@ -230,7 +230,11 @@ enum PipeEvent {
     Payload(Option<String>),
 }
 
-const STREAM_BATCH_BYTES: usize = 256 * 1024;
+// The plugin host accepts at most 256 KiB in one stdin frame, and that frame
+// is the JSON encoding of a protobuf byte array. Each payload byte can become
+// four JSON characters ("255,"), so batching near the host cap would exceed
+// it. Keep the raw batch well below the cap.
+const STREAM_BATCH_BYTES: usize = 32 * 1024;
 
 pub(crate) fn next_payload(
     queued: &mut VecDeque<Option<String>>,
@@ -803,7 +807,7 @@ pub fn start_subscribe_client(
     os_input: Box<dyn ClientOsApi>,
     session_name: &str,
     subscribe_cli: SubscribeCli,
-) {
+) -> i32 {
     let zellij_ipc_pipe: PathBuf = {
         let sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
         fs::create_dir_all(&sock_dir).unwrap();
@@ -891,20 +895,41 @@ pub fn start_subscribe_client(
                     },
                 }
                 if remaining_panes.is_empty() {
-                    break;
+                    os_input.send_to_server(ClientToServerMsg::ClientExited);
+                    return 0;
                 }
             },
-            Some((ServerToClientMsg::Exit { .. }, _)) => break,
+            Some((ServerToClientMsg::Exit { exit_reason }, _)) => {
+                os_input.send_to_server(ClientToServerMsg::ClientExited);
+                return match exit_reason {
+                    ExitReason::Normal | ExitReason::NormalDetached => 0,
+                    ExitReason::CustomExitStatus(status) => status,
+                    // The server reports Disconnect whenever it drops a
+                    // client; its Display text is advice for interactive
+                    // terminals, not for a subscriber.
+                    ExitReason::Disconnect => {
+                        eprintln!("subscription ended: the session disconnected this client");
+                        1
+                    },
+                    other => {
+                        eprintln!("{}", other);
+                        1
+                    },
+                };
+            },
             Some((ServerToClientMsg::LogError { lines }, _)) => {
                 for line in lines {
                     eprintln!("{}", line);
                 }
-                process::exit(2);
+                os_input.send_to_server(ClientToServerMsg::ClientExited);
+                return 2;
             },
-            None => break,
+            None => {
+                eprintln!("subscribe connection closed unexpectedly");
+                os_input.send_to_server(ClientToServerMsg::ClientExited);
+                return 1;
+            },
             _ => {},
         }
     }
-
-    os_input.send_to_server(ClientToServerMsg::ClientExited);
 }

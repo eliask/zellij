@@ -355,6 +355,116 @@ fn client_buffer_reports_disconnect_when_receiver_is_gone() {
     assert_eq!(buffer.queued.load(Ordering::Acquire), 0);
 }
 
+#[test]
+fn client_writer_stops_after_the_first_send_failure() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use zellij_utils::ipc::IpcStream;
+
+    struct FailAfterFirstFlush {
+        flushes: Arc<std::sync::atomic::AtomicUsize>,
+        blocked: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Read for FailAfterFirstFlush {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("read not supported"))
+        }
+    }
+
+    impl Write for FailAfterFirstFlush {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            let n = self.flushes.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return Ok(());
+            }
+            if n == 1 {
+                return Err(std::io::Error::other("flush failed"));
+            }
+            self.blocked.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(std::io::Error::other("flush failed"))
+        }
+    }
+
+    impl IpcStream for FailAfterFirstFlush {
+        fn try_clone_stream(&self) -> std::io::Result<Box<dyn IpcStream>> {
+            Err(std::io::Error::other("clone not supported"))
+        }
+        fn set_read_timeout(&self, _timeout: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let blocked = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let _release = ReleaseOnDrop(Arc::clone(&release));
+    let sender =
+        IpcSenderWithContext::<ServerToClientMsg>::from_boxed(Box::new(FailAfterFirstFlush {
+            flushes: Arc::clone(&flushes),
+            blocked: Arc::clone(&blocked),
+            release: Arc::clone(&release),
+        }));
+    let client_sender = ClientSender::new(7, sender);
+    let exit_msg = || ServerToClientMsg::Exit {
+        exit_reason: ExitReason::Normal,
+    };
+    client_sender.send_or_buffer(exit_msg()).unwrap();
+    client_sender.send_or_buffer(exit_msg()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_disconnect = false;
+    while Instant::now() < deadline {
+        if blocked.load(Ordering::SeqCst) {
+            break;
+        }
+        match client_sender.send_or_buffer(exit_msg()) {
+            Ok(()) => {},
+            Err(err)
+                if err
+                    .chain()
+                    .any(|cause| cause.to_string().contains("disconnected")) =>
+            {
+                saw_disconnect = true;
+                break;
+            },
+            Err(err) if err.chain().any(|cause| cause.to_string().contains("full")) => break,
+            Err(err) => panic!("unexpected send error: {err:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    assert!(
+        !blocked.load(Ordering::SeqCst),
+        "the writer kept sending after the first failure"
+    );
+    assert!(
+        saw_disconnect,
+        "a failed writer must drop its queue so later producers see disconnection"
+    );
+    assert_eq!(
+        flushes.load(Ordering::SeqCst),
+        2,
+        "one delivered frame, one failed flush, and no flush retry or further send"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn the_pane_environment_is_added_to_and_removed_from_the_child_environment() {
