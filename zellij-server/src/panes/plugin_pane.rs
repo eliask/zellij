@@ -980,6 +980,20 @@ impl Pane for PluginPane {
             .map(|g| g.pane_contents(get_full_scrollback, max_scrollback_lines))
             .unwrap_or_else(Default::default)
     }
+    fn display_recount_pending(&self) -> bool {
+        self.grids
+            .values()
+            .any(|grid| grid.display_recount_pending())
+    }
+    fn continue_display_row_recount(&mut self) -> bool {
+        let mut done = true;
+        for grid in self.grids.values_mut() {
+            if grid.display_recount_pending() && !grid.continue_display_row_recount() {
+                done = false;
+            }
+        }
+        done
+    }
     fn pane_contents_with_ansi(
         &self,
         client_id: Option<ClientId>,
@@ -998,7 +1012,7 @@ impl PluginPane {
         let content_rows = self.get_content_rows();
         let content_columns = self.get_content_columns();
         for grid in self.grids.values_mut() {
-            grid.change_size(content_rows, content_columns);
+            grid.resize_keeping_recount_open(content_rows, content_columns);
         }
         self.set_should_render(true);
     }

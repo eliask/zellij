@@ -5852,6 +5852,18 @@ impl Screen {
         Ok(())
     }
 
+    /// Continue every open scrollback recount by one budget. Returns true
+    /// when a later turn still has lines to measure.
+    fn advance_scrollback_recounts(&mut self) -> bool {
+        let mut still_pending = false;
+        for tab in self.tabs.values_mut() {
+            if tab.advance_scrollback_recounts() {
+                still_pending = true;
+            }
+        }
+        still_pending
+    }
+
     pub fn render_to_clients(&mut self) -> Result<()> {
         // this method does the actual rendering and is triggered by a debounced BackgroundJob (see
         // the render method for more details)
@@ -5871,6 +5883,12 @@ impl Screen {
             return Ok(());
         }
         self.render_waits_for_ack = false;
+        if self.advance_scrollback_recounts() {
+            let _ = self
+                .bus
+                .senders
+                .send_to_background_jobs(BackgroundJob::RenderToClients);
+        }
         let _row_shifts = RowShiftsWhileRendering::new(self.row_shifts_possible());
         self.sync_attention_visibility();
         self.sync_plugin_visibility();

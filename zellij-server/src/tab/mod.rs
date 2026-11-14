@@ -650,6 +650,15 @@ pub trait Pane {
     fn clear_command_output_flash(&mut self) {}
     fn clear_scroll(&mut self);
     fn is_scrolled(&self) -> bool;
+    /// Scrollback display rows are still being reconciled at the current width.
+    fn display_recount_pending(&self) -> bool {
+        false
+    }
+    /// Measure one budgeted chunk of scrollback. Returns true when the
+    /// published length is exact.
+    fn continue_display_row_recount(&mut self) -> bool {
+        true
+    }
     fn active_at(&self) -> Instant;
     fn set_active_at(&mut self, instant: Instant);
     fn set_frame(&mut self, frame: bool);
@@ -6898,6 +6907,26 @@ impl Tab {
             self.tiled_panes.rendered_pane_ids().into_iter().collect();
         pane_ids.extend(self.floating_panes.rendered_pane_ids());
         pane_ids
+    }
+    /// One budgeted step of every pane whose scrollback length is still
+    /// being reconciled. Returns true when another step is required.
+    pub fn advance_scrollback_recounts(&mut self) -> bool {
+        let pane_ids = self.get_all_pane_ids();
+        let mut still_pending = false;
+        for pane_id in pane_ids {
+            let Some(pane) = self.get_pane_with_id_mut(pane_id) else {
+                continue;
+            };
+            if !pane.display_recount_pending() {
+                continue;
+            }
+            if pane.continue_display_row_recount() {
+                pane.set_should_render(true);
+            } else {
+                still_pending = true;
+            }
+        }
+        still_pending
     }
     pub fn get_all_pane_ids(&self) -> Vec<PaneId> {
         let mut static_and_floating_pane_ids = self.get_static_and_floating_pane_ids();

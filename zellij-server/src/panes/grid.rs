@@ -3,6 +3,7 @@ use super::kitty_graphics::{
     KittyError, KittyErrorCode, KittyGrid, KittyHostSupport, KittyImageChunk, KittyImageStore,
     KittyPlacement, KittyReplyData, KittyRowsBelowTheViewport, KittyVerticalAnchor,
 };
+use super::line_index::{LineIndex, MeasureBudget, MeasureProgress};
 use super::sixel::{PixelRect, SixelGrid, SixelImageStore};
 use base64::alphabet::STANDARD as BASE64_STANDARD_ALPHABET;
 use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
@@ -36,6 +37,11 @@ use zellij_utils::{
 };
 
 const TABSTOP_WIDTH: usize = 8; // TODO: is this always right?
+/// Stored rows one scrollback recount step may scan. A longer history
+/// continues on a later screen turn instead of during this call.
+const DISPLAY_RECOUNT_ROWS: usize = 128;
+/// Cells one recount step may scan. Charged even when a line is uniform.
+const DISPLAY_RECOUNT_CELLS: usize = DISPLAY_RECOUNT_ROWS * 1024;
 pub const MAX_TITLE_STACK_SIZE: usize = 1000;
 pub const MAX_TITLE_BYTES: usize = 4096;
 const MAX_XTGETTCAP_BYTES: usize = 4096;
@@ -398,93 +404,38 @@ fn scrollback_tail_is_wrapped_at(
     }
 }
 
-fn scrollback_display_row_count(rows: &mut VecDeque<Row>, width: usize) -> usize {
-    let mut display_rows = 0;
-    let mut run_width = 0;
-    for index in 0..rows.len() {
-        let row_width = match rows.get_mut(index) {
-            Some(row) => row.width_cached(),
-            None => break,
-        };
-        run_width += row_width;
-        let continues = matches!(rows.get(index + 1), Some(next_row) if !next_row.is_canonical);
-        if !continues {
-            display_rows += run_display_height(run_width, width);
-            run_width = 0;
-        }
-    }
-    display_rows
-}
-
-fn evicted_row_display_row_delta(
-    lines_above: &mut VecDeque<Row>,
-    evicted_row_width: usize,
-    width: usize,
-) -> isize {
-    let mut remaining_run_width = 0;
-    let mut remaining_run_rows = 0;
-    loop {
-        match lines_above.get(remaining_run_rows) {
-            Some(row) if !row.is_canonical => {},
-            _ => break,
-        }
-        remaining_run_width += match lines_above.get_mut(remaining_run_rows) {
-            Some(row) => row.width_cached(),
-            None => break,
-        };
-        remaining_run_rows += 1;
-    }
-    let before = run_display_height(remaining_run_width + evicted_row_width, width);
-    let after = if remaining_run_rows == 0 {
-        0
-    } else {
-        run_display_height(remaining_run_width, width)
-    };
-    after as isize - before as isize
-}
-
-fn run_display_height(run_width: usize, width: usize) -> usize {
-    if run_width <= width || width == 0 {
-        return 1;
-    }
-    run_width.div_ceil(width)
-}
-
 fn transfer_rows_from_lines_above_to_viewport(
     lines_above: &mut VecDeque<Row>,
     viewport: &mut VecDeque<Row>,
     sixel_grid: &mut SixelGrid,
     kitty_grid: &mut KittyGrid,
+    line_index: &mut LineIndex,
     count: usize,
     max_viewport_width: usize,
-) -> isize {
+) {
     let mut next_lines: Vec<Row> = vec![];
     let mut lines_added_to_viewport: isize = 0;
-    let mut display_row_delta: isize = 0;
     loop {
         if lines_added_to_viewport as usize == count {
             break;
         }
         if next_lines.is_empty() {
             if scrollback_tail_is_wrapped_at(lines_above, viewport, max_viewport_width) {
-                match lines_above.pop_back() {
-                    Some(mut next_line) => {
-                        next_line.expand_trailing_blanks();
-                        viewport.push_front(next_line);
-                        lines_added_to_viewport += 1;
-                        display_row_delta -= 1;
-                        continue;
-                    },
-                    None => break,
-                }
+                let (mut rows, _) = line_index.take_back(lines_above, 1);
+                let Some(mut next_line) = rows.pop() else {
+                    break;
+                };
+                next_line.expand_trailing_blanks();
+                viewport.push_front(next_line);
+                lines_added_to_viewport += 1;
+                continue;
             }
             let mut canonical_run = get_lines_above_bottom_canonical_row_and_wraps(lines_above);
             if canonical_run.is_empty() {
                 break;
             }
+            line_index.note_back_rows_removed(lines_above, canonical_run.len());
             let rows_taken_from_lines_above = canonical_run.len();
-            let run_width: usize = canonical_run.iter_mut().map(|row| row.width_cached()).sum();
-            display_row_delta -= run_display_height(run_width, max_viewport_width) as isize;
             let mut top_non_canonical_rows_in_dst = get_top_non_canonical_rows(viewport);
             let merged_row_count = top_non_canonical_rows_in_dst.len();
             lines_added_to_viewport -= merged_row_count as isize;
@@ -507,15 +458,8 @@ fn transfer_rows_from_lines_above_to_viewport(
         lines_added_to_viewport += 1;
     }
     for excess_row in next_lines {
-        if let Some(evicted_row_width) =
-            bounded_push(lines_above, sixel_grid, kitty_grid, excess_row)
-        {
-            display_row_delta +=
-                evicted_row_display_row_delta(lines_above, evicted_row_width, max_viewport_width);
-        }
-        display_row_delta += 1;
+        bounded_push(lines_above, sixel_grid, kitty_grid, excess_row, line_index);
     }
-    display_row_delta
 }
 
 fn transfer_rows_from_viewport_to_lines_above(
@@ -523,21 +467,13 @@ fn transfer_rows_from_viewport_to_lines_above(
     lines_above: &mut VecDeque<Row>,
     sixel_grid: &mut SixelGrid,
     kitty_grid: &mut KittyGrid,
+    line_index: &mut LineIndex,
     count: usize,
-    width: usize,
-) -> isize {
-    let mut display_row_delta: isize = 0;
+) {
     let drained_lines = std::cmp::min(count, viewport.len());
     for next_line in viewport.drain(..drained_lines) {
-        if let Some(evicted_row_width) =
-            bounded_push(lines_above, sixel_grid, kitty_grid, next_line)
-        {
-            display_row_delta +=
-                evicted_row_display_row_delta(lines_above, evicted_row_width, width);
-        }
-        display_row_delta += 1;
+        bounded_push(lines_above, sixel_grid, kitty_grid, next_line, line_index);
     }
-    display_row_delta
 }
 
 fn transfer_rows_from_lines_below_to_viewport(
@@ -601,7 +537,8 @@ fn bounded_push(
     sixel_grid: &mut SixelGrid,
     kitty_grid: &mut KittyGrid,
     mut value: Row,
-) -> Option<usize> {
+    line_index: &mut LineIndex,
+) {
     value.compress_trailing_blanks();
     if value.columns.capacity() > value.columns.len() {
         let mut exact = Vec::with_capacity(value.columns.len());
@@ -609,10 +546,9 @@ fn bounded_push(
         recycle_columns(std::mem::replace(&mut value.columns, exact));
     }
     let scroll_buffer_size = *SCROLL_BUFFER_SIZE.get().unwrap();
-    let mut evicted_row_width = None;
+    let mut evicted = 0usize;
     if vec.len() >= scroll_buffer_size {
-        let line = vec.pop_front();
-        if let Some(mut line) = line {
+        if let Some(line) = vec.pop_front() {
             sixel_grid.offset_grid_top();
             kitty_grid.offset_grid_top();
             if line.is_canonical {
@@ -626,15 +562,63 @@ fn bounded_push(
                     };
                 kitty_grid.drop_first_canonical_anchor_line(first_canonical_row);
             }
-            evicted_row_width = Some(line.width_cached());
+            evicted = 1;
         }
+    }
+    if evicted > 0 {
+        line_index.note_front_rows_removed(vec, evicted);
     }
     if vec.len() == vec.capacity() && vec.len() < scroll_buffer_size {
         let doubled = vec.capacity().max(8);
         vec.reserve_exact(doubled.min(scroll_buffer_size - vec.len()));
     }
-    vec.push_back(value);
-    evicted_row_width
+    line_index.append_row(vec, value);
+}
+
+/// Independent full recount used by grid tests. It wraps stored cells the
+/// same way `LineIndex` does and is not a second production counter.
+#[cfg(test)]
+fn scrollback_display_row_count(rows: &mut VecDeque<Row>, width: usize) -> usize {
+    let mut total = 0usize;
+    let mut start = 0usize;
+    for index in 0..rows.len() {
+        let continues = matches!(rows.get(index + 1), Some(next_row) if !next_row.is_canonical);
+        if !continues {
+            total += reference_line_display_height(rows.range(start..=index), width);
+            start = index + 1;
+        }
+    }
+    total
+}
+
+#[cfg(test)]
+fn reference_line_display_height<'a>(
+    rows: impl IntoIterator<Item = &'a Row>,
+    width: usize,
+) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let mut completed = 0usize;
+    let mut current = 0usize;
+    let mut push = |character_width: usize| {
+        if current + character_width > width {
+            if current > 0 {
+                completed += 1;
+            }
+            current = 0;
+        }
+        current += character_width;
+    };
+    for row in rows {
+        for character in &row.columns {
+            push(character.width());
+        }
+        for _ in 0..row.stored_cell_count().saturating_sub(row.columns.len()) {
+            push(1);
+        }
+    }
+    (completed + usize::from(current > 0)).max(1)
 }
 
 pub fn create_horizontal_tabstops(columns: usize) -> BTreeSet<usize> {
@@ -1003,7 +987,9 @@ pub struct Grid {
     pub is_scrolled: bool,
     pub link_handler: Rc<RefCell<LinkHandler>>,
     pub ring_bell: bool,
-    scrollback_display_rows: usize,
+    /// Authoritative scrollback display-row summaries. Every `lines_above`
+    /// mutation is routed through this index; there is no second counter.
+    line_index: LineIndex,
     scrollback_epoch: u64,
     pub mouse_mode: MouseMode,
     pub mouse_tracking: MouseTracking,
@@ -1400,7 +1386,7 @@ impl Grid {
             is_scrolled: false,
             link_handler,
             ring_bell: false,
-            scrollback_display_rows: 0,
+            line_index: LineIndex::new(columns),
             mouse_mode: MouseMode::default(),
             mouse_tracking: MouseTracking::default(),
             focus_event_tracking: false,
@@ -1559,10 +1545,12 @@ impl Grid {
         self.scrollback_epoch = self.scrollback_epoch.wrapping_add(1);
     }
     pub fn scrollback_position_and_length(&self) -> (usize, usize) {
-        // (position, length)
+        // (position, length). The length is the last fully measured total.
+        // A width change keeps that total until the bounded recount finishes;
+        // a partial sum is not a length.
         (
             self.lines_below.len(),
-            (self.scrollback_display_rows + self.lines_below.len()),
+            self.line_index.published_display_rows() + self.lines_below.len(),
         )
     }
 
@@ -1776,15 +1764,15 @@ impl Grid {
             let line_to_push_down = self.viewport.pop_back().unwrap();
             self.lines_below.push_front(line_to_push_down);
 
-            let display_row_delta = transfer_rows_from_lines_above_to_viewport(
+            transfer_rows_from_lines_above_to_viewport(
                 &mut self.lines_above,
                 &mut self.viewport,
                 &mut self.sixel_grid,
                 &mut self.kitty_grid,
+                &mut self.line_index,
                 1,
                 self.width,
             );
-            self.apply_scrollback_display_row_delta(display_row_delta);
             self.kitty_reanchor_all_from_pixels();
 
             self.selection.move_down(1);
@@ -1814,19 +1802,13 @@ impl Grid {
                 line_to_push_up.canonical()
             };
 
-            let evicted_row_width = bounded_push(
+            bounded_push(
                 &mut self.lines_above,
                 &mut self.sixel_grid,
                 &mut self.kitty_grid,
                 line_to_push_up,
+                &mut self.line_index,
             );
-            let mut display_row_delta = 1;
-            if let Some(evicted_row_width) = evicted_row_width {
-                let width = self.width;
-                display_row_delta +=
-                    evicted_row_display_row_delta(&mut self.lines_above, evicted_row_width, width);
-            }
-            self.apply_scrollback_display_row_delta(display_row_delta);
 
             transfer_rows_from_lines_below_to_viewport(
                 &mut self.lines_below,
@@ -1854,16 +1836,43 @@ impl Grid {
     }
     pub fn force_change_size(&mut self, new_rows: usize, new_columns: usize) {
         self.resize_and_reflow(new_rows, new_columns, true);
+        self.finish_display_row_recount();
     }
-    fn apply_scrollback_display_row_delta(&mut self, delta: isize) {
-        self.scrollback_display_rows = self.scrollback_display_rows.saturating_add_signed(delta);
+    /// The oldest line still needs a summary, so a reader must not treat the
+    /// published length as the post-resize total yet.
+    pub(crate) fn display_recount_pending(&self) -> bool {
+        !self.line_index.is_fully_measured()
     }
-    fn recount_scrollback_display_rows(&mut self, new_columns: usize) {
-        self.scrollback_display_rows =
-            scrollback_display_row_count(&mut self.lines_above, new_columns);
+    /// Measure at most one budgeted chunk of scrollback. Returns true when
+    /// every line has been measured and the published length is exact.
+    pub(crate) fn continue_display_row_recount(&mut self) -> bool {
+        if !self.line_index.is_fully_measured()
+            && self.line_index.measure_next(
+                &self.lines_above,
+                MeasureBudget::new(DISPLAY_RECOUNT_ROWS, DISPLAY_RECOUNT_CELLS),
+            ) == MeasureProgress::Pending
+        {
+            return false;
+        }
+        self.line_index.is_fully_measured()
+    }
+    /// Finish a resize recount on the calling thread. Callers that read the
+    /// length immediately, including grid tests, use this. The screen thread
+    /// uses [`Self::continue_display_row_recount`] one budget at a time.
+    pub(crate) fn finish_display_row_recount(&mut self) {
+        if !self.line_index.is_fully_measured() {
+            self.line_index.measure_all(&self.lines_above);
+        }
+    }
+    /// Resize without scanning the whole scrollback. One recount quantum runs
+    /// inside [`Self::resize_and_reflow`]; the screen thread continues the rest.
+    pub(crate) fn resize_keeping_recount_open(&mut self, new_rows: usize, new_columns: usize) {
+        self.resize_and_reflow(new_rows, new_columns, false);
+        self.note_change();
     }
     pub fn change_size(&mut self, new_rows: usize, new_columns: usize) {
         self.resize_and_reflow(new_rows, new_columns, false);
+        self.finish_display_row_recount();
         self.note_change();
     }
     pub fn note_change(&mut self) {
@@ -1969,6 +1978,10 @@ impl Grid {
             }
 
             self.viewport = VecDeque::from(new_viewport_rows);
+            // The viewport drain may have taken a tail from `lines_above`,
+            // and the width is changing. Rebuild grouping before the
+            // transfers below update the index one row at a time.
+            self.line_index.regroup(&self.lines_above, new_columns);
 
             let cursor_line_first_y =
                 self.canonical_line_y_coordinates(cursor_canonical_line_index);
@@ -2065,6 +2078,7 @@ impl Grid {
                         &mut self.viewport,
                         &mut self.sixel_grid,
                         &mut self.kitty_grid,
+                        &mut self.line_index,
                         row_count_to_transfer,
                         new_columns,
                     );
@@ -2093,8 +2107,8 @@ impl Grid {
                         &mut self.lines_above,
                         &mut self.sixel_grid,
                         &mut self.kitty_grid,
+                        &mut self.line_index,
                         row_count_to_transfer,
-                        new_columns,
                     );
                 },
                 Ordering::Equal => {},
@@ -2118,7 +2132,12 @@ impl Grid {
         self.kitty_reproject_all_from_anchor();
         self.height = new_rows;
         self.width = new_columns;
-        self.recount_scrollback_display_rows(new_columns);
+        // One quantum here. `change_size` finishes the rest for callers that
+        // read the length immediately; the screen thread continues a pane
+        // resize one budget at a time.
+        if !self.line_index.is_fully_measured() {
+            let _ = self.continue_display_row_recount();
+        }
         self.set_scroll_region_to_viewport_size();
         self.search_results.selections.clear();
         self.search_viewport();
@@ -3032,7 +3051,7 @@ impl Grid {
     fn clear_lines_above(&mut self) {
         self.invalidate_scroll_offset();
         self.lines_above = VecDeque::new();
-        self.scrollback_display_rows = 0;
+        self.line_index.clear();
     }
 
     fn pad_current_line_until(&mut self, position: usize, pad_character: TerminalCharacter) {
@@ -3261,6 +3280,7 @@ impl Grid {
         }
         self.invalidate_scroll_offset();
         self.lines_above = VecDeque::new();
+        self.line_index.clear();
         self.lines_below = VecDeque::new();
         self.is_scrolled = false;
         self.viewport = VecDeque::from(vec![Row::with_capacity(self.width).canonical()]);
@@ -3277,7 +3297,6 @@ impl Grid {
         self.output_buffer.update_all_lines();
         self.changed_colors = None;
         self.search_results = Default::default();
-        self.scrollback_display_rows = 0;
         self.sixel_scrolling = false;
         self.mouse_mode = MouseMode::NoEncoding;
         self.mouse_tracking = MouseTracking::Off;
@@ -4327,16 +4346,14 @@ impl Grid {
     fn transfer_rows_to_lines_above(&mut self, count: usize) {
         self.invalidate_scroll_offset();
         self.kitty_settle_placements_below_the_viewport();
-        let width = self.width;
-        let display_row_delta = transfer_rows_from_viewport_to_lines_above(
+        transfer_rows_from_viewport_to_lines_above(
             &mut self.viewport,
             &mut self.lines_above,
             &mut self.sixel_grid,
             &mut self.kitty_grid,
+            &mut self.line_index,
             count,
-            width,
         );
-        self.apply_scrollback_display_row_delta(display_row_delta);
         self.kitty_reanchor_all_from_pixels();
     }
     fn move_cursor_down_by_pixels(&mut self, pixel_count: usize) {
@@ -4959,9 +4976,9 @@ impl Grid {
     pub fn delete_viewport_and_scroll(&mut self) {
         self.invalidate_scroll_offset();
         self.lines_above = VecDeque::new();
+        self.line_index.clear();
         self.viewport.clear();
         self.lines_below = VecDeque::new();
-        self.scrollback_display_rows = 0;
     }
     pub fn reset_cursor_position(&mut self) {
         self.cursor = Cursor::new(0, 0, self.styled_underlines);
@@ -6127,6 +6144,7 @@ impl Handler for Grid {
                             // enter alternate buffer
                             let current_lines_above =
                                 std::mem::replace(&mut self.lines_above, VecDeque::new());
+                            self.line_index.clear();
                             let current_viewport = std::mem::replace(
                                 &mut self.viewport,
                                 VecDeque::from(vec![Row::new().canonical()]),
@@ -6161,7 +6179,6 @@ impl Handler for Grid {
                             self.shell_reports
                                 .push(crate::attention::signals::PaneSignal::AlternateScreen(true));
                             self.clear_viewport_before_rendering = true;
-                            self.scrollback_display_rows = 0;
                             self.output_buffer.update_all_lines(); // make sure the screen gets cleared in the next render
                         },
                         1 => {
@@ -6931,6 +6948,11 @@ impl Row {
             width += terminal_character.width();
         }
         width
+    }
+    /// Stored cells, including compressed trailing blanks. The count is
+    /// invariant under compress and expand.
+    pub fn stored_cell_count(&self) -> usize {
+        self.columns.len() + self.trailing_blanks as usize
     }
     pub fn compress_trailing_blanks(&mut self) {
         let mut kept = self.columns.len();

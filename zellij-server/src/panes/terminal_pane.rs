@@ -1573,6 +1573,12 @@ impl Pane for TerminalPane {
     fn mirror_change_counter(&self) -> u64 {
         self.grid.change_counter
     }
+    fn display_recount_pending(&self) -> bool {
+        self.grid.display_recount_pending()
+    }
+    fn continue_display_row_recount(&mut self) -> bool {
+        self.grid.continue_display_row_recount()
+    }
 }
 
 impl TerminalPane {
@@ -1741,7 +1747,11 @@ impl TerminalPane {
         if (self.grid.height, self.grid.width) != (rows, cols) {
             self.program_resized_at = Some(Instant::now());
         }
-        self.grid.change_size(rows, cols);
+        // One recount quantum in this call. The screen loop continues the
+        // rest, so a resize does not scan the whole scrollback before the
+        // next pane can run. `Grid::change_size` still finishes, for callers
+        // that read the length immediately.
+        self.grid.resize_keeping_recount_open(rows, cols);
         if self.banner.is_some() {
             self.grid.reset_terminal_state();
             self.render_first_run_banner();

@@ -10353,6 +10353,51 @@ fn sixel_image_in_a_wrapped_line_survives_a_resize() {
 }
 
 #[test]
+fn scrollback_length_does_not_split_wide_characters() {
+    let mut grid = create_grid_with_size_and_raw(2, 3, "界界界".as_bytes());
+    feed_bytes(&mut grid, b"\r\nA\r\nB");
+    assert!(
+        !grid.lines_above.is_empty(),
+        "the wide line must leave the viewport"
+    );
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        3,
+        "three wide characters at width 3 each need their own display row"
+    );
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        scrollback_recount(&mut grid)
+    );
+}
+
+#[test]
+fn display_row_recount_is_bounded_and_then_converges() {
+    let mut grid = create_grid_with_size_and_raw(5, 10, b"");
+    let mut content = Vec::new();
+    for _ in 0..500 {
+        content.extend_from_slice(b"0123456789\r\n");
+    }
+    feed_bytes(&mut grid, &content);
+    grid.resize_keeping_recount_open(5, 7);
+    assert!(
+        grid.display_recount_pending(),
+        "one quantum must not scan a 500-line scrollback"
+    );
+    assert!(!grid.continue_display_row_recount());
+    let mut turns = 0;
+    while grid.display_recount_pending() {
+        turns += 1;
+        assert!(turns < 50, "recount did not converge");
+        let _ = grid.continue_display_row_recount();
+    }
+    assert_eq!(
+        grid.scrollback_position_and_length().1,
+        scrollback_recount(&mut grid)
+    );
+}
+
+#[test]
 fn scrollback_length_counts_display_rows_after_a_narrowing_resize() {
     let (mut grid, _texts_before, _canonical_before) = grid_with_wrapped_line_in_scrollback();
     assert_eq!(grid.scrollback_position_and_length().1, 5);
