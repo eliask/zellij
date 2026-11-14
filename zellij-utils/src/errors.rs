@@ -365,6 +365,7 @@ pub enum ScreenContext {
     SearchToggleCaseSensitivity,
     SearchToggleWholeWord,
     SearchToggleWrap,
+    ContinuePendingSearch,
     AddRedPaneFrameColorOverride,
     ClearPaneFrameColorOverride,
     SetTabBellFlash,

@@ -991,6 +991,14 @@ pub trait Pane {
     fn clear_search(&mut self) {
         // No-op by default (only terminal-panes currently have search capability)
     }
+    /// True when a search scan stopped at the row quantum.
+    fn has_pending_search(&self) -> bool {
+        false
+    }
+    /// Run one quantum of a paused search. Returns true when it is still pending.
+    fn continue_pending_search(&mut self) -> bool {
+        false
+    }
     fn is_alternate_mode_active(&self) -> bool {
         // False by default (only terminal-panes support alternate mode)
         false
@@ -8238,6 +8246,28 @@ impl Tab {
         if let Some(active_pane) = self.get_active_pane_or_floating_pane_mut(client_id) {
             active_pane.search_up();
         }
+    }
+
+    pub(crate) fn has_pending_search(&self) -> bool {
+        self.get_all_pane_ids().into_iter().any(|pane_id| {
+            self.get_pane_with_id(pane_id)
+                .is_some_and(|pane| pane.has_pending_search())
+        })
+    }
+
+    /// One quantum for every pane that still has a paused search.
+    /// Returns true when at least one scan is still pending.
+    pub(crate) fn continue_pending_searches(&mut self) -> bool {
+        let pane_ids = self.get_all_pane_ids();
+        let mut still_pending = false;
+        for pane_id in pane_ids {
+            if let Some(pane) = self.get_pane_with_id_mut(pane_id) {
+                if pane.continue_pending_search() {
+                    still_pending = true;
+                }
+            }
+        }
+        still_pending
     }
 
     pub fn toggle_search_case_sensitivity(&mut self, client_id: ClientId) {

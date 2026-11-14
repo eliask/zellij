@@ -1204,6 +1204,17 @@ impl Pane for TerminalPane {
         self.grid.search_up();
         self.set_should_render(true);
     }
+    fn has_pending_search(&self) -> bool {
+        self.grid.pending_search.is_some()
+    }
+    fn continue_pending_search(&mut self) -> bool {
+        if self.grid.pending_search.is_none() {
+            return false;
+        }
+        let still_pending = self.grid.continue_pending_search();
+        self.set_should_render(true);
+        still_pending
+    }
     fn toggle_search_case_sensitivity(&mut self) {
         self.grid.toggle_search_case_sensitivity();
         self.set_should_render(true);

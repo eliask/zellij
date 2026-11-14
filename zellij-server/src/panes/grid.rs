@@ -38,6 +38,15 @@ use zellij_utils::{
 const TABSTOP_WIDTH: usize = 8; // TODO: is this always right?
 pub const MAX_TITLE_STACK_SIZE: usize = 1000;
 pub const MAX_TITLE_BYTES: usize = 4096;
+
+/// Whether a viewport step moved, separate from whether that step found a hit.
+/// A search that only watches the boolean hit flag loops when the viewport
+/// cannot move.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ScrollResult {
+    pub moved: bool,
+    pub found_something: bool,
+}
 const MAX_XTGETTCAP_BYTES: usize = 4096;
 const MAX_NESTED_FRAME_BYTES: usize = 1_048_576;
 
@@ -264,7 +273,7 @@ use crate::panes::alacritty_functions::{parse_number, xparse_color};
 use crate::panes::grapheme_join;
 use crate::panes::hyperlink_tracker;
 use crate::panes::link_handler::LinkHandler;
-use crate::panes::search::SearchResult;
+use crate::panes::search::{PendingSearch, SearchResult};
 use crate::panes::terminal_character::{
     AnsiCode, CharsetIndex, Cursor, CursorShape, RcCharacterStyles, StandardCharset, StyleCache,
     TerminalCharacter, EMPTY_TERMINAL_CHARACTER,
@@ -1015,6 +1024,8 @@ pub struct Grid {
     /// `pending_messages_to_pty` for this pane.
     pub color_palette_notification_enabled: bool,
     pub search_results: SearchResult,
+    /// A search that stopped at the row quantum and must continue or be cancelled.
+    pub(crate) pending_search: Option<PendingSearch>,
     pub pending_clipboard_update: Option<String>,
     pub pending_osc7_cwd: Option<std::path::PathBuf>,
     pub pending_prompt_return: bool,
@@ -1407,6 +1418,7 @@ impl Grid {
             color_palette_notification_enabled: false,
             character_cell_size,
             search_results: Default::default(),
+            pending_search: None,
             sixel_grid,
             kitty_grid,
             kitty_parser: KittyCommandParser::new(),
@@ -1769,10 +1781,15 @@ impl Grid {
         }
     }
 
-    pub fn scroll_up_one_line(&mut self) -> bool {
-        let mut found_something = false;
-        if !self.lines_above.is_empty() && self.viewport.len() == self.height {
+    pub(super) fn scroll_up_one_line_with_progress(&mut self) -> ScrollResult {
+        let mut result = ScrollResult::default();
+        // height == 0 makes len == height on an empty viewport. Do not pop.
+        if !self.lines_above.is_empty()
+            && self.viewport.len() == self.height
+            && !self.viewport.is_empty()
+        {
             self.is_scrolled = true;
+            result.moved = true;
             let line_to_push_down = self.viewport.pop_back().unwrap();
             self.lines_below.push_front(line_to_push_down);
 
@@ -1792,19 +1809,26 @@ impl Grid {
                 command_output_flash.move_down(1);
             }
             // Move all search-selections down one line as well
-            found_something = self
-                .search_results
-                .move_down(1, &self.viewport, self.height);
+            result.found_something = self.search_results.move_down(
+                1,
+                &self.viewport,
+                self.lines_above.back(),
+                self.height,
+            );
         }
         self.output_buffer.update_all_lines();
-        found_something
+        result
     }
-    pub fn scroll_down_one_line(&mut self) -> bool {
-        let mut found_something = false;
+    pub fn scroll_up_one_line(&mut self) -> bool {
+        self.scroll_up_one_line_with_progress().found_something
+    }
+    pub(super) fn scroll_down_one_line_with_progress(&mut self) -> ScrollResult {
+        let mut result = ScrollResult::default();
         if !self.lines_below.is_empty()
             && self.viewport.len() == self.height
             && !self.viewport.is_empty()
         {
+            result.moved = true;
             let line_to_push_up = self.viewport.pop_front().unwrap();
 
             let line_to_push_up = if line_to_push_up.is_canonical || !self.lines_above.is_empty() {
@@ -1841,16 +1865,47 @@ impl Grid {
                 command_output_flash.move_up(1);
             }
             // Move all search-selections up one line as well
-            found_something =
-                self.search_results
-                    .move_up(1, &self.viewport, &self.lines_below, self.height);
+            result.found_something = self.search_results.move_up(
+                1,
+                &self.viewport,
+                &self.lines_below,
+                self.lines_above.back(),
+                self.height,
+            );
             self.output_buffer.update_all_lines();
         }
         if self.lines_below.is_empty() {
             self.is_scrolled = false;
             self.lines_below.shrink_to_fit();
         }
-        found_something
+        result
+    }
+    pub fn scroll_down_one_line(&mut self) -> bool {
+        self.scroll_down_one_line_with_progress().found_something
+    }
+    /// Move up to `count` rows toward older scrollback. Stops when a step
+    /// does not move the viewport.
+    pub(super) fn scroll_up_rows(&mut self, count: usize) -> usize {
+        let mut moved = 0;
+        while moved < count {
+            if !self.scroll_up_one_line_with_progress().moved {
+                break;
+            }
+            moved += 1;
+        }
+        moved
+    }
+    /// Move up to `count` rows toward newer output. Stops when a step does
+    /// not move the viewport.
+    pub(super) fn scroll_down_rows(&mut self, count: usize) -> usize {
+        let mut moved = 0;
+        while moved < count {
+            if !self.scroll_down_one_line_with_progress().moved {
+                break;
+            }
+            moved += 1;
+        }
+        moved
     }
     pub fn force_change_size(&mut self, new_rows: usize, new_columns: usize) {
         self.resize_and_reflow(new_rows, new_columns, true);
@@ -1877,6 +1932,8 @@ impl Grid {
         if new_columns == 0 || new_rows == 0 {
             return;
         }
+        // Reflow invalidates the coordinates a paused scan would resume from.
+        self.pending_search = None;
         self.invalidate_scroll_offset();
         if self.alternate_screen_state.is_some() {
             // in alternate screen we do nothing but log the new size, the program in the terminal
@@ -2539,6 +2596,8 @@ impl Grid {
         self.output_buffer.update_all_lines();
     }
     pub fn reset_viewport(&mut self) {
+        // Jumping to the live bottom drops the scan's undo distance.
+        self.pending_search = None;
         let max_lines_to_scroll = *SCROLL_BUFFER_SIZE.get().unwrap() * 2; // while not very elegant, this can prevent minor bugs from becoming showstoppers by sticking the whole app display in an endless loop
         let mut lines_scrolled = 0;
         let should_clear_output_buffer = self.is_scrolled;
@@ -3276,6 +3335,7 @@ impl Grid {
         self.cursor.change_shape(CursorShape::Initial);
         self.output_buffer.update_all_lines();
         self.changed_colors = None;
+        self.pending_search = None;
         self.search_results = Default::default();
         self.scrollback_display_rows = 0;
         self.sixel_scrolling = false;
@@ -6931,6 +6991,12 @@ impl Row {
             width += terminal_character.width();
         }
         width
+    }
+    /// Glyphs plus blanks compressed out of `columns`. The count is stable
+    /// across compress and expand, so a search can see a trailing space that
+    /// is no longer stored as a cell.
+    pub fn stored_cell_count(&self) -> usize {
+        self.columns.len() + self.trailing_blanks as usize
     }
     pub fn compress_trailing_blanks(&mut self) {
         let mut kept = self.columns.len();

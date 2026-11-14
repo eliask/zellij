@@ -11577,3 +11577,106 @@ fn oversized_xtgettcap_request_is_dropped() {
     vte_parser.feed(&mut grid, &sequence);
     assert!(grid.pending_messages_to_pty.is_empty());
 }
+
+#[test]
+fn search_stops_when_viewport_cannot_scroll() {
+    use zellij_utils::input::actions::SearchDirection;
+
+    let mut grid = create_grid_with_scrollback();
+    grid.scroll_up_one_line();
+    assert!(grid.is_scrolled);
+
+    grid.height += 1;
+
+    assert_eq!(
+        grid.search_viewport_move(SearchDirection::Down),
+        Some(false)
+    );
+}
+
+#[test]
+fn setting_a_search_string_keeps_a_paused_upward_scan() {
+    let mut grid = create_grid_with_size_and_raw(4, 20, b"");
+    let mut lines = Vec::new();
+    for index in 0..400 {
+        if index == 5 {
+            lines.extend_from_slice(b"NEEDLE\r\n");
+        } else {
+            lines.extend_from_slice(format!("line-{index}\r\n").as_bytes());
+        }
+    }
+    feed_bytes(&mut grid, &lines);
+    grid.set_search_string("NEEDLE");
+    assert!(
+        grid.pending_search.is_some(),
+        "the upward scan should still be in progress"
+    );
+    let mut guard = 0;
+    while grid.pending_search.is_some() {
+        grid.continue_pending_search();
+        guard += 1;
+        assert!(guard < 100, "search did not finish");
+    }
+    assert!(!grid.search_results.selections.is_empty());
+    assert!(grid.dump_screen(false).contains("NEEDLE"));
+}
+
+#[test]
+fn a_paused_upward_search_tries_downward_when_it_finds_nothing() {
+    let mut grid = create_grid_with_size_and_raw(4, 20, b"");
+    let mut lines = Vec::new();
+    for index in 0..400 {
+        if index == 350 {
+            lines.extend_from_slice(b"LOWER-NEEDLE\r\n");
+        } else {
+            lines.extend_from_slice(format!("line-{index}\r\n").as_bytes());
+        }
+    }
+    feed_bytes(&mut grid, &lines);
+    grid.scroll_up_rows(250);
+    grid.set_search_string("LOWER-NEEDLE");
+    assert!(grid.pending_search.is_some());
+    let mut guard = 0;
+    while grid.pending_search.is_some() {
+        grid.continue_pending_search();
+        guard += 1;
+        assert!(guard < 100, "search did not finish");
+    }
+    assert!(!grid.search_results.selections.is_empty());
+    assert!(grid.dump_screen(false).contains("LOWER-NEEDLE"));
+}
+
+#[test]
+fn a_paused_search_is_cancelled_by_clear_resize_and_case_toggle() {
+    let mut grid = create_grid_with_size_and_raw(4, 20, b"");
+    let mut lines = Vec::new();
+    for index in 0..400 {
+        if index == 5 {
+            lines.extend_from_slice(b"NEEDLE\r\n");
+        } else {
+            lines.extend_from_slice(format!("line-{index}\r\n").as_bytes());
+        }
+    }
+    feed_bytes(&mut grid, &lines);
+
+    grid.set_search_string("NEEDLE");
+    assert!(grid.pending_search.is_some());
+    grid.clear_search();
+    assert!(grid.pending_search.is_none());
+
+    grid.set_search_string("NEEDLE");
+    assert!(grid.pending_search.is_some());
+    grid.toggle_search_case_sensitivity();
+    assert!(
+        grid.pending_search.is_none(),
+        "changing the search mode left the old scan running"
+    );
+
+    grid.set_search_string("NEEDLE");
+    assert!(grid.pending_search.is_some());
+    grid.change_size(4, 20);
+    assert!(
+        grid.pending_search.is_none(),
+        "resize left a scan whose coordinates were invalidated"
+    );
+}

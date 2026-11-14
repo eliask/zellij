@@ -700,6 +700,8 @@ pub enum ScreenInstruction {
     SearchToggleCaseSensitivity(ClientId, Option<NotificationEnd>),
     SearchToggleWholeWord(ClientId, Option<NotificationEnd>),
     SearchToggleWrap(ClientId, Option<NotificationEnd>),
+    /// Continue searches that stopped at the row quantum.
+    ContinuePendingSearch,
     AddRedPaneFrameColorOverride(Vec<PaneId>, Option<String>), // Option<String> => optional error text
     ClearPaneFrameColorOverride(Vec<PaneId>),
     SetTabBellFlash(usize, bool), // tab_id, is_flashing
@@ -1454,6 +1456,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             },
             ScreenInstruction::SearchToggleWholeWord(..) => ScreenContext::SearchToggleWholeWord,
             ScreenInstruction::SearchToggleWrap(..) => ScreenContext::SearchToggleWrap,
+            ScreenInstruction::ContinuePendingSearch => ScreenContext::ContinuePendingSearch,
             ScreenInstruction::AddRedPaneFrameColorOverride(..) => {
                 ScreenContext::AddRedPaneFrameColorOverride
             },
@@ -6186,6 +6189,15 @@ impl Screen {
 
     pub fn get_tabs(&self) -> &BTreeMap<usize, Tab> {
         &self.tabs
+    }
+
+    fn schedule_pending_search(&self) {
+        if self.tabs.values().any(|tab| tab.has_pending_search()) {
+            let _ = self
+                .bus
+                .senders
+                .send_to_screen(ScreenInstruction::ContinuePendingSearch);
+        }
     }
 
     /// Returns an immutable reference to this [`Screen`]'s active [`Tab`].
@@ -13375,6 +13387,7 @@ pub(crate) fn screen_thread_main(
                     client_id,
                     |tab: &mut Tab, client_id: ClientId| tab.update_search_term(c, client_id), ?
                 );
+                screen.schedule_pending_search();
                 screen.render(None)?;
             },
             ScreenInstruction::SearchDown(
@@ -13387,6 +13400,7 @@ pub(crate) fn screen_thread_main(
                     client_id,
                     |tab: &mut Tab, client_id: ClientId| tab.search_down(client_id)
                 );
+                screen.schedule_pending_search();
                 screen.render(None)?;
             },
             ScreenInstruction::SearchUp(
@@ -13399,6 +13413,7 @@ pub(crate) fn screen_thread_main(
                     client_id,
                     |tab: &mut Tab, client_id: ClientId| tab.search_up(client_id)
                 );
+                screen.schedule_pending_search();
                 screen.render(None)?;
             },
             ScreenInstruction::SearchToggleCaseSensitivity(
@@ -13412,6 +13427,7 @@ pub(crate) fn screen_thread_main(
                     |tab: &mut Tab, client_id: ClientId| tab
                         .toggle_search_case_sensitivity(client_id)
                 );
+                screen.schedule_pending_search();
                 screen.render(None)?;
             },
             ScreenInstruction::SearchToggleWrap(
@@ -13424,6 +13440,7 @@ pub(crate) fn screen_thread_main(
                     client_id,
                     |tab: &mut Tab, client_id: ClientId| tab.toggle_search_wrap(client_id)
                 );
+                screen.schedule_pending_search();
                 screen.render(None)?;
             },
             ScreenInstruction::SearchToggleWholeWord(
@@ -13436,6 +13453,22 @@ pub(crate) fn screen_thread_main(
                     client_id,
                     |tab: &mut Tab, client_id: ClientId| tab.toggle_search_whole_words(client_id)
                 );
+                screen.schedule_pending_search();
+                screen.render(None)?;
+            },
+            ScreenInstruction::ContinuePendingSearch => {
+                let mut still_pending = false;
+                for tab in screen.get_tabs_mut().values_mut() {
+                    if tab.continue_pending_searches() {
+                        still_pending = true;
+                    }
+                }
+                if still_pending {
+                    let _ = screen
+                        .bus
+                        .senders
+                        .send_to_screen(ScreenInstruction::ContinuePendingSearch);
+                }
                 screen.render(None)?;
             },
             ScreenInstruction::AddRedPaneFrameColorOverride(pane_ids, error_text) => {
