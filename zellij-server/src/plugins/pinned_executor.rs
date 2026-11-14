@@ -2,12 +2,178 @@ use crate::plugins::plugin_map::PluginMap;
 use crate::plugins::wasm_bridge::PluginCache;
 use crate::ClientId;
 use crate::ThreadSenders;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use wasmi::Engine;
+
+/// `Ordered` work keeps its place in the queue. `Replaceable` work with the
+/// same owner and key overwrites a pending payload only while that payload is
+/// still the newest job for the owner. An ordered job in between is a barrier,
+/// so newer state cannot jump ahead of input that was submitted before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobClass {
+    Ordered,
+    Replaceable(u64),
+}
+
+type PluginWork = Box<
+    dyn FnOnce(ThreadSenders, Arc<Mutex<PluginMap>>, Arc<Mutex<Vec<ClientId>>>, PluginCache, Engine)
+        + Send
+        + 'static,
+>;
+
+enum Job {
+    Work { owner: u32, work: PluginWork },
+    Coalesced { slot: Arc<Mutex<CoalesceSlot>> },
+    Shutdown,
+}
+
+struct CoalesceSlot {
+    owner: u32,
+    sequence: u64,
+    work: Option<PluginWork>,
+}
+
+struct ThreadQueueState {
+    jobs: VecDeque<Job>,
+    shutdown: bool,
+    coalesced: HashMap<(u32, u64), Weak<Mutex<CoalesceSlot>>>,
+    next_sequence: u64,
+    last_sequence: HashMap<u32, u64>,
+    owner_jobs: HashMap<u32, usize>,
+}
+
+struct ThreadQueue {
+    state: Mutex<ThreadQueueState>,
+    wake: Condvar,
+    jobs_in_flight: Arc<AtomicUsize>,
+}
+
+impl ThreadQueue {
+    fn new(jobs_in_flight: Arc<AtomicUsize>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ThreadQueueState {
+                jobs: VecDeque::new(),
+                shutdown: false,
+                coalesced: HashMap::new(),
+                next_sequence: 0,
+                last_sequence: HashMap::new(),
+                owner_jobs: HashMap::new(),
+            }),
+            wake: Condvar::new(),
+            jobs_in_flight,
+        })
+    }
+
+    fn enqueue(&self, owner: u32, class: JobClass, work: PluginWork) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.shutdown {
+            return false;
+        }
+        let sequence = state.next_sequence.wrapping_add(1);
+        if let JobClass::Replaceable(key) = class {
+            let existing = state
+                .coalesced
+                .get(&(owner, key))
+                .and_then(|slot| slot.upgrade());
+            if let Some(slot) = existing {
+                let mut slot = slot.lock().unwrap();
+                let still_latest = state.last_sequence.get(&owner).copied() == Some(slot.sequence);
+                if still_latest && slot.work.is_some() {
+                    let replaced = std::mem::replace(&mut slot.work, Some(work));
+                    slot.sequence = sequence;
+                    state.next_sequence = sequence;
+                    state.last_sequence.insert(owner, sequence);
+                    drop(slot);
+                    drop(state);
+                    drop(replaced);
+                    return true;
+                }
+            }
+            let slot = Arc::new(Mutex::new(CoalesceSlot {
+                owner,
+                sequence,
+                work: Some(work),
+            }));
+            state.coalesced.insert((owner, key), Arc::downgrade(&slot));
+            state.next_sequence = sequence;
+            state.last_sequence.insert(owner, sequence);
+            *state.owner_jobs.entry(owner).or_insert(0) += 1;
+            state.jobs.push_back(Job::Coalesced { slot });
+        } else {
+            state.next_sequence = sequence;
+            state.last_sequence.insert(owner, sequence);
+            *state.owner_jobs.entry(owner).or_insert(0) += 1;
+            state.jobs.push_back(Job::Work { owner, work });
+        }
+        self.jobs_in_flight.fetch_add(1, Ordering::SeqCst);
+        self.wake.notify_one();
+        true
+    }
+
+    fn complete(&self, owner: u32) {
+        let mut state = self.state.lock().unwrap();
+        let left = state
+            .owner_jobs
+            .get_mut(&owner)
+            .map(|count| {
+                *count = count.saturating_sub(1);
+                *count
+            })
+            .unwrap_or(0);
+        if left == 0 {
+            state.owner_jobs.remove(&owner);
+            state.last_sequence.remove(&owner);
+            state
+                .coalesced
+                .retain(|(entry_owner, _), _| *entry_owner != owner);
+        }
+        self.jobs_in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn request_shutdown(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !state.shutdown {
+            state.shutdown = true;
+            state.jobs.push_back(Job::Shutdown);
+        }
+        self.wake.notify_all();
+    }
+
+    fn next_job(queue: &Arc<ThreadQueue>) -> Option<Job> {
+        let mut state = queue.state.lock().unwrap();
+        loop {
+            if let Some(job) = state.jobs.pop_front() {
+                return Some(job);
+            }
+            if state.shutdown {
+                return None;
+            }
+            state = queue.wake.wait(state).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    fn owner_jobs(&self, owner: u32) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .owner_jobs
+            .get(&owner)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+struct DeadOnDrop(Arc<AtomicBool>);
+
+impl Drop for DeadOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 /// A dynamic thread pool that pins jobs to specific threads based on plugin_id
 /// Starts with 1 thread and expands when threads are busy, shrinks when plugins unload
@@ -36,24 +202,9 @@ pub struct PinnedExecutor {
 }
 
 struct ExecutionThread {
-    sender: Sender<Job>,
+    queue: Arc<ThreadQueue>,
     jobs_in_flight: Arc<AtomicUsize>, // Busy state tracking
-}
-
-enum Job {
-    Work(
-        Box<
-            dyn FnOnce(
-                    ThreadSenders,
-                    Arc<Mutex<PluginMap>>,
-                    Arc<Mutex<Vec<ClientId>>>,
-                    PluginCache,
-                    Engine,
-                ) + Send
-                + 'static,
-        >,
-    ),
-    Shutdown, // Signal to exit the worker loop
+    alive: Arc<AtomicBool>,
 }
 
 impl PinnedExecutor {
@@ -100,22 +251,34 @@ impl PinnedExecutor {
         plugin_cache: PluginCache,
         engine: Engine,
     ) -> ExecutionThread {
-        let (sender, receiver) = channel::<Job>();
         let jobs_in_flight = Arc::new(AtomicUsize::new(0));
-        let jobs_in_flight_clone = jobs_in_flight.clone();
+        let queue = ThreadQueue::new(jobs_in_flight.clone());
+        let alive = Arc::new(AtomicBool::new(true));
+        let worker_queue = queue.clone();
+        let worker_alive = alive.clone();
 
         let thread_handle = thread::Builder::new()
             .name(format!("plugin-exec-{}", thread_idx))
-            .spawn({
-                move || {
-                    let senders = senders;
-                    let plugin_map = plugin_map;
-                    let connected_clients = connected_clients;
-                    let plugin_cache = plugin_cache;
-                    let engine = engine;
-                    while let Ok(job) = receiver.recv() {
-                        match job {
-                            Job::Work(work) => {
+            .spawn(move || {
+                let _dead = DeadOnDrop(worker_alive);
+                while let Some(job) = ThreadQueue::next_job(&worker_queue) {
+                    match job {
+                        Job::Work { owner, work } => {
+                            work(
+                                senders.clone(),
+                                plugin_map.clone(),
+                                connected_clients.clone(),
+                                plugin_cache.clone(),
+                                engine.clone(),
+                            );
+                            worker_queue.complete(owner);
+                        },
+                        Job::Coalesced { slot } => {
+                            let (owner, work) = {
+                                let mut slot = slot.lock().unwrap();
+                                (slot.owner, slot.work.take())
+                            };
+                            if let Some(work) = work {
                                 work(
                                     senders.clone(),
                                     plugin_map.clone(),
@@ -123,20 +286,23 @@ impl PinnedExecutor {
                                     plugin_cache.clone(),
                                     engine.clone(),
                                 );
-                                jobs_in_flight_clone.fetch_sub(1, Ordering::SeqCst);
-                            },
-                            Job::Shutdown => break,
-                        }
+                            }
+                            worker_queue.complete(owner);
+                        },
+                        Job::Shutdown => break,
                     }
                 }
             });
         if let Err(e) = thread_handle {
             log::error!("Failed to spawn plugin execution thread: {}", e);
+            alive.store(false, Ordering::SeqCst);
+            queue.request_shutdown();
         }
 
         ExecutionThread {
-            sender,
+            queue,
             jobs_in_flight,
+            alive,
         }
     }
 
@@ -234,7 +400,22 @@ impl PinnedExecutor {
             ) + Send
             + 'static,
     {
-        // Look up assigned thread
+        self.execute_for_plugin_with(plugin_id, JobClass::Ordered, f);
+    }
+
+    /// Queue work on the plugin's thread. Replaceable work may overwrite a
+    /// still-pending payload with the same key; ordered work never does.
+    pub fn execute_for_plugin_with<F>(&self, plugin_id: u32, class: JobClass, f: F)
+    where
+        F: FnOnce(
+                ThreadSenders,
+                Arc<Mutex<PluginMap>>,
+                Arc<Mutex<Vec<ClientId>>>,
+                PluginCache,
+                Engine,
+            ) + Send
+            + 'static,
+    {
         let thread_idx = {
             let assignments = self.plugin_assignments.lock().unwrap();
             assignments.get(&plugin_id).copied()
@@ -244,22 +425,19 @@ impl PinnedExecutor {
             return;
         };
 
-        // Get thread and mark as busy
-        let threads = self.execution_threads.lock().unwrap();
-        let thread = threads[thread_idx].as_ref();
-        let Some(thread) = thread else {
-            log::error!("Failed to find thread for plugin with id: {}", plugin_id);
-            return;
+        let queue = {
+            let threads = self.execution_threads.lock().unwrap();
+            let Some(thread) = threads.get(thread_idx).and_then(|thread| thread.as_ref()) else {
+                log::error!("Failed to find thread for plugin with id: {}", plugin_id);
+                return;
+            };
+            if !thread.alive.load(Ordering::SeqCst) {
+                log::error!("Plugin executor thread {} has died", thread_idx);
+                return;
+            }
+            thread.queue.clone()
         };
-
-        // Increment busy counter BEFORE sending work
-        thread.jobs_in_flight.fetch_add(1, Ordering::SeqCst);
-
-        // Send work
-        let job = Job::Work(Box::new(f));
-        if let Err(_) = thread.sender.send(job) {
-            // Thread died unexpectedly - this is a critical error
-            thread.jobs_in_flight.fetch_sub(1, Ordering::SeqCst);
+        if !queue.enqueue(plugin_id, class, Box::new(f)) {
             log::error!("Plugin executor thread {} has died", thread_idx);
         }
     }
@@ -360,7 +538,7 @@ impl PinnedExecutor {
         // Shutdown and remove idle threads
         for idx in threads_to_remove {
             if let Some(thread) = threads[idx].take() {
-                let _ = thread.sender.send(Job::Shutdown);
+                thread.queue.request_shutdown();
             }
         }
     }
@@ -374,6 +552,20 @@ impl PinnedExecutor {
             .filter(|t| t.is_some())
             .count()
     }
+
+    #[cfg(test)]
+    fn owner_queued_jobs(&self, owner: u32) -> usize {
+        let assignments = self.plugin_assignments.lock().unwrap();
+        let Some(&thread_idx) = assignments.get(&owner) else {
+            return 0;
+        };
+        let threads = self.execution_threads.lock().unwrap();
+        threads
+            .get(thread_idx)
+            .and_then(|thread| thread.as_ref())
+            .map(|thread| thread.queue.owner_jobs(owner))
+            .unwrap_or(0)
+    }
 }
 
 impl Drop for PinnedExecutor {
@@ -383,7 +575,7 @@ impl Drop for PinnedExecutor {
         // Send shutdown to all threads
         for thread_opt in threads.iter_mut() {
             if let Some(thread) = thread_opt {
-                let _ = thread.sender.send(Job::Shutdown);
+                thread.queue.request_shutdown();
             }
         }
     }
@@ -1328,5 +1520,152 @@ mod tests {
         );
 
         drop(executor);
+    }
+
+    fn wait_for(mut condition: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !condition() {
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("timed out waiting for the plugin executor");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn block_plugin(executor: &Arc<PinnedExecutor>, plugin_id: u32) -> Sender<()> {
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let blocking_release = release_rx.clone();
+        executor.execute_for_plugin(plugin_id, move |_s, _p, _c, _ca, _e| {
+            started_tx.send(()).unwrap();
+            let _ = blocking_release.lock().unwrap().recv();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocking job should start");
+        release_tx
+    }
+
+    #[test]
+    fn replaceable_state_coalesces_to_the_latest_payload() {
+        let executor = create_test_executor(1);
+        executor.register_plugin(1);
+        let release = block_plugin(&executor, 1);
+
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        for value in 0..50u32 {
+            let executed = executed.clone();
+            executor.execute_for_plugin_with(
+                1,
+                JobClass::Replaceable(7),
+                move |_s, _p, _c, _ca, _e| executed.lock().unwrap().push(value),
+            );
+        }
+        assert_eq!(
+            executor.owner_queued_jobs(1),
+            2,
+            "only the blocked job and one pending replaceable slot should remain"
+        );
+
+        release.send(()).unwrap();
+        wait_for(|| executor.owner_queued_jobs(1) == 0);
+        assert_eq!(*executed.lock().unwrap(), vec![49]);
+    }
+
+    #[test]
+    fn coalescing_does_not_reorder_replaceable_state_past_ordered_work() {
+        let executor = create_test_executor(1);
+        executor.register_plugin(1);
+        let release = block_plugin(&executor, 1);
+
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let push = |executed: &Arc<Mutex<Vec<&'static str>>>, value| {
+            let executed = executed.clone();
+            move |_s: ThreadSenders,
+                  _p: Arc<Mutex<PluginMap>>,
+                  _c: Arc<Mutex<Vec<ClientId>>>,
+                  _ca: PluginCache,
+                  _e: Engine| executed.lock().unwrap().push(value)
+        };
+        executor.execute_for_plugin_with(1, JobClass::Replaceable(1), push(&executed, "state-a"));
+        executor.execute_for_plugin_with(1, JobClass::Ordered, push(&executed, "event"));
+        executor.execute_for_plugin_with(1, JobClass::Replaceable(1), push(&executed, "state-b"));
+
+        release.send(()).unwrap();
+        wait_for(|| executor.owner_queued_jobs(1) == 0);
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec!["state-a", "event", "state-b"]
+        );
+    }
+
+    #[test]
+    fn replaceable_keys_with_different_destinations_both_execute() {
+        let executor = create_test_executor(1);
+        executor.register_plugin(1);
+        let release = block_plugin(&executor, 1);
+
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let push = |executed: &Arc<Mutex<Vec<&'static str>>>, value| {
+            let executed = executed.clone();
+            move |_s: ThreadSenders,
+                  _p: Arc<Mutex<PluginMap>>,
+                  _c: Arc<Mutex<Vec<ClientId>>>,
+                  _ca: PluginCache,
+                  _e: Engine| executed.lock().unwrap().push(value)
+        };
+        executor.execute_for_plugin_with(
+            1,
+            JobClass::Replaceable(0x0200_0000_0000_000b),
+            push(&executed, "client-11"),
+        );
+        executor.execute_for_plugin_with(
+            1,
+            JobClass::Replaceable(0x0200_0000_0000_000c),
+            push(&executed, "client-12"),
+        );
+
+        release.send(()).unwrap();
+        wait_for(|| executor.owner_queued_jobs(1) == 0);
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec!["client-11", "client-12"],
+            "different destinations must not replace one another"
+        );
+    }
+
+    #[test]
+    fn replaceable_keys_from_different_generations_both_execute() {
+        let executor = create_test_executor(1);
+        executor.register_plugin(1);
+        let release = block_plugin(&executor, 1);
+
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let push = |executed: &Arc<Mutex<Vec<&'static str>>>, value| {
+            let executed = executed.clone();
+            move |_s: ThreadSenders,
+                  _p: Arc<Mutex<PluginMap>>,
+                  _c: Arc<Mutex<Vec<ClientId>>>,
+                  _ca: PluginCache,
+                  _e: Engine| executed.lock().unwrap().push(value)
+        };
+        executor.execute_for_plugin_with(
+            1,
+            JobClass::Replaceable(0x0200_0001_0000_000b),
+            push(&executed, "generation-1"),
+        );
+        executor.execute_for_plugin_with(
+            1,
+            JobClass::Replaceable(0x0200_0002_0000_000b),
+            push(&executed, "generation-2"),
+        );
+
+        release.send(()).unwrap();
+        wait_for(|| executor.owner_queued_jobs(1) == 0);
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec!["generation-1", "generation-2"]
+        );
     }
 }

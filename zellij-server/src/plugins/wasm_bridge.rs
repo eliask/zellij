@@ -1,3 +1,4 @@
+use super::pinned_executor::JobClass;
 use super::{PinnedExecutor, PluginId, PluginInstruction};
 use crate::global_async_runtime::get_tokio_runtime;
 use crate::plugins::pipes::{
@@ -81,6 +82,390 @@ fn make_plugin_url_path_safe(url: String) -> String {
 pub enum EventOrPipeMessage {
     Event(Event, Option<ClientId>),
     PipeMessage(PipeMessage, Option<ClientId>),
+}
+
+const MAX_PENDING_CACHE_ENTRIES_PER_PLUGIN: usize = 1024;
+const MAX_PENDING_CACHE_BYTES_PER_PLUGIN: usize = 4 * 1024 * 1024;
+const MAX_PENDING_CACHE_ENTRIES_TOTAL: usize = 4096;
+const MAX_PENDING_CACHE_BYTES_TOTAL: usize = 16 * 1024 * 1024;
+const PENDING_CACHE_ENTRY_OVERHEAD: usize = 64;
+
+#[derive(Debug, Default)]
+struct PendingPluginMessages {
+    entries: Vec<EventOrPipeMessage>,
+    bytes: usize,
+    /// A one-shot event could not be stored. The entries are not a complete history.
+    incomplete: bool,
+}
+
+#[derive(Debug, Default)]
+struct PendingPluginCaches {
+    plugins: HashMap<PluginId, PendingPluginMessages>,
+    total_entries: usize,
+    total_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PendingCacheRejection {
+    EntryLimit,
+    ByteLimit,
+}
+
+impl PendingPluginCaches {
+    fn reset(&mut self, plugin_id: PluginId) {
+        if let Some(previous) = self.plugins.remove(&plugin_id) {
+            self.total_entries = self.total_entries.saturating_sub(previous.entries.len());
+            self.total_bytes = self.total_bytes.saturating_sub(previous.bytes);
+        }
+        self.plugins
+            .insert(plugin_id, PendingPluginMessages::default());
+    }
+
+    fn insert_empty(&mut self, plugin_id: PluginId) {
+        self.plugins.entry(plugin_id).or_default();
+    }
+
+    fn contains(&self, plugin_id: &PluginId) -> bool {
+        self.plugins.contains_key(plugin_id)
+    }
+
+    fn take(&mut self, plugin_id: &PluginId) -> Option<PendingPluginMessages> {
+        let messages = self.plugins.remove(plugin_id)?;
+        self.total_entries = self.total_entries.saturating_sub(messages.entries.len());
+        self.total_bytes = self.total_bytes.saturating_sub(messages.bytes);
+        Some(messages)
+    }
+
+    fn plugin_ids(&self) -> Vec<PluginId> {
+        self.plugins.keys().copied().collect()
+    }
+
+    fn try_push(
+        &mut self,
+        plugin_id: PluginId,
+        entry: EventOrPipeMessage,
+        front: bool,
+    ) -> Result<(), PendingCacheRejection> {
+        if !self.plugins.contains_key(&plugin_id) {
+            return Ok(());
+        }
+        let bytes =
+            event_or_pipe_message_bytes(&entry).saturating_add(PENDING_CACHE_ENTRY_OVERHEAD);
+        // A newer full-state snapshot replaces the cached view of that same
+        // kind only when it is at the queue boundary the new snapshot belongs
+        // to. Replacing an earlier snapshot across an ordered event would move
+        // newer state before that event, so in that case append the snapshot
+        // after the intervening entries instead.
+        if let Some(replaced) = self.try_replace_snapshot(plugin_id, &entry, front) {
+            return replaced;
+        }
+        let over_entries = {
+            let cache = &self.plugins[&plugin_id];
+            cache.entries.len() >= MAX_PENDING_CACHE_ENTRIES_PER_PLUGIN
+                || self.total_entries >= MAX_PENDING_CACHE_ENTRIES_TOTAL
+        };
+        let over_bytes = {
+            let cache = &self.plugins[&plugin_id];
+            cache.bytes.saturating_add(bytes) > MAX_PENDING_CACHE_BYTES_PER_PLUGIN
+                || self.total_bytes.saturating_add(bytes) > MAX_PENDING_CACHE_BYTES_TOTAL
+        };
+        if over_entries || over_bytes {
+            if snapshot_key(&entry).is_none() {
+                self.plugins.get_mut(&plugin_id).unwrap().incomplete = true;
+            }
+            return Err(if over_entries {
+                PendingCacheRejection::EntryLimit
+            } else {
+                PendingCacheRejection::ByteLimit
+            });
+        }
+        let cache = self.plugins.get_mut(&plugin_id).unwrap();
+        if front {
+            cache.entries.insert(0, entry);
+        } else {
+            cache.entries.push(entry);
+        }
+        cache.bytes = cache.bytes.saturating_add(bytes);
+        self.total_entries = self.total_entries.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    fn try_replace_snapshot(
+        &mut self,
+        plugin_id: PluginId,
+        entry: &EventOrPipeMessage,
+        front: bool,
+    ) -> Option<Result<(), PendingCacheRejection>> {
+        let cache = self.plugins.get(&plugin_id)?;
+        let index = cache
+            .entries
+            .iter()
+            .rposition(|existing| same_snapshot(existing, entry))?;
+        let at_boundary = if front {
+            index == 0
+        } else {
+            index + 1 == cache.entries.len()
+        };
+        if !at_boundary {
+            return None;
+        }
+        // Keep every pane already pending. Fall back to replacing the whole
+        // snapshot only when the cached event cannot be updated in place.
+        let entry = coalesce_pane_render_delta(&self.plugins[&plugin_id].entries[index], entry)
+            .unwrap_or_else(|| entry.clone());
+        let bytes =
+            event_or_pipe_message_bytes(&entry).saturating_add(PENDING_CACHE_ENTRY_OVERHEAD);
+        let old_bytes = event_or_pipe_message_bytes(&self.plugins[&plugin_id].entries[index])
+            .saturating_add(PENDING_CACHE_ENTRY_OVERHEAD);
+        let next_plugin_bytes = self.plugins[&plugin_id]
+            .bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(bytes);
+        let next_total_bytes = self
+            .total_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(bytes);
+        if next_plugin_bytes > MAX_PENDING_CACHE_BYTES_PER_PLUGIN
+            || next_total_bytes > MAX_PENDING_CACHE_BYTES_TOTAL
+        {
+            return Some(Err(PendingCacheRejection::ByteLimit));
+        }
+        let cache = self.plugins.get_mut(&plugin_id).unwrap();
+        cache.entries[index] = entry;
+        cache.bytes = next_plugin_bytes;
+        self.total_bytes = next_total_bytes;
+        Some(Ok(()))
+    }
+
+    #[cfg(test)]
+    fn cached_bytes(&self, plugin_id: PluginId) -> usize {
+        self.plugins
+            .get(&plugin_id)
+            .map(|cache| cache.bytes)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn is_incomplete(&self, plugin_id: PluginId) -> bool {
+        self.plugins
+            .get(&plugin_id)
+            .map(|cache| cache.incomplete)
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn cached_events(&self, plugin_id: PluginId) -> Vec<EventOrPipeMessage> {
+        self.plugins
+            .get(&plugin_id)
+            .map(|cache| cache.entries.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Kinds of event that are a full view of one piece of state. A later event of
+/// the same kind, for the same client, replaces the cached one. Pane render
+/// reports are the exception: the producer sends only changed panes, so a later
+/// report replaces those panes and keeps every other pane already pending.
+/// One-shot facts (permission results, keys, command results, pipes) are not snapshots.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotKind {
+    Mode,
+    Tab,
+    Pane,
+    Session,
+    Clients,
+    WebServer,
+    HostTerminalTheme,
+    GlobalAttention,
+    SessionHistory,
+    Layouts,
+    KeybindPresets,
+    PluginSettings,
+    InitialKeybinds,
+    SessionCounts,
+    FolderSessions,
+    SessionSuggestions,
+    HintText,
+    PluginConfiguration,
+    PaneRenderReport,
+    SoftKeyboard,
+    Visible,
+}
+
+fn coalescible_snapshot_kind(event: &Event) -> Option<SnapshotKind> {
+    Some(match event {
+        Event::ModeUpdate(_) => SnapshotKind::Mode,
+        Event::TabUpdate(_) => SnapshotKind::Tab,
+        Event::PaneUpdate(_) => SnapshotKind::Pane,
+        Event::SessionUpdate(..) => SnapshotKind::Session,
+        Event::ListClients(_) => SnapshotKind::Clients,
+        Event::WebServerStatus(_) => SnapshotKind::WebServer,
+        Event::HostTerminalThemeChanged(_) => SnapshotKind::HostTerminalTheme,
+        Event::GlobalAttentionUpdate(_) => SnapshotKind::GlobalAttention,
+        Event::SessionHistoryUpdate(_) => SnapshotKind::SessionHistory,
+        Event::AvailableLayoutInfo(..) => SnapshotKind::Layouts,
+        Event::AvailableKeybindPresets(..) => SnapshotKind::KeybindPresets,
+        Event::PluginSettingsEntries(_) => SnapshotKind::PluginSettings,
+        Event::InitialKeybinds(_) => SnapshotKind::InitialKeybinds,
+        Event::SessionCountsUpdate(_) => SnapshotKind::SessionCounts,
+        Event::FolderSessionsUpdate(_) => SnapshotKind::FolderSessions,
+        Event::SessionSuggestions(_) => SnapshotKind::SessionSuggestions,
+        Event::HintText(_) => SnapshotKind::HintText,
+        Event::PluginConfigurationChanged(_) => SnapshotKind::PluginConfiguration,
+        Event::PaneRenderReport(_) => SnapshotKind::PaneRenderReport,
+        Event::SoftKeyboardVisibilityChanged(_) => SnapshotKind::SoftKeyboard,
+        Event::Visible(_) => SnapshotKind::Visible,
+        _ => return None,
+    })
+}
+
+fn snapshot_key(entry: &EventOrPipeMessage) -> Option<(SnapshotKind, Option<ClientId>)> {
+    let EventOrPipeMessage::Event(event, client_id) = entry else {
+        return None;
+    };
+    Some((coalescible_snapshot_kind(event)?, *client_id))
+}
+
+fn same_snapshot(left: &EventOrPipeMessage, right: &EventOrPipeMessage) -> bool {
+    match (snapshot_key(left), snapshot_key(right)) {
+        (Some(left_key), Some(right_key)) => left_key == right_key,
+        _ => false,
+    }
+}
+
+/// Fold `incoming` pane deltas into the cached report. The same pane is
+/// replaced; a different pane is kept. Returns None when the cached event is
+/// not a pane report or its client differs, so the caller replaces the whole
+/// snapshot instead of inventing a full-screen view.
+fn coalesce_pane_render_delta(
+    existing: &EventOrPipeMessage,
+    incoming: &EventOrPipeMessage,
+) -> Option<EventOrPipeMessage> {
+    let EventOrPipeMessage::Event(Event::PaneRenderReport(existing_panes), existing_client) =
+        existing
+    else {
+        return None;
+    };
+    let EventOrPipeMessage::Event(Event::PaneRenderReport(incoming_panes), incoming_client) =
+        incoming
+    else {
+        return None;
+    };
+    if existing_client != incoming_client {
+        return None;
+    }
+    let mut panes = existing_panes.clone();
+    for (pane_id, contents) in incoming_panes {
+        panes.insert(*pane_id, contents.clone());
+    }
+    Some(EventOrPipeMessage::Event(
+        Event::PaneRenderReport(panes),
+        *existing_client,
+    ))
+}
+
+const REPLACEABLE_RESIZE: u64 = 1;
+const REPLACEABLE_HOST_DIR: u64 = 2;
+const REPLACEABLE_SHARED_SETTINGS: u64 = 3;
+const REPLACEABLE_PLUGIN_SETTINGS: u64 = 4;
+const REPLACEABLE_VISIBILITY: u64 = 5;
+const REPLACEABLE_KIND_SHIFT: u64 = 56;
+const REPLACEABLE_GENERATION_SHIFT: u64 = 32;
+const REPLACEABLE_GENERATION_MASK: u64 = 0x00FF_FFFF;
+const REPLACEABLE_DESTINATION_MASK: u64 = u32::MAX as u64;
+
+/// Replaceable work coalesces only when operation, destination and generation
+/// all match. The destination is a client for per-client instances and a slot
+/// for shared instances.
+fn replaceable_key(kind: u64, destination: u32, generation: u64) -> u64 {
+    ((kind & 0xFF) << REPLACEABLE_KIND_SHIFT)
+        | ((generation & REPLACEABLE_GENERATION_MASK) << REPLACEABLE_GENERATION_SHIFT)
+        | (destination as u64 & REPLACEABLE_DESTINATION_MASK)
+}
+
+fn replaceable_host_dir_key(client_id: ClientId, generation: u64) -> u64 {
+    replaceable_key(REPLACEABLE_HOST_DIR, client_id, generation)
+}
+
+fn replaceable_resize_key(destination: u32, generation: u64) -> u64 {
+    replaceable_key(REPLACEABLE_RESIZE, destination, generation)
+}
+
+fn replaceable_plugin_settings_key(client_id: ClientId, generation: u64) -> u64 {
+    replaceable_key(REPLACEABLE_PLUGIN_SETTINGS, client_id, generation)
+}
+
+fn replaceable_shared_settings_key(generation: u64) -> u64 {
+    replaceable_key(REPLACEABLE_SHARED_SETTINGS, 0, generation)
+}
+
+fn replaceable_visibility_key(generation: u64) -> u64 {
+    replaceable_key(REPLACEABLE_VISIBILITY, 0, generation)
+}
+
+fn pane_contents_bytes(contents: &PaneContents) -> usize {
+    contents
+        .lines_above_viewport
+        .iter()
+        .chain(contents.lines_below_viewport.iter())
+        .chain(contents.viewport.iter())
+        .map(|line| line.len().saturating_add(32))
+        .fold(std::mem::size_of::<PaneContents>(), usize::saturating_add)
+}
+
+fn event_payload_bytes(event: &Event) -> usize {
+    let extra = match event {
+        Event::ModeUpdate(mode) => mode
+            .session_name
+            .as_ref()
+            .map(|name| name.len())
+            .unwrap_or(0)
+            .saturating_add(64),
+        Event::TabUpdate(tabs) => tabs
+            .iter()
+            .map(|tab| tab.name.len().saturating_add(256))
+            .fold(0usize, usize::saturating_add),
+        Event::PaneUpdate(manifest) => manifest
+            .panes
+            .values()
+            .flatten()
+            .map(|pane| pane.title.len().saturating_add(192))
+            .fold(0usize, usize::saturating_add),
+        Event::PaneRenderReport(panes) => panes.values().map(pane_contents_bytes).fold(
+            std::mem::size_of::<PaneRenderReport>(),
+            usize::saturating_add,
+        ),
+        Event::PastedText(text) => text.len(),
+        Event::SessionUpdate(sessions, resurrectable) => sessions
+            .iter()
+            .map(|session| session.name.len().saturating_add(128))
+            .chain(resurrectable.iter().map(|(name, _)| name.len()))
+            .fold(0usize, usize::saturating_add),
+        Event::CustomMessage(message, payload) => message.len().saturating_add(payload.len()),
+        Event::InitialKeybinds(keybinds) => keybinds.len().saturating_mul(64),
+        _ => 64,
+    };
+    std::mem::size_of::<Event>().saturating_add(extra)
+}
+
+fn pipe_message_payload_bytes(message: &PipeMessage) -> usize {
+    let source_bytes = match &message.source {
+        PipeSource::Cli(pipe_id) => pipe_id.len(),
+        _ => 0,
+    };
+    source_bytes
+        .saturating_add(message.name.len())
+        .saturating_add(message.payload.as_ref().map(String::len).unwrap_or(0))
+        .saturating_add(message.args.len().saturating_mul(32))
+        .saturating_add(std::mem::size_of::<PipeMessage>())
+}
+
+fn event_or_pipe_message_bytes(entry: &EventOrPipeMessage) -> usize {
+    match entry {
+        EventOrPipeMessage::Event(event, _) => event_payload_bytes(event),
+        EventOrPipeMessage::PipeMessage(message, _) => pipe_message_payload_bytes(message),
+    }
 }
 
 pub const PIPE_POPUP_CLOSED_EXIT_CODE: i32 = 1;
@@ -281,7 +666,7 @@ pub struct WasmBridge {
     plugin_executor: Arc<PinnedExecutor>,
     next_plugin_id: PluginId,
     plugin_ids_waiting_for_permission_request: HashSet<PluginId>,
-    cached_events_for_pending_plugins: HashMap<PluginId, Vec<EventOrPipeMessage>>,
+    cached_events_for_pending_plugins: PendingPluginCaches,
     cached_resizes_for_pending_plugins: HashMap<PluginId, (usize, usize)>, // (rows, columns)
     cached_worker_messages: HashMap<PluginId, Vec<(ClientId, String, String, String)>>, // Vec<clientid,
     // worker_name,
@@ -361,7 +746,7 @@ impl WasmBridge {
             path_to_default_shell,
             watcher,
             next_plugin_id: 0,
-            cached_events_for_pending_plugins: HashMap::new(),
+            cached_events_for_pending_plugins: PendingPluginCaches::default(),
             plugin_ids_waiting_for_permission_request: HashSet::new(),
             cached_resizes_for_pending_plugins: HashMap::new(),
             cached_worker_messages: HashMap::new(),
@@ -489,8 +874,7 @@ impl WasmBridge {
                 };
                 let plugin_name = run.location.to_string();
 
-                self.cached_events_for_pending_plugins
-                    .insert(plugin_id, vec![]);
+                self.cached_events_for_pending_plugins.reset(plugin_id);
                 self.cached_resizes_for_pending_plugins
                     .insert(plugin_id, (size.rows, size.cols));
                 self.loading_plugins.insert((plugin_id, run.clone()));
@@ -781,8 +1165,7 @@ impl WasmBridge {
         };
 
         let (rows, columns) = self.size_of_plugin_id(plugin_id).unwrap_or((0, 0));
-        self.cached_events_for_pending_plugins
-            .insert(plugin_id, vec![]);
+        self.cached_events_for_pending_plugins.reset(plugin_id);
         self.cached_resizes_for_pending_plugins
             .insert(plugin_id, (rows, columns));
 
@@ -918,8 +1301,7 @@ impl WasmBridge {
             };
 
             let (rows, columns) = self.size_of_plugin_id(plugin_id).unwrap_or((0, 0));
-            self.cached_events_for_pending_plugins
-                .insert(plugin_id, vec![]);
+            self.cached_events_for_pending_plugins.reset(plugin_id);
             self.cached_resizes_for_pending_plugins
                 .insert(plugin_id, (rows, columns));
 
@@ -1014,8 +1396,9 @@ impl WasmBridge {
             .set_size(pid, new_rows, new_columns);
         if let Some(instance_id) = self.shared_slot_owner.get(&pid).copied() {
             let _s = shutdown_sender.clone();
-            self.plugin_executor.execute_for_plugin(
+            self.plugin_executor.execute_for_plugin_with(
                 instance_id,
+                JobClass::Replaceable(replaceable_resize_key(pid, 0)),
                 move |senders, plugin_map, _connected_clients, _plugin_cache, _engine| {
                     let _s = _s;
                     resize_job(senders, plugin_map, instance_id, pid, new_rows, new_columns);
@@ -1044,61 +1427,68 @@ impl WasmBridge {
                     .unwrap()
                     .next_event_id(AtomicEvent::Resize);
                 // Execute directly on pinned thread (no async I/O needed for resize/render)
-                self.plugin_executor.execute_for_plugin(plugin_id, {
-                    // let senders = self.senders.clone();
-                    let running_plugin = running_plugin.clone();
-                    let _s = shutdown_sender.clone();
-                    move |senders, _plugin_map, _connected_clients, _plugin_cache, _engine| {
-                        let mut running_plugin = running_plugin.lock().unwrap();
-                        let _s = _s; // guard to allow the task to complete before cleanup/shutdown
-                        if running_plugin.apply_event_id(AtomicEvent::Resize, event_id) {
-                            let old_rows = running_plugin.rows;
-                            let old_columns = running_plugin.columns;
-                            running_plugin.rows = new_rows;
-                            running_plugin.columns = new_columns;
+                self.plugin_executor.execute_for_plugin_with(
+                    plugin_id,
+                    JobClass::Replaceable(replaceable_resize_key(client_id, 0)),
+                    {
+                        // let senders = self.senders.clone();
+                        let running_plugin = running_plugin.clone();
+                        let _s = shutdown_sender.clone();
+                        move |senders, _plugin_map, _connected_clients, _plugin_cache, _engine| {
+                            let mut running_plugin = running_plugin.lock().unwrap();
+                            let _s = _s; // guard to allow the task to complete before cleanup/shutdown
+                            if running_plugin.apply_event_id(AtomicEvent::Resize, event_id) {
+                                let old_rows = running_plugin.rows;
+                                let old_columns = running_plugin.columns;
+                                running_plugin.rows = new_rows;
+                                running_plugin.columns = new_columns;
 
-                            // in the below conditional, we check if event_id == 0 so that we'll
-                            // make sure to always render on the first resize event
-                            if old_rows != new_rows || old_columns != new_columns || event_id == 0 {
-                                let rendered_bytes = running_plugin
-                                    .instance
-                                    .clone()
-                                    .get_typed_func::<(i32, i32), ()>(
-                                        &mut running_plugin.store,
-                                        "render",
-                                    )
-                                    .and_then(|render| {
-                                        render.call(
+                                // in the below conditional, we check if event_id == 0 so that we'll
+                                // make sure to always render on the first resize event
+                                if old_rows != new_rows
+                                    || old_columns != new_columns
+                                    || event_id == 0
+                                {
+                                    let rendered_bytes = running_plugin
+                                        .instance
+                                        .clone()
+                                        .get_typed_func::<(i32, i32), ()>(
                                             &mut running_plugin.store,
-                                            (new_rows as i32, new_columns as i32),
+                                            "render",
                                         )
-                                    })
-                                    .map_err(|e| anyhow!(e))
-                                    .and_then(|_| {
-                                        wasi_read_string(running_plugin.store.data())
-                                            .map_err(|e| anyhow!(e))
-                                    })
-                                    .with_context(err_context);
-                                match rendered_bytes {
-                                    Ok(rendered_bytes) => {
-                                        let plugin_render_asset = PluginRenderAsset::new(
-                                            plugin_id,
-                                            client_id,
-                                            rendered_bytes.as_bytes().to_vec(),
-                                        )
-                                        .rendered_at(new_rows, new_columns);
-                                        senders
-                                            .send_to_screen(ScreenInstruction::PluginBytes(vec![
-                                                plugin_render_asset,
-                                            ]))
-                                            .unwrap();
-                                    },
-                                    Err(e) => log::error!("{}", e),
+                                        .and_then(|render| {
+                                            render.call(
+                                                &mut running_plugin.store,
+                                                (new_rows as i32, new_columns as i32),
+                                            )
+                                        })
+                                        .map_err(|e| anyhow!(e))
+                                        .and_then(|_| {
+                                            wasi_read_string(running_plugin.store.data())
+                                                .map_err(|e| anyhow!(e))
+                                        })
+                                        .with_context(err_context);
+                                    match rendered_bytes {
+                                        Ok(rendered_bytes) => {
+                                            let plugin_render_asset = PluginRenderAsset::new(
+                                                plugin_id,
+                                                client_id,
+                                                rendered_bytes.as_bytes().to_vec(),
+                                            )
+                                            .rendered_at(new_rows, new_columns);
+                                            senders
+                                                .send_to_screen(ScreenInstruction::PluginBytes(
+                                                    vec![plugin_render_asset],
+                                                ))
+                                                .unwrap();
+                                        },
+                                        Err(e) => log::error!("{}", e),
+                                    }
                                 }
                             }
                         }
-                    }
-                });
+                    },
+                );
             }
         }
         for (plugin_id, current_size) in self.cached_resizes_for_pending_plugins.iter_mut() {
@@ -1135,9 +1525,7 @@ impl WasmBridge {
             .iter()
             .cloned()
             .filter(|(plugin_id, _client_id, _running_plugin, _subscriptions)| {
-                !&self
-                    .cached_events_for_pending_plugins
-                    .contains_key(&plugin_id)
+                !&self.cached_events_for_pending_plugins.contains(&plugin_id)
             })
             .collect();
 
@@ -1227,9 +1615,23 @@ impl WasmBridge {
         // loop once more to update the cached events for the pending plugins (probably currently
         // being loaded, we'll send them these events when they load)
         for (pid, cid, event) in updates.drain(..) {
-            for (plugin_id, cached_events) in self.cached_events_for_pending_plugins.iter_mut() {
-                if pid.is_none() || pid.as_ref() == Some(plugin_id) {
-                    cached_events.push(EventOrPipeMessage::Event(event.clone(), cid));
+            let targets: Vec<PluginId> = self
+                .cached_events_for_pending_plugins
+                .plugin_ids()
+                .into_iter()
+                .filter(|plugin_id| pid.is_none() || pid.as_ref() == Some(plugin_id))
+                .collect();
+            for plugin_id in targets {
+                if let Err(rejection) = self.cached_events_for_pending_plugins.try_push(
+                    plugin_id,
+                    EventOrPipeMessage::Event(event.clone(), cid),
+                    false,
+                ) {
+                    log::warn!(
+                        "Dropping event cached for loading plugin {}: {:?}",
+                        plugin_id,
+                        rejection
+                    );
                 }
             }
         }
@@ -1279,8 +1681,9 @@ impl WasmBridge {
         client_id_to_update: ClientId,
     ) -> Result<()> {
         if let Some(instance_id) = self.shared_instance_of(plugin_id_to_update) {
-            self.plugin_executor.execute_for_plugin(
+            self.plugin_executor.execute_for_plugin_with(
                 instance_id,
+                JobClass::Replaceable(replaceable_host_dir_key(client_id_to_update, 0)),
                 move |senders, plugin_map, _connected_clients, _plugin_cache, _engine| {
                     let running_plugin = plugin_map
                         .lock()
@@ -1324,8 +1727,10 @@ impl WasmBridge {
             .collect();
 
         // Execute directly on pinned thread (no async I/O needed for directory check/change)
-        self.plugin_executor
-            .execute_for_plugin(plugin_id_to_update, {
+        self.plugin_executor.execute_for_plugin_with(
+            plugin_id_to_update,
+            JobClass::Replaceable(replaceable_host_dir_key(client_id_to_update, 0)),
+            {
                 move |senders, plugin_map, _connected_clients, _plugin_cache, _engine| {
                     match new_host_dir.try_exists() {
                         Ok(false) => {
@@ -1405,7 +1810,8 @@ impl WasmBridge {
                         }
                     }
                 }
-            });
+            },
+        );
         Ok(())
     }
     pub fn pipe_messages(
@@ -1429,9 +1835,7 @@ impl WasmBridge {
             .iter()
             .cloned()
             .filter(|(plugin_id, _client_id, _running_plugin, _subscriptions)| {
-                !&self
-                    .cached_events_for_pending_plugins
-                    .contains_key(&plugin_id)
+                !&self.cached_events_for_pending_plugins.contains(&plugin_id)
             })
             .collect();
 
@@ -1500,23 +1904,36 @@ impl WasmBridge {
                 .iter()
                 .copied()
                 .collect();
-            for (plugin_id, cached_events) in self.cached_events_for_pending_plugins.iter_mut() {
-                if message_pid.is_none() || message_pid.as_ref() == Some(plugin_id) {
-                    cached_events.push(EventOrPipeMessage::PipeMessage(
-                        pipe_message.clone(),
-                        message_cid,
-                    ));
-                    if let PipeSource::Cli(pipe_id) = &pipe_message.source {
-                        for client_id in &all_connected_clients {
-                            if Self::message_is_directed_at_plugin(
-                                message_pid,
-                                message_cid,
-                                plugin_id,
-                                client_id,
-                            ) {
-                                self.pending_pipes
-                                    .mark_being_processed(pipe_id, plugin_id, client_id);
-                            }
+            let targets: Vec<PluginId> = self
+                .cached_events_for_pending_plugins
+                .plugin_ids()
+                .into_iter()
+                .filter(|plugin_id| {
+                    message_pid.is_none() || message_pid.as_ref() == Some(plugin_id)
+                })
+                .collect();
+            for plugin_id in targets {
+                if let Err(rejection) = self.cached_events_for_pending_plugins.try_push(
+                    plugin_id,
+                    EventOrPipeMessage::PipeMessage(pipe_message.clone(), message_cid),
+                    false,
+                ) {
+                    log::warn!(
+                        "Dropping pipe cached for loading plugin {}: {:?}",
+                        plugin_id,
+                        rejection
+                    );
+                }
+                if let PipeSource::Cli(pipe_id) = &pipe_message.source {
+                    for client_id in &all_connected_clients {
+                        if Self::message_is_directed_at_plugin(
+                            message_pid,
+                            message_cid,
+                            &plugin_id,
+                            client_id,
+                        ) {
+                            self.pending_pipes
+                                .mark_being_processed(pipe_id, &plugin_id, client_id);
                         }
                     }
                 }
@@ -1816,8 +2233,18 @@ impl WasmBridge {
         event: Event,
         shutdown_sender: Sender<()>,
     ) -> Result<()> {
-        if let Some(cached_events) = self.cached_events_for_pending_plugins.get_mut(&plugin_id) {
-            cached_events.insert(0, EventOrPipeMessage::Event(event, Some(client_id)));
+        if self.cached_events_for_pending_plugins.contains(&plugin_id) {
+            if let Err(rejection) = self.cached_events_for_pending_plugins.try_push(
+                plugin_id,
+                EventOrPipeMessage::Event(event, Some(client_id)),
+                true,
+            ) {
+                log::warn!(
+                    "Dropping initial state for loading plugin {}: {:?}",
+                    plugin_id,
+                    rejection
+                );
+            }
             return Ok(());
         }
         self.update_plugins(
@@ -1899,8 +2326,9 @@ impl WasmBridge {
         for instance_id in shared_instance_ids {
             let default_shell = default_shell.clone();
             let layout_dir = layout_dir.clone();
-            self.plugin_executor.execute_for_plugin(
+            self.plugin_executor.execute_for_plugin_with(
                 instance_id,
+                JobClass::Replaceable(replaceable_shared_settings_key(0)),
                 move |_senders, plugin_map, _connected_clients, _plugin_cache, _engine| {
                     host_settings_job(plugin_map, instance_id, default_shell, layout_dir);
                 },
@@ -1932,23 +2360,27 @@ impl WasmBridge {
         };
 
         for (plugin_id, running_plugin) in plugins_to_reconfigure {
-            self.plugin_executor.execute_for_plugin(plugin_id, {
-                let running_plugin = running_plugin.clone();
-                let keybinds = keybinds.clone();
-                let default_shell = default_shell.clone();
-                let layout_dir = layout_dir.clone();
-                move |_senders, _plugin_map, _connected_clients, _plugin_cache, _engine| {
-                    let mut running_plugin = running_plugin.lock().unwrap();
-                    if let Some(keybinds) = keybinds {
-                        running_plugin.update_keybinds(keybinds);
+            self.plugin_executor.execute_for_plugin_with(
+                plugin_id,
+                JobClass::Replaceable(replaceable_plugin_settings_key(client_id, 0)),
+                {
+                    let running_plugin = running_plugin.clone();
+                    let keybinds = keybinds.clone();
+                    let default_shell = default_shell.clone();
+                    let layout_dir = layout_dir.clone();
+                    move |_senders, _plugin_map, _connected_clients, _plugin_cache, _engine| {
+                        let mut running_plugin = running_plugin.lock().unwrap();
+                        if let Some(keybinds) = keybinds {
+                            running_plugin.update_keybinds(keybinds);
+                        }
+                        if let Some(default_mode) = default_mode {
+                            running_plugin.update_default_mode(default_mode);
+                        }
+                        running_plugin.update_default_shell(default_shell);
+                        running_plugin.update_layout_dir(layout_dir);
                     }
-                    if let Some(default_mode) = default_mode {
-                        running_plugin.update_default_mode(default_mode);
-                    }
-                    running_plugin.update_default_shell(default_shell);
-                    running_plugin.update_layout_dir(layout_dir);
-                }
-            });
+                },
+            );
         }
         // Send InitialKeybinds to subscribed plugins after reconfiguration
         if let Some(keybinds) = keybinds.as_ref() {
@@ -1969,9 +2401,7 @@ impl WasmBridge {
         shutdown_sender: Sender<()>,
     ) -> Result<()> {
         let err_context = || format!("Failed to apply cached events to plugin");
-        if let Some(events_or_pipe_messages) =
-            self.cached_events_for_pending_plugins.remove(&plugin_id)
-        {
+        if let Some(events_or_pipe_messages) = self.take_replayable_cached_events(plugin_id) {
             let plugin_instances = self.plugin_map.lock().unwrap().all_plugin_ids();
             for (instance_plugin_id, client_id) in plugin_instances {
                 if instance_plugin_id != plugin_id {
@@ -2329,8 +2759,45 @@ impl WasmBridge {
         self.plugin_ids_waiting_for_permission_request
             .insert(plugin_id);
         self.cached_events_for_pending_plugins
-            .entry(plugin_id)
-            .or_insert_with(Default::default);
+            .insert_empty(plugin_id);
+    }
+
+    /// Replay a loading-plugin cache only when every one-shot event fit.
+    /// An overflowed cache is not a complete history, so it is dropped instead
+    /// of being applied. CLI pipes cached in it are released so their callers
+    /// do not stay blocked.
+    fn take_replayable_cached_events(
+        &mut self,
+        plugin_id: PluginId,
+    ) -> Option<Vec<EventOrPipeMessage>> {
+        let messages = self.cached_events_for_pending_plugins.take(&plugin_id)?;
+        if messages.incomplete {
+            log::error!(
+                "Not applying cached events for plugin {plugin_id}: the loading-plugin cache overflowed and is incomplete"
+            );
+            self.release_cached_cli_pipes_with_error(&messages.entries);
+            None
+        } else {
+            Some(messages.entries)
+        }
+    }
+
+    fn release_cached_cli_pipes_with_error(&mut self, entries: &[EventOrPipeMessage]) {
+        for entry in entries {
+            let EventOrPipeMessage::PipeMessage(pipe_message, _) = entry else {
+                continue;
+            };
+            let PipeSource::Cli(pipe_id) = &pipe_message.source else {
+                continue;
+            };
+            if self.pending_pipes.is_finished(pipe_id) {
+                continue;
+            }
+            let release = self
+                .pending_pipes
+                .release_with_code(pipe_id, PIPE_POPUP_ERROR_EXIT_CODE);
+            self.send_pipe_releases(vec![release]);
+        }
     }
 
     // gets all running plugins details matching this run_plugin, if none are running, loads one and
@@ -3200,8 +3667,9 @@ impl WasmBridge {
                     )
                 })
                 .collect();
-            self.plugin_executor.execute_for_plugin(
+            self.plugin_executor.execute_for_plugin_with(
                 instance_id,
+                JobClass::Replaceable(replaceable_visibility_key(0)),
                 move |senders, plugin_map, _connected_clients, _plugin_cache, _engine| {
                     visibility_job(senders, plugin_map, instance_id, visible_slots);
                 },
@@ -3806,6 +4274,10 @@ pub(crate) fn is_hover(event: &Event) -> bool {
             | Event::MouseWithModifiers(zellij_utils::data::Mouse::Hover(..), _)
     )
 }
+
+#[cfg(test)]
+#[path = "unit/coalesce_tests.rs"]
+mod coalesce_tests;
 
 #[cfg(test)]
 #[path = "unit/hover_merge_tests.rs"]
