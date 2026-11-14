@@ -17601,6 +17601,228 @@ fn a_session_with_a_collapsed_pane_serializes_as_if_the_pane_were_expanded() {
     assert_eq!(collapsed, expanded);
 }
 
+fn snapshot_markers(screen: &Screen) -> String {
+    let metadata = screen.get_layout_metadata(None, None);
+    let manifest: zellij_utils::session_serialization::GlobalLayoutManifest = metadata.into();
+    manifest
+        .tabs
+        .iter()
+        .flat_map(|(_, tab)| tab.tiled_panes.iter().chain(tab.floating_panes.iter()))
+        .filter_map(|pane| pane.pane_contents.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn snapshot_pass_layout_metadata_publishes_only_the_finished_text() {
+    use crate::panes::grid::{MAX_SERIALIZE_SNAPSHOT_CELLS, SCREEN_ROW_QUANTUM};
+
+    let rows = SCREEN_ROW_QUANTUM + 40;
+    let cols = 20;
+    assert!(rows * cols < MAX_SERIALIZE_SNAPSHOT_CELLS);
+    let mut screen = create_new_screen(Size { cols, rows }, false, false);
+    new_tab(&mut screen, 1, 0);
+    let mut bytes = Vec::new();
+    for index in 0..rows {
+        bytes.extend(format!("MARK{index:05}XXXXXXXX\r\n").into_bytes());
+    }
+    let leftover = screen
+        .apply_pty_bytes(1, bytes)
+        .expect("the tall viewport is parsed on the screen");
+    assert!(
+        leftover.is_none(),
+        "the markers must be in the pane before the layout dump"
+    );
+    screen.serialize_pane_viewport = true;
+    screen.scrollback_lines_to_serialize = Some(usize::MAX);
+    let first = snapshot_markers(&screen);
+    assert!(
+        first.is_empty(),
+        "an unfinished snapshot must not publish a partial viewport"
+    );
+    assert!(
+        screen.serialize_snapshot_has_more(),
+        "rows past the first quantum must remain for the next turn"
+    );
+    let mut guard = 0;
+    let mut latest = first;
+    while screen.serialize_snapshot_has_more() && guard < 8 {
+        latest = snapshot_markers(&screen);
+        guard += 1;
+    }
+    assert!(
+        !screen.serialize_snapshot_has_more(),
+        "continuation must cover the requested range"
+    );
+    assert!(
+        latest.contains("MARK00000"),
+        "the finished snapshot must include the oldest marker"
+    );
+    assert!(
+        latest.contains(&format!("MARK{:05}", rows - 1)),
+        "the finished snapshot must include the newest marker"
+    );
+}
+
+#[test]
+fn snapshot_pass_save_waits_until_the_snapshot_finishes() {
+    use crate::panes::grid::SCREEN_ROW_QUANTUM;
+
+    let rows = SCREEN_ROW_QUANTUM + 40;
+    let cols = 20;
+    let mut screen = create_new_screen(Size { cols, rows }, false, false);
+    let (to_pty, pty_receiver): ChannelWithContext<PtyInstruction> = channels::unbounded();
+    let (to_screen, _screen_receiver): ChannelWithContext<ScreenInstruction> =
+        channels::unbounded();
+    screen.bus.senders.to_pty = Some(SenderWithContext::new(to_pty));
+    screen.bus.senders.to_screen = Some(SenderWithContext::new(to_screen));
+    screen.bus.senders.should_silently_fail = true;
+    screen.serialize_pane_viewport = true;
+    screen.scrollback_lines_to_serialize = Some(usize::MAX);
+    screen.session_serialization = true;
+    new_tab(&mut screen, 1, 0);
+    let mut bytes = Vec::new();
+    for index in 0..rows {
+        bytes.extend(format!("MARK{index:05}XXXXXXXX\r\n").into_bytes());
+    }
+    let leftover = screen
+        .apply_pty_bytes(1, bytes)
+        .expect("the tall viewport is parsed on the screen");
+    assert!(leftover.is_none());
+
+    screen
+        .handle_save_session(1, None)
+        .expect("the first save turn requeues");
+    assert!(
+        screen.serialize_snapshot_has_more(),
+        "a two-quantum pane is unfinished after one SaveSession turn"
+    );
+    assert!(
+        pty_receiver.try_recv().is_err(),
+        "SaveSessionToDisk must wait until the snapshot pass finishes"
+    );
+
+    let mut saved = None;
+    for _ in 0..8 {
+        let unfinished = screen.serialize_snapshot_has_more();
+        screen
+            .handle_save_session(1, None)
+            .expect("a later save turn runs");
+        match pty_receiver.try_recv() {
+            Ok((instruction, _)) => {
+                assert!(
+                    !unfinished || !screen.serialize_snapshot_has_more(),
+                    "the disk write must be the turn that finishes the pass"
+                );
+                assert!(
+                    !screen.serialize_snapshot_has_more(),
+                    "SaveSessionToDisk arrived while the snapshot still had more rows"
+                );
+                saved = Some(instruction);
+                break;
+            },
+            Err(_) => {
+                assert!(
+                    screen.serialize_snapshot_has_more(),
+                    "a turn that does not publish must leave the pass open"
+                );
+            },
+        }
+    }
+    let PtyInstruction::SaveSessionToDisk {
+        session_layout_metadata,
+        ..
+    } = saved.expect("SaveSession publishes once the pass is done")
+    else {
+        panic!("SaveSession must send SaveSessionToDisk");
+    };
+    assert!(
+        pty_receiver.try_recv().is_err(),
+        "one finished pass publishes one SaveSessionToDisk"
+    );
+    let manifest: zellij_utils::session_serialization::GlobalLayoutManifest =
+        session_layout_metadata.into();
+    let dumped = manifest
+        .tabs
+        .iter()
+        .flat_map(|(_, tab)| tab.tiled_panes.iter().chain(tab.floating_panes.iter()))
+        .filter_map(|pane| pane.pane_contents.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(dumped.contains("MARK00000"));
+    assert!(dumped.contains(&format!("MARK{:05}", rows - 1)));
+}
+
+#[test]
+fn snapshot_pass_save_finishes_two_panes_of_different_lengths() {
+    use crate::panes::grid::SCREEN_ROW_QUANTUM;
+
+    let rows = SCREEN_ROW_QUANTUM + 40;
+    let cols = 40;
+    let mut screen = create_new_screen(Size { cols, rows }, false, false);
+    let (to_pty, pty_receiver): ChannelWithContext<PtyInstruction> = channels::unbounded();
+    let (to_screen, _screen_receiver): ChannelWithContext<ScreenInstruction> =
+        channels::unbounded();
+    screen.bus.senders.to_pty = Some(SenderWithContext::new(to_pty));
+    screen.bus.senders.to_screen = Some(SenderWithContext::new(to_screen));
+    screen.bus.senders.should_silently_fail = true;
+    screen.serialize_pane_viewport = true;
+    screen.scrollback_lines_to_serialize = Some(usize::MAX);
+    screen.session_serialization = true;
+    new_tab(&mut screen, 1, 0);
+    screen
+        .get_active_tab_mut(1)
+        .unwrap()
+        .horizontal_split(PaneId::Terminal(2), None, 1, None, None)
+        .unwrap();
+    let mut pane_a = Vec::new();
+    for index in 0..rows {
+        pane_a.extend(format!("PANE_A{index:05}\r\n").into_bytes());
+    }
+    let mut pane_b = Vec::new();
+    for index in 0..(rows + SCREEN_ROW_QUANTUM) {
+        pane_b.extend(format!("PANE_B{index:05}\r\n").into_bytes());
+    }
+    assert!(screen.apply_pty_bytes(1, pane_a).unwrap().is_none());
+    assert!(screen.apply_pty_bytes(2, pane_b).unwrap().is_none());
+
+    let mut saved = None;
+    for _ in 0..16 {
+        screen.handle_save_session(1, None).expect("save turn");
+        if let Ok((instruction, _)) = pty_receiver.try_recv() {
+            saved = Some(instruction);
+            break;
+        }
+    }
+    let PtyInstruction::SaveSessionToDisk {
+        session_layout_metadata,
+        ..
+    } = saved.expect("two panes of different lengths still finish one pass")
+    else {
+        panic!("SaveSession must send SaveSessionToDisk");
+    };
+    let manifest: zellij_utils::session_serialization::GlobalLayoutManifest =
+        session_layout_metadata.into();
+    let dumped = manifest
+        .tabs
+        .iter()
+        .flat_map(|(_, tab)| tab.tiled_panes.iter().chain(tab.floating_panes.iter()))
+        .filter_map(|pane| pane.pane_contents.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(dumped.contains("PANE_A00000"));
+    assert!(dumped.contains(&format!("PANE_A{:05}", rows - 1)));
+    assert!(dumped.contains("PANE_B00000"));
+    assert!(dumped.contains(&format!("PANE_B{:05}", rows + SCREEN_ROW_QUANTUM - 1)));
+    assert_eq!(dumped.matches("PANE_A00000").count(), 1);
+    assert_eq!(
+        dumped
+            .matches(&format!("PANE_B{:05}", rows + SCREEN_ROW_QUANTUM - 1))
+            .count(),
+        1
+    );
+}
+
 fn rendered_payload_for_client(
     server_receiver: &ServerReceiver,
     client_id: ClientId,

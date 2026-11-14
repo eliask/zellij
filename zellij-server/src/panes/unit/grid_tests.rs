@@ -11577,3 +11577,339 @@ fn oversized_xtgettcap_request_is_dropped() {
     vte_parser.feed(&mut grid, &sequence);
     assert!(grid.pending_messages_to_pty.is_empty());
 }
+
+/// A grid `columns` cells wide whose scrollback holds `line_count`
+/// full-width rows, each starting with its five-digit index.
+fn wide_marked_scrollback(columns: usize, line_count: usize) -> Grid {
+    let mut grid = create_grid_with_size_and_raw(5, columns, b"");
+    let mut content: Vec<u8> = Vec::with_capacity(line_count * (columns + 2));
+    for index in 0..line_count {
+        content.extend_from_slice(format!("{index:05}").as_bytes());
+        content.resize(content.len() + columns - 5, b'x');
+        content.extend_from_slice(b"\r\n");
+    }
+    feed_bytes(&mut grid, &content);
+    grid
+}
+
+fn scroll_history_into_view(grid: &mut Grid) -> usize {
+    let steps = grid.lines_above.len().saturating_mul(2).max(1);
+    let mut moved = 0;
+    for _ in 0..steps {
+        if grid.lines_above.is_empty() {
+            break;
+        }
+        let before = grid.lines_above.len();
+        grid.scroll_up_one_line();
+        if grid.lines_above.len() < before {
+            moved += before - grid.lines_above.len();
+        } else {
+            break;
+        }
+    }
+    moved
+}
+
+#[test]
+fn snapshot_pass_is_bounded_by_cells_not_just_rows() {
+    // 8,000 rows of 1,000 cells is twice the absolute snapshot ceiling and
+    // far above one turn. One call must keep the newest quantum, not fill
+    // the 4MiB ceiling, and must not return that partial text.
+    let budget = super::MAX_SERIALIZE_SNAPSHOT_CELLS;
+    let quantum = super::SCREEN_ROW_QUANTUM;
+    let line_count = 8_000;
+    let mut grid = wide_marked_scrollback(1_000, line_count);
+    assert!(grid.lines_above.len() < *SCROLL_BUFFER_SIZE.get_or_init(|| 10_000));
+    let stored_cells: usize = grid
+        .lines_above
+        .iter_mut()
+        .map(|row| row.width_cached())
+        .sum();
+    assert!(stored_cells > budget + budget / 2);
+    assert!(grid.lines_above.len() + grid.viewport.len() > quantum);
+
+    super::reset_serialize_budget_rows_scanned();
+    let first = grid.serialize(Some(usize::MAX));
+    let scanned = super::serialize_budget_rows_scanned();
+    assert!(
+        first.is_none(),
+        "an unfinished snapshot must not return a partial viewport"
+    );
+    assert!(
+        grid.serialize_snapshot_has_more(),
+        "rows past the first quantum remain"
+    );
+    assert!(
+        scanned <= quantum,
+        "one serialize call scanned {scanned} rows, past the {quantum} quantum"
+    );
+    let mut serialized = None;
+    for _ in 0..line_count {
+        serialized = grid.serialize(Some(usize::MAX));
+        if serialized.is_some() {
+            break;
+        }
+    }
+    let serialized = serialized.expect("the snapshot pass finishes");
+    assert!(!grid.serialize_snapshot_has_more());
+    let serialized_filler = serialized.matches('x').count();
+    let quantum_cells = quantum * 1_000;
+    assert!(
+        serialized_filler <= budget,
+        "{serialized_filler} serialized cells exceed the {budget} ceiling"
+    );
+    assert!(
+        serialized_filler > quantum_cells / 2,
+        "{serialized_filler} serialized cells: the quantum must be used, not an empty snapshot"
+    );
+    assert!(
+        !serialized.contains("00000x"),
+        "the oldest rows must be the ones dropped"
+    );
+    assert!(
+        serialized.contains(&format!("{:05}x", line_count - 1)),
+        "the newest row must survive the ceiling"
+    );
+}
+
+#[test]
+fn snapshot_pass_ignores_a_row_appended_between_quanta() {
+    let quantum = super::SCREEN_ROW_QUANTUM;
+    let line_count = quantum + 30;
+    let mut grid = wide_marked_scrollback(20, line_count);
+    let newest = format!("{:05}x", line_count - 1);
+    assert!(grid.serialize(Some(usize::MAX)).is_none());
+    assert!(grid.serialize_snapshot_has_more());
+    feed_bytes(&mut grid, b"APPENDED_ROW_MARKER\r\n");
+
+    let mut serialized = None;
+    for _ in 0..8 {
+        serialized = grid.serialize(Some(usize::MAX));
+        if serialized.is_some() {
+            break;
+        }
+    }
+    let serialized = serialized.expect("the frozen pass finishes");
+    assert!(!grid.serialize_snapshot_has_more());
+    assert_eq!(
+        serialized.matches(newest.as_str()).count(),
+        1,
+        "the first quantum's newest marker must appear once"
+    );
+    assert!(
+        !serialized.contains("APPENDED_ROW_MARKER"),
+        "a row appended after the freeze is not part of this pass"
+    );
+    for index in 0..line_count {
+        let marker = format!("{:05}x", index);
+        assert_eq!(
+            serialized.matches(marker.as_str()).count(),
+            1,
+            "pre-freeze marker {marker} must appear once"
+        );
+    }
+}
+
+#[test]
+fn snapshot_pass_keeps_a_rewrap_tail_with_its_line() {
+    let mut grid =
+        create_grid_with_size_and_raw(6, 20, b"AAAA\r\nBBBBBBBBBBBBBBBBBBBB\r\nCCCC\r\n");
+    grid.change_size(6, 10);
+    let serialized = grid
+        .serialize(Some(usize::MAX))
+        .expect("four wrapped rows finish in one call");
+    let cccc = serialized.find("CCCC").expect("C survives the resize");
+    let bees_before_c = serialized[..cccc].matches('B').count();
+    let bees_after_c = serialized[cccc..].matches('B').count();
+    assert_eq!(
+        bees_before_c, 20,
+        "both halves of B must precede C, snapshot:\n{serialized}"
+    );
+    assert_eq!(
+        bees_after_c, 0,
+        "B's rewrap tail must not follow C, snapshot:\n{serialized}"
+    );
+    assert!(serialized.find("AAAA").is_some_and(|index| index < cccc));
+}
+
+#[test]
+fn snapshot_pass_keeps_a_pending_line_rewrapped_between_quanta() {
+    let quantum = super::SCREEN_ROW_QUANTUM;
+    let mut bytes = b"WWWWWWWWWWXXXXXXXXXX\r\n".to_vec();
+    for index in 0..(quantum + 40) {
+        bytes.extend(format!("L{index:05}\r\n").into_bytes());
+    }
+    let mut grid = create_grid_with_size_and_raw(4, 20, &bytes);
+    assert!(grid.serialize(Some(usize::MAX)).is_none());
+    grid.change_size(4, 10);
+    assert!(
+        scroll_history_into_view(&mut grid) > 0,
+        "scrolling must pull the pending history line"
+    );
+    let rewrapped = grid.viewport.iter().any(|row| !row.is_canonical)
+        || grid.lines_above.iter().any(|row| !row.is_canonical);
+    assert!(
+        rewrapped,
+        "the wide line has to be split before the pass resumes"
+    );
+
+    let mut serialized = None;
+    for _ in 0..8 {
+        serialized = grid.serialize(Some(usize::MAX));
+        if serialized.is_some() {
+            break;
+        }
+    }
+    let serialized = serialized.expect("the pass finishes after the reflow");
+    let first = serialized.find('W').expect("the carried half survives");
+    let last = serialized.rfind('X').expect("the rewrap tail survives");
+    let between = &serialized[first..=last];
+    assert!(
+        first
+            < serialized
+                .find('X')
+                .expect("the tail follows the carried half")
+    );
+    assert_eq!(between.matches('W').count(), 10);
+    assert_eq!(between.matches('X').count(), 10);
+    assert!(
+        !between.contains('\n') && !between.contains('\r'),
+        "the pending line must stay one logical line, between: {between:?}"
+    );
+    for index in 0..(quantum + 40) {
+        let marker = format!("L{index:05}");
+        assert!(
+            serialized.contains(&marker),
+            "scrollback row {marker} must stay in the snapshot"
+        );
+    }
+}
+
+#[test]
+fn snapshot_pass_does_not_repeat_a_half_copied_before_reflow() {
+    let quantum = super::SCREEN_ROW_QUANTUM;
+    let mut bytes = b"WWWWWWWWWWXXXXXXXXXX\r\n".to_vec();
+    for index in 0..(quantum - 2) {
+        bytes.extend(format!("L{index:05}\r\n").into_bytes());
+    }
+    let mut grid = create_grid_with_size_and_raw(4, 10, &bytes);
+    assert!(grid.serialize(Some(usize::MAX)).is_none());
+    grid.change_size(4, 5);
+    assert!(scroll_history_into_view(&mut grid) > 0);
+    assert!(
+        grid.viewport
+            .iter()
+            .chain(grid.lines_above.iter())
+            .chain(grid.lines_below.iter())
+            .any(|row| !row.is_canonical),
+        "scrolling the wide line into the narrower viewport has to rewrap it"
+    );
+    let mut serialized = None;
+    for _ in 0..8 {
+        serialized = grid.serialize(Some(usize::MAX));
+        if serialized.is_some() {
+            break;
+        }
+    }
+    let serialized = serialized.expect("the pass finishes after the reflow");
+    assert_eq!(
+        serialized.matches('W').count(),
+        10,
+        "the carried half must be saved once, snapshot:\n{serialized}"
+    );
+    assert_eq!(
+        serialized.matches('X').count(),
+        10,
+        "the half copied before the reflow must not be repeated, snapshot:\n{serialized}"
+    );
+}
+
+#[test]
+fn snapshot_pass_does_not_break_a_wrapped_line_at_a_quantum_boundary() {
+    let quantum = super::SCREEN_ROW_QUANTUM;
+    let width = 10;
+    let rows = quantum + 1;
+    let grid = create_grid_with_size_and_raw(4, width, &vec![b'B'; rows * width]);
+    let mut serialized = None;
+    for _ in 0..4 {
+        serialized = grid.serialize(Some(usize::MAX));
+        if serialized.is_some() {
+            break;
+        }
+    }
+    let serialized = serialized.expect("the wrapped line finishes");
+    let first = serialized.find('B').expect("the line has cells");
+    let last = serialized.rfind('B').expect("the line has cells");
+    let between = &serialized[first..=last];
+    assert_eq!(between.matches('B').count(), rows * width);
+    assert!(
+        !between.contains('\n') && !between.contains('\r'),
+        "a wrapped line must stay one line across the quantum boundary:\n{serialized}"
+    );
+}
+
+#[test]
+fn snapshot_pass_only_scans_the_requested_rows() {
+    let grid = wide_marked_scrollback(1_000, 3_000);
+    super::reset_serialize_budget_rows_scanned();
+    let serialized = grid
+        .serialize(Some(100))
+        .expect("viewport plus the requested scrollback serializes");
+    let scanned = super::serialize_budget_rows_scanned();
+    assert!(
+        scanned <= 200,
+        "a 100-row request scanned {scanned} history rows"
+    );
+    assert!(serialized.contains("02990x"));
+    assert!(!serialized.contains("02000x"));
+}
+
+#[test]
+fn snapshot_pass_drops_a_viewport_row_past_the_cell_ceiling() {
+    let budget = super::MAX_SERIALIZE_SNAPSHOT_CELLS;
+    let mut grid =
+        create_grid_with_size_and_raw(2, 40, b"OLDEST_VIEWPORT_ROW\r\nNEWEST_VIEWPORT_ROW");
+    assert!(
+        grid.lines_above.is_empty(),
+        "the markers must sit in the viewport, not scrollback"
+    );
+    assert!(row_text(&grid.viewport[0]).contains("OLDEST_VIEWPORT_ROW"));
+    assert!(row_text(grid.viewport.back().expect("newest row")).contains("NEWEST_VIEWPORT_ROW"));
+    grid.viewport[0].trailing_blanks = u32::try_from(budget).expect("budget fits in u32");
+    let viewport_cells: usize = grid.viewport.iter().map(|row| row.snapshot_cost()).sum();
+    assert!(
+        viewport_cells > budget,
+        "viewport snapshot cost {viewport_cells} must exceed the {budget} budget"
+    );
+
+    let serialized = grid
+        .serialize(Some(0))
+        .expect("bounded viewport serializes");
+    assert!(
+        !serialized.contains("OLDEST_VIEWPORT_ROW"),
+        "the oldest viewport row must be dropped, not copied"
+    );
+    assert!(
+        serialized.contains("NEWEST_VIEWPORT_ROW"),
+        "the newest retained viewport row must be present"
+    );
+}
+
+#[test]
+fn snapshot_pass_keeps_a_finished_pane_until_cleared() {
+    let mut grid = wide_marked_scrollback(20, 10);
+    let first = grid
+        .serialize(Some(usize::MAX))
+        .expect("a small pass finishes in one call");
+    feed_bytes(&mut grid, b"AFTER_FREEZE\r\n");
+    let second = grid
+        .serialize(Some(usize::MAX))
+        .expect("a finished pass stays cached");
+    assert_eq!(first, second);
+    assert!(!second.contains("AFTER_FREEZE"));
+    grid.clear_serialize_snapshot();
+    let third = grid
+        .serialize(Some(usize::MAX))
+        .expect("clearing the pass freezes the pane again");
+    assert!(third.contains("AFTER_FREEZE"));
+}

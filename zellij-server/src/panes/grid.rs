@@ -17,9 +17,10 @@ use zellij_utils::data::{
 };
 use zellij_utils::errors::prelude::*;
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeSet, HashSet, VecDeque},
     fmt::{self, Debug, Formatter},
     num::NonZeroU32,
     str,
@@ -1061,6 +1062,8 @@ pub struct Grid {
     pub osc7_payload: Option<String>,
     pub shell_reports: crate::attention::signals::ShellReportState,
     unseen_output_mark: Option<(usize, usize)>,
+    /// Frozen viewport snapshot. Later turns copy this row order.
+    serialize_resume: RefCell<SerializeResume>,
 }
 
 impl Grid {
@@ -1338,6 +1341,170 @@ fn resolve_highlight_colors(
     }
 }
 
+/// Rows one screen-thread turn copies while taking a viewport snapshot.
+pub(crate) const SCREEN_ROW_QUANTUM: usize = 128;
+/// Absolute cell ceiling for one serialization snapshot. A single row above
+/// this is refused. One turn still copies only [`SCREEN_ROW_QUANTUM`] rows
+/// and [`SNAPSHOT_TURN_CELL_BUDGET`] cells.
+pub(crate) const MAX_SERIALIZE_SNAPSHOT_CELLS: usize = 4 * 1024 * 1024;
+/// One quantum of 1024-cell rows. The wider absolute ceiling is separate.
+const SNAPSHOT_TURN_CELL_BUDGET: usize = SCREEN_ROW_QUANTUM * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static SERIALIZE_BUDGET_ROWS_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn serialize_budget_rows_scanned() -> usize {
+    SERIALIZE_BUDGET_ROWS_SCANNED.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_serialize_budget_rows_scanned() {
+    SERIALIZE_BUDGET_ROWS_SCANNED.with(|c| c.set(0));
+}
+
+/// A snapshot pass frozen on the first call for a request. `pending` is the
+/// stamps of that window in newest-screen-line-first order. Later turns copy
+/// the front of this list. A row created after the freeze is absent. A tail
+/// minted after the freeze is copied with the row it continues. `parts` holds
+/// each copied row, newest quantum first and oldest row first inside the
+/// quantum. A continuation replaced by one of those tails is in `superseded`
+/// and left out of the joined text.
+#[derive(Clone)]
+struct SerializeResume {
+    request: Option<usize>,
+    pending: Vec<u64>,
+    known_stamps: HashSet<u64>,
+    taken_cells: usize,
+    done: bool,
+    started: bool,
+    parts: Vec<Vec<(u64, String)>>,
+    screen_successor: HashMap<u64, u64>,
+    continuation_stamps: HashSet<u64>,
+    superseded: HashSet<u64>,
+}
+
+impl Default for SerializeResume {
+    fn default() -> Self {
+        Self {
+            request: None,
+            pending: Vec::new(),
+            known_stamps: HashSet::new(),
+            taken_cells: 0,
+            done: false,
+            started: false,
+            parts: Vec::new(),
+            screen_successor: HashMap::new(),
+            continuation_stamps: HashSet::new(),
+            superseded: HashSet::new(),
+        }
+    }
+}
+
+impl SerializeResume {
+    fn joined(&self) -> String {
+        let len = self
+            .parts
+            .iter()
+            .flat_map(|turn| turn.iter())
+            .filter(|(stamp, _)| !self.superseded.contains(stamp))
+            .map(|(_, text)| text.len())
+            .sum();
+        let mut out = String::with_capacity(len);
+        for turn in self.parts.iter().rev() {
+            for (stamp, text) in turn {
+                if !self.superseded.contains(stamp) {
+                    out.push_str(text);
+                }
+            }
+        }
+        out
+    }
+
+    /// The frozen continuation rows after `parent` were replaced by a reflow
+    /// tail. Drop them when the pass is joined.
+    fn supersede_frozen_continuations(&mut self, parent: u64) {
+        let mut cursor = parent;
+        while let Some(next) = self.screen_successor.get(&cursor).copied() {
+            if !self.continuation_stamps.contains(&next) {
+                break;
+            }
+            self.superseded.insert(next);
+            cursor = next;
+        }
+    }
+}
+
+/// Continuations that follow `rows` until a canonical row or a stamp the
+/// snapshot already knows. Returns false when that boundary is inside
+/// `rows`, so the caller must not walk into the next buffer.
+fn collect_unseen_reflow_tails<'a, I>(
+    rows: I,
+    known_stamps: &HashSet<u64>,
+    out: &mut Vec<u64>,
+) -> bool
+where
+    I: Iterator<Item = &'a Row>,
+{
+    for row in rows {
+        if row.is_canonical || known_stamps.contains(&row.row_stamp) {
+            return false;
+        }
+        out.push(row.row_stamp);
+    }
+    true
+}
+
+fn snapshot_row_for_resume(
+    viewport: &VecDeque<Row>,
+    lines_above: &VecDeque<Row>,
+    lines_below: &VecDeque<Row>,
+    stamp: u64,
+    known_stamps: &HashSet<u64>,
+) -> Option<(usize, Row, Vec<u64>)> {
+    if let Some(index) = viewport.iter().position(|row| row.row_stamp == stamp) {
+        let mut tails = Vec::new();
+        if collect_unseen_reflow_tails(viewport.iter().skip(index + 1), known_stamps, &mut tails) {
+            collect_unseen_reflow_tails(lines_below.iter(), known_stamps, &mut tails);
+        }
+        let row = &viewport[index];
+        return Some((row.snapshot_cost(), row.clone(), tails));
+    }
+    if let Some(index) = lines_above.iter().position(|row| row.row_stamp == stamp) {
+        let mut tails = Vec::new();
+        let mut proceed = collect_unseen_reflow_tails(
+            lines_above.iter().skip(index + 1),
+            known_stamps,
+            &mut tails,
+        );
+        if proceed {
+            proceed = collect_unseen_reflow_tails(viewport.iter(), known_stamps, &mut tails);
+        }
+        if proceed {
+            collect_unseen_reflow_tails(lines_below.iter(), known_stamps, &mut tails);
+        }
+        let row = &lines_above[index];
+        return Some((
+            row.snapshot_cost(),
+            row.with_trailing_blanks().into_owned(),
+            tails,
+        ));
+    }
+    if let Some(index) = lines_below.iter().position(|row| row.row_stamp == stamp) {
+        let mut tails = Vec::new();
+        collect_unseen_reflow_tails(lines_below.iter().skip(index + 1), known_stamps, &mut tails);
+        let row = &lines_below[index];
+        return Some((
+            row.snapshot_cost(),
+            row.with_trailing_blanks().into_owned(),
+            tails,
+        ));
+    }
+    None
+}
+
 impl Grid {
     pub fn new(
         rows: usize,
@@ -1446,6 +1613,7 @@ impl Grid {
             osc7_payload: None,
             shell_reports: Default::default(),
             unseen_output_mark: None,
+            serialize_resume: RefCell::new(SerializeResume::default()),
         }
     }
     pub fn set_selection_options(&mut self, osc133_command_selection: bool, word_separators: &str) {
@@ -2257,41 +2425,192 @@ impl Grid {
             kitty_image_chunks,
         )
     }
+    pub fn serialize_snapshot_has_more(&self) -> bool {
+        let resume = self.serialize_resume.borrow();
+        resume.started && !resume.done
+    }
+    pub fn clear_serialize_snapshot(&self) {
+        *self.serialize_resume.borrow_mut() = SerializeResume::default();
+    }
     pub fn serialize(&self, scrollback_lines_to_serialize: Option<usize>) -> Option<String> {
-        match scrollback_lines_to_serialize {
-            Some(scrollback_lines_to_serialize) => {
-                let first_index = if scrollback_lines_to_serialize == 0 {
-                    0
-                } else {
-                    let first_requested_index = self
-                        .lines_above
-                        .len()
-                        .saturating_sub(scrollback_lines_to_serialize);
-                    self.lines_above
-                        .iter()
-                        .enumerate()
-                        .skip(first_requested_index)
-                        .find(|(_, row)| row.is_canonical)
-                        .map(|(index, _)| index)
-                        .unwrap_or(first_requested_index)
+        {
+            let resume = self.serialize_resume.borrow();
+            // A finished pane keeps its joined text until the screen publishes
+            // and clears it. Restarting here would drop that text while another
+            // pane still has older quanta left.
+            if resume.started && resume.done && resume.request == scrollback_lines_to_serialize {
+                return Some(resume.joined());
+            }
+        }
+        let history_len = self.lines_above.len();
+        // `None` serializes the viewport only. `Some` also includes the
+        // requested scrollback, aligned to a canonical row like before.
+        let history_first = match scrollback_lines_to_serialize {
+            Some(0) => 0,
+            Some(limit) => {
+                let first_requested_index = history_len.saturating_sub(limit);
+                self.lines_above
+                    .iter()
+                    .enumerate()
+                    .skip(first_requested_index)
+                    .find(|(_, row)| row.is_canonical)
+                    .map(|(index, _)| index)
+                    .unwrap_or(first_requested_index)
+            },
+            None => history_len,
+        };
+        let mut resume = self.serialize_resume.borrow_mut();
+        if !resume.started || resume.request != scrollback_lines_to_serialize {
+            // Newest screen line first. Stamps name the rows of this pass.
+            let mut pending = Vec::new();
+            for row in self.viewport.iter().rev() {
+                pending.push(row.row_stamp);
+            }
+            for index in (history_first..history_len).rev() {
+                pending.push(self.lines_above[index].row_stamp);
+            }
+            let mut screen_successor = HashMap::new();
+            let mut continuation_stamps = HashSet::new();
+            let mut previous = None;
+            let history_rows = self
+                .lines_above
+                .iter()
+                .skip(history_first)
+                .take(history_len.saturating_sub(history_first));
+            for row in history_rows.chain(self.viewport.iter()) {
+                if !row.is_canonical {
+                    continuation_stamps.insert(row.row_stamp);
+                }
+                if let Some(previous) = previous {
+                    screen_successor.insert(previous, row.row_stamp);
+                }
+                previous = Some(row.row_stamp);
+            }
+            if pending.is_empty() {
+                *resume = SerializeResume {
+                    request: scrollback_lines_to_serialize,
+                    pending,
+                    known_stamps: HashSet::new(),
+                    taken_cells: 0,
+                    done: true,
+                    started: true,
+                    parts: Vec::new(),
+                    screen_successor,
+                    continuation_stamps,
+                    superseded: HashSet::new(),
                 };
-                let mut to_serialize = vec![];
-                for line in self.lines_above.iter().skip(first_index) {
-                    to_serialize.push(line.with_trailing_blanks().into_owned());
+                return Some(String::new());
+            }
+            let known_stamps = pending.iter().copied().collect();
+            *resume = SerializeResume {
+                request: scrollback_lines_to_serialize,
+                pending,
+                known_stamps,
+                taken_cells: 0,
+                done: false,
+                started: true,
+                parts: Vec::new(),
+                screen_successor,
+                continuation_stamps,
+                superseded: HashSet::new(),
+            };
+        }
+
+        let mut taken_cells = resume.taken_cells;
+        let mut turn_cells_left = SNAPSHOT_TURN_CELL_BUDGET;
+        let mut turn_rows_left = SCREEN_ROW_QUANTUM;
+        let mut copied: Vec<Row> = Vec::new();
+        let mut index = 0usize;
+        let mut finished = false;
+        let mut known_stamps = std::mem::take(&mut resume.known_stamps);
+        while index < resume.pending.len() {
+            if turn_rows_left == 0 {
+                break;
+            }
+            let stamp = resume.pending[index];
+            let Some((cost, row, tails)) = snapshot_row_for_resume(
+                &self.viewport,
+                &self.lines_above,
+                &self.lines_below,
+                stamp,
+                &known_stamps,
+            ) else {
+                // The row left the buffer. Skip it so the pass cannot stall.
+                index += 1;
+                continue;
+            };
+            if !tails.is_empty() {
+                // Reflow minted these continuations after the freeze. They sit
+                // just after this row on screen, so they belong immediately
+                // before it in newest-first order. The frozen continuation
+                // rows of this line are the pre-reflow text and must not be
+                // joined as well.
+                resume.supersede_frozen_continuations(stamp);
+                let newest_first: Vec<u64> = tails.into_iter().rev().collect();
+                for tail in &newest_first {
+                    known_stamps.insert(*tail);
                 }
-                for line in &self.viewport {
-                    to_serialize.push(line.clone())
+                resume.pending.splice(index..index, newest_first);
+                continue;
+            }
+            #[cfg(test)]
+            SERIALIZE_BUDGET_ROWS_SCANNED.with(|c| c.set(c.get() + 1));
+            if cost > MAX_SERIALIZE_SNAPSHOT_CELLS
+                || taken_cells.saturating_add(cost) > MAX_SERIALIZE_SNAPSHOT_CELLS
+            {
+                finished = true;
+                break;
+            }
+            if !copied.is_empty() && cost > turn_cells_left {
+                break;
+            }
+            copied.push(row);
+            taken_cells = taken_cells.saturating_add(cost);
+            turn_cells_left = turn_cells_left.saturating_sub(cost);
+            turn_rows_left -= 1;
+            index += 1;
+        }
+        resume.known_stamps = known_stamps;
+        if finished {
+            resume.pending.clear();
+        } else {
+            resume.pending.drain(..index);
+        }
+        resume.taken_cells = taken_cells;
+        resume.done = finished || resume.pending.is_empty();
+        // This quantum was collected newest-screen-line first. Emit it
+        // oldest-first. Unfinished turns return nothing, so a caller cannot
+        // persist a partial quantum.
+        if copied.is_empty() {
+            resume.done = true;
+            return Some(resume.joined());
+        }
+        copied.reverse();
+        // One row at a time. A continuation is serialized with a leading
+        // break because its slice starts at index 0; that break is the
+        // middle of a logical line, so drop it.
+        let mut turn = Vec::with_capacity(copied.len());
+        for row in &copied {
+            let Some(mut piece) = self
+                .output_buffer
+                .serialize(std::slice::from_ref(row), self.osc8_hyperlinks, None)
+                .ok()
+            else {
+                resume.done = true;
+                return None;
+            };
+            if !row.is_canonical {
+                if let Some(rest) = piece.strip_prefix("\n\r") {
+                    piece = rest.to_string();
                 }
-                self.output_buffer
-                    .serialize(to_serialize.as_slice(), self.osc8_hyperlinks, None)
-                    .ok()
-            },
-            None => {
-                let viewport_vec: Vec<Row> = self.viewport.iter().cloned().collect();
-                self.output_buffer
-                    .serialize(&viewport_vec, self.osc8_hyperlinks, None)
-                    .ok()
-            },
+            }
+            turn.push((row.row_stamp, piece));
+        }
+        resume.parts.push(turn);
+        if resume.done {
+            Some(resume.joined())
+        } else {
+            None
         }
     }
     pub fn render(
@@ -6733,9 +7052,18 @@ impl AlternateScreenState {
     }
 }
 
+fn mint_row_stamp() -> u64 {
+    static NEXT_ROW_STAMP: AtomicU64 = AtomicU64::new(1);
+    NEXT_ROW_STAMP.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
 #[derive(Clone)]
 pub struct Row {
     pub columns: Vec<TerminalCharacter>,
+    /// Identity of this logical line. It stays put when the row moves between
+    /// scrollback and the viewport. A new line, including one left behind when
+    /// this row is split, gets a new stamp.
+    row_stamp: u64,
     osc133_markers: Osc133Markers,
     width: Option<NonZeroU32>,
     trailing_blanks: u32,
@@ -6747,7 +7075,7 @@ pub struct Row {
 }
 
 #[cfg(target_arch = "x86_64")]
-const _: [(); 48] = [(); std::mem::size_of::<Row>()];
+const _: [(); 56] = [(); std::mem::size_of::<Row>()];
 
 fn encode_width(width: usize) -> Option<NonZeroU32> {
     u32::try_from(width)
@@ -6847,6 +7175,7 @@ impl Row {
     pub fn new() -> Self {
         Row {
             columns: Vec::new(),
+            row_stamp: mint_row_stamp(),
             osc133_markers: Osc133Markers::default(),
             width: None,
             trailing_blanks: 0,
@@ -6860,6 +7189,7 @@ impl Row {
     pub fn with_capacity(capacity: usize) -> Self {
         Row {
             columns: columns_with_capacity(capacity),
+            row_stamp: mint_row_stamp(),
             osc133_markers: Osc133Markers::default(),
             width: None,
             trailing_blanks: 0,
@@ -6873,6 +7203,7 @@ impl Row {
     pub fn from_columns(columns: Vec<TerminalCharacter>) -> Self {
         Row {
             columns,
+            row_stamp: mint_row_stamp(),
             osc133_markers: Osc133Markers::default(),
             width: None,
             trailing_blanks: 0,
@@ -6931,6 +7262,12 @@ impl Row {
             width += terminal_character.width();
         }
         width
+    }
+    /// Cost of cloning this row into a serialization snapshot: its display
+    /// cells plus one unit per OSC 133 marker, which a clone copies even when
+    /// the row holds no characters.
+    fn snapshot_cost(&self) -> usize {
+        self.width() + self.osc133_markers.as_slice().len()
     }
     pub fn compress_trailing_blanks(&mut self) {
         let mut kept = self.columns.len();
@@ -7375,6 +7712,7 @@ impl Row {
     pub fn split_to_rows_of_length(&mut self, max_row_length: usize) -> Vec<Row> {
         let drained = Row {
             columns: Vec::new(),
+            row_stamp: mint_row_stamp(),
             osc133_markers: Osc133Markers::default(),
             width: None,
             trailing_blanks: 0,
@@ -7390,6 +7728,10 @@ impl Row {
         if rows.is_empty() {
             return vec![];
         }
+        // The first physical row keeps the logical line's stamp. Extra wraps
+        // are new lines. The emptied shell left in the caller already has its
+        // own stamp.
+        let carried_stamp = rows[0].row_stamp;
         let is_canonical = rows[0].is_canonical;
         let bg_color = rows[0].bg_color;
         let may_have_groups = rows.iter().any(|row| row.may_have_groups);
@@ -7428,7 +7770,11 @@ impl Row {
             parts.push(part);
         }
         if parts.is_empty() {
-            parts.push(Row::new().with_bg_color(bg_color));
+            let mut empty = Row::new().with_bg_color(bg_color);
+            empty.row_stamp = carried_stamp;
+            parts.push(empty);
+        } else if let Some(part) = parts.first_mut() {
+            part.row_stamp = carried_stamp;
         }
         if is_canonical {
             if let Some(part) = parts.get_mut(0) {

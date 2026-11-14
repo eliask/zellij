@@ -1069,6 +1069,12 @@ pub trait Pane {
     fn serialize(&self, _scrollback_lines_to_serialize: Option<usize>) -> Option<String> {
         None
     }
+    /// `true` while a pane snapshot still has older rows inside the request
+    /// and the absolute cell ceiling. The next `serialize` call emits them.
+    fn serialize_snapshot_has_more(&self) -> bool {
+        false
+    }
+    fn clear_serialize_snapshot(&self) {}
     fn rerun(&mut self) -> Option<RunCommand> {
         None
     } // only relevant to terminal panes
