@@ -467,7 +467,9 @@ pub(crate) struct Tab {
     hidden_bars: HiddenBars,
     auto_layout: bool,
     pending_vte_events: HashMap<u32, Vec<VteBytes>>,
-    pub selecting_with_mouse_in_pane: Option<PaneId>, // this is only pub for the tests
+    /// Pane each client is selecting in. Release and disconnect retire only
+    /// that client's gesture, so a newer client's selection stays put.
+    pub selecting_with_mouse_in_pane: HashMap<ClientId, PaneId>, // this is only pub for the tests
     pane_being_resized_with_mouse: Option<PaneResizeState>,
     link_handler: Rc<RefCell<LinkHandler>>,
     clipboard_provider: ClipboardProvider,
@@ -1348,7 +1350,7 @@ impl Tab {
             auto_layout,
             pending_vte_events: HashMap::new(),
             connected_clients,
-            selecting_with_mouse_in_pane: None,
+            selecting_with_mouse_in_pane: HashMap::new(),
             pane_being_resized_with_mouse: None,
             link_handler: Rc::new(RefCell::new(LinkHandler::new())),
             clipboard_provider,
@@ -3055,15 +3057,22 @@ impl Tab {
         self.last_mouse_activity_time.remove(&client_id);
         self.pane_drawings.remove(&client_id);
         self.mouse_click_tracker.remove(&client_id);
+        if let Some(pane_id) = self.selecting_with_mouse_in_pane.remove(&client_id) {
+            if let Some(pane) = self.get_pane_with_id_mut(pane_id) {
+                pane.reset_selection(Some(client_id));
+            }
+        }
         if is_connected_to_this_tab || was_dimmed {
             self.set_client_dimmed(client_id, false);
             self.set_force_render();
         }
     }
     fn forget_held_mouse_gestures(&mut self) {
-        if let Some(pane_id) = self.selecting_with_mouse_in_pane.take() {
+        let selections: Vec<(ClientId, PaneId)> =
+            self.selecting_with_mouse_in_pane.drain().collect();
+        for (client_id, pane_id) in selections {
             if let Some(pane) = self.get_pane_with_id_mut(pane_id) {
-                pane.reset_selection(None);
+                pane.reset_selection(Some(client_id));
             }
         }
         self.pane_being_resized_with_mouse = None;
@@ -7127,9 +7136,8 @@ impl Tab {
         ignore_suppressed_panes: bool,
         exit_status: Option<i32>,
     ) {
-        if self.selecting_with_mouse_in_pane == Some(id) {
-            self.selecting_with_mouse_in_pane = None;
-        }
+        self.selecting_with_mouse_in_pane
+            .retain(|_, pane_id| *pane_id != id);
         self.forget_typed_input(id);
         let id_parks_a_different_pane = self.pane_parked_by(&id).is_some();
         if !ignore_suppressed_panes

@@ -140,6 +140,10 @@ pub struct TerminalPane {
     pub style: Style,
     vte_parser: vt_parser::Parser,
     selection_scrolled_at: time::Instant,
+    /// Client that owns the one shared grid selection. A stale release or
+    /// disconnect must not clear a newer client's gesture. This is not
+    /// per-client scrollback: the viewport stays shared.
+    selection_owner: Option<ClientId>,
     content_offset: Offset,
     pane_title: String,
     pane_name: String,
@@ -831,8 +835,10 @@ impl Pane for TerminalPane {
             self.set_should_render(true);
         }
     }
-    fn select_command_at_scroll_position(&mut self, _client_id: ClientId) {
+    fn select_command_at_scroll_position(&mut self, client_id: ClientId) {
         if self.grid.select_command_at_scroll_position() {
+            // Copy reads the selection only for the client that owns it.
+            self.selection_owner = Some(client_id);
             self.set_should_render(true);
         }
     }
@@ -1034,12 +1040,16 @@ impl Pane for TerminalPane {
             .set_selection_options(osc133_command_selection, word_separators);
     }
 
-    fn start_selection(&mut self, start: &Position, _client_id: ClientId) {
+    fn start_selection(&mut self, start: &Position, client_id: ClientId) {
+        self.selection_owner = Some(client_id);
         self.grid.start_selection(start);
         self.set_should_render(true);
     }
 
-    fn update_selection(&mut self, to: &Position, _client_id: ClientId) {
+    fn update_selection(&mut self, to: &Position, client_id: ClientId) {
+        if self.selection_owner != Some(client_id) {
+            return;
+        }
         let should_scroll = self.selection_scrolled_at.elapsed()
             >= time::Duration::from_millis(SELECTION_SCROLL_INTERVAL_MS);
         let cursor_at_the_bottom = to.line.0 < 0 && should_scroll;
@@ -1062,16 +1072,28 @@ impl Pane for TerminalPane {
         }
     }
 
-    fn end_selection(&mut self, end: &Position, _client_id: ClientId) {
+    fn end_selection(&mut self, end: &Position, client_id: ClientId) {
+        if self.selection_owner != Some(client_id) {
+            return;
+        }
         self.grid.end_selection(end);
         self.set_should_render(true);
     }
 
-    fn reset_selection(&mut self, _client_id: Option<ClientId>) {
+    fn reset_selection(&mut self, client_id: Option<ClientId>) {
+        if let Some(client_id) = client_id {
+            if self.selection_owner != Some(client_id) {
+                return;
+            }
+        }
+        self.selection_owner = None;
         self.grid.reset_selection();
     }
 
-    fn get_selected_text(&self, _client_id: ClientId) -> Option<String> {
+    fn get_selected_text(&self, client_id: ClientId) -> Option<String> {
+        if self.selection_owner != Some(client_id) {
+            return None;
+        }
         self.grid.get_selected_text()
     }
 
@@ -1679,6 +1701,7 @@ impl TerminalPane {
             active_at: Instant::now(),
             style,
             selection_scrolled_at: time::Instant::now(),
+            selection_owner: None,
             pane_title: initial_pane_title,
             pane_name: pane_name.clone(),
             prev_pane_name: pane_name,
