@@ -1,7 +1,10 @@
 use crate::background_jobs::write_session_state_to_disk;
 use crate::background_jobs::BackgroundJob;
 use crate::global_async_runtime::get_tokio_runtime as async_runtime;
-use crate::os_input_output::{env_value, AsyncReader, NullAsyncReader, PaneEnv};
+use crate::os_input_output::{
+    env_value, AsyncReader, ChildPidFd, ForegroundSignal, NullAsyncReader, PaneEnv,
+};
+use crate::pty_writer::PtyWriteInstruction;
 use crate::route::NotificationEnd;
 use crate::session_suggestions::{ContextTrigger, SessionSuggestionsJob};
 use crate::terminal_bytes::TerminalBytes;
@@ -107,6 +110,11 @@ pub enum PtyInstruction {
     ),
     ClosePane(PaneId, Option<NotificationEnd>),
     ClosePaneThatWasNotCreated(PaneId, Option<NotificationEnd>),
+    /// Forget the child process of a pane whose command exited and was
+    /// reaped. The generation names the run that exited, so a late
+    /// notification from a replaced run cannot erase the process that
+    /// replaced it. Reader EOF is not this path.
+    ClearPaneProcessIdentity(PaneId, u64),
     CloseTab(Vec<PaneId>),
     ReRunCommandInPane(PaneId, RunCommand, Option<NotificationEnd>),
     DropToShellInPane {
@@ -202,6 +210,7 @@ impl From<&PtyInstruction> for PtyContext {
             PtyInstruction::ClosePaneThatWasNotCreated(..) => {
                 PtyContext::ClosePaneThatWasNotCreated
             },
+            PtyInstruction::ClearPaneProcessIdentity(..) => PtyContext::ClosePane,
             PtyInstruction::CloseTab(_) => PtyContext::CloseTab,
             PtyInstruction::NewTab(..) => PtyContext::NewTab,
             PtyInstruction::OverrideLayout(..) => PtyContext::OverrideLayout,
@@ -232,10 +241,42 @@ impl From<&PtyInstruction> for PtyContext {
     }
 }
 
+/// Pid, pidfd, and generation of one process invocation.
+///
+/// The reader task stays in `Pty::task_handles` until the next run starts
+/// or the pane closes. Child exit drops the pid without dropping a reader
+/// that is still draining. Reader EOF is that task finishing; it is not
+/// this record being cleared.
+struct TerminalRun {
+    generation: Option<u64>,
+    /// Pidfd captured at spawn, before the exit watcher can reap. Empty when
+    /// that open failed, or when a test stored only a pid. Not opened again.
+    #[cfg(target_os = "linux")]
+    pidfd: Option<std::os::fd::OwnedFd>,
+}
+
+impl Default for TerminalRun {
+    fn default() -> Self {
+        Self {
+            generation: None,
+            #[cfg(target_os = "linux")]
+            pidfd: None,
+        }
+    }
+}
+
 pub(crate) struct Pty {
     pub active_panes: HashMap<ClientId, PaneId>,
     pub bus: Bus<PtyInstruction>,
     pub id_to_child_pid: HashMap<u32, u32>, // terminal_id => child pid
+    terminal_runs: HashMap<u32, TerminalRun>,
+    /// Generation whose exit this thread has already applied. Outlives the
+    /// pid so a later close does not signal a reused number.
+    reaped_generations: HashMap<u32, u64>,
+    next_run_generation: u64,
+    /// Tests inject the pidfd signal-0 result. `None` asks the stored pidfd.
+    #[cfg(test)]
+    test_shell_pid_probe: Option<std::result::Result<(), i32>>,
     originating_plugins: HashMap<u32, OriginatingPlugin>,
     origin_pane_ids: HashMap<u32, PaneId>,
     debug_to_file: bool,
@@ -648,6 +689,10 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: Str
                 drop(completion_tx);
                 close_result.with_context(|| format!("failed to close pane {:?}", id))?;
             },
+            PtyInstruction::ClearPaneProcessIdentity(PaneId::Terminal(id), run_generation) => {
+                pty.clear_exited_process_identity(id, run_generation);
+            },
+            PtyInstruction::ClearPaneProcessIdentity(PaneId::Plugin(_), _) => {},
             PtyInstruction::CloseTab(ids) => {
                 pty.close_tab(ids)
                     .and_then(|_| {
@@ -1011,6 +1056,11 @@ impl Pty {
             active_panes: HashMap::new(),
             bus,
             id_to_child_pid: HashMap::new(),
+            terminal_runs: HashMap::new(),
+            reaped_generations: HashMap::new(),
+            next_run_generation: 0,
+            #[cfg(test)]
+            test_shell_pid_probe: None,
             debug_to_file,
             task_handles: HashMap::new(),
             default_editor,
@@ -1071,9 +1121,8 @@ impl Pty {
     fn cwd_of_pane(&self, pane_id: &PaneId) -> Option<PathBuf> {
         match pane_id {
             PaneId::Terminal(terminal_id) => self
-                .id_to_child_pid
-                .get(terminal_id)
-                .and_then(|&pid| {
+                .live_stored_shell_pid(*terminal_id)
+                .and_then(|pid| {
                     self.bus
                         .os_input
                         .as_ref()
@@ -1125,10 +1174,11 @@ impl Pty {
                 .and_then(|pane| match pane {
                     PaneId::Plugin(plugin_id) => self.plugin_cwds.get(plugin_id).cloned(),
                     PaneId::Terminal(id) => {
-                        // Try to get CWD from OS, fall back to cached value
-                        self.id_to_child_pid
-                            .get(id)
-                            .and_then(|&pid| {
+                        // Try to get CWD from OS, fall back to cached value.
+                        // The stored number is used only while it still names
+                        // this run.
+                        self.live_stored_shell_pid(*id)
+                            .and_then(|pid| {
                                 self.bus
                                     .os_input
                                     .as_ref()
@@ -1147,10 +1197,11 @@ impl Pty {
         if cwd.is_none() {
             *cwd = match pane_id {
                 PaneId::Terminal(terminal_pane_id) => {
-                    // Try to get CWD from OS, fall back to cached value
-                    self.id_to_child_pid
-                        .get(terminal_pane_id)
-                        .and_then(|&pid| {
+                    // Try to get CWD from OS, fall back to cached value.
+                    // The stored number is used only while it still names
+                    // this run.
+                    self.live_stored_shell_pid(*terminal_pane_id)
+                        .and_then(|pid| {
                             self.bus
                                 .os_input
                                 .as_ref()
@@ -1161,6 +1212,237 @@ impl Pty {
                 PaneId::Plugin(plugin_id) => self.plugin_cwds.get(plugin_id).cloned(),
             };
         };
+    }
+    fn mint_run_generation(&mut self) -> u64 {
+        let run_generation = self.next_run_generation;
+        self.next_run_generation = self.next_run_generation.wrapping_add(1);
+        run_generation
+    }
+    fn stored_child_pid(&self, terminal_id: u32) -> Option<u32> {
+        self.id_to_child_pid.get(&terminal_id).copied()
+    }
+    fn stored_run_generation(&self, terminal_id: u32) -> Option<u64> {
+        self.terminal_runs.get(&terminal_id)?.generation
+    }
+    /// The one registration path for a pane's process identity. Spawn, layout
+    /// execution, and rerun all come through here (rerun and ordinary spawn via
+    /// [`Self::install_run`]). Pid, pidfd, and generation replace the previous
+    /// run together, even when the new pid is missing. This does not open a
+    /// pidfd and does not stop the reader; [`Self::install_run`] does that
+    /// when the run itself is replaced.
+    fn remember_run(
+        &mut self,
+        terminal_id: u32,
+        child_pid: Option<u32>,
+        child_pidfd: Option<ChildPidFd>,
+        run_generation: u64,
+    ) {
+        self.reaped_generations.remove(&terminal_id);
+        {
+            let run = self.terminal_runs.entry(terminal_id).or_default();
+            run.generation = Some(run_generation);
+            // A missing fd must not leave the previous run's fd associated
+            // with this pid. The fd was opened at spawn.
+            #[cfg(target_os = "linux")]
+            {
+                run.pidfd = child_pidfd;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = child_pidfd;
+            }
+        }
+        match child_pid {
+            Some(pid) => {
+                self.id_to_child_pid.insert(terminal_id, pid);
+            },
+            None => {
+                self.id_to_child_pid.remove(&terminal_id);
+            },
+        }
+        // The endpoint was inserted by spawn, still unbound. Binding it
+        // here is what lets a stamped write for this run through.
+        if let Some(os_input) = self.bus.os_input.as_ref() {
+            os_input.bind_terminal_generation(terminal_id, run_generation);
+        }
+        let _ = self
+            .bus
+            .senders
+            .send_to_pty_writer(PtyWriteInstruction::AdoptRun(terminal_id, run_generation));
+    }
+    /// Register a run and, when `reader` is present, start its reader.
+    /// Layout passes no reader and attaches one only after the screen accepts
+    /// the layout. Rerun announces and stops the previous reader first, so a
+    /// write or signal admitted for the old run is not applied to the new one.
+    fn install_run(
+        &mut self,
+        terminal_id: u32,
+        child_pid: Option<u32>,
+        child_pidfd: Option<ChildPidFd>,
+        run_generation: u64,
+        reader: Option<(Box<dyn AsyncReader>, String)>,
+        announce_before_replace: bool,
+        stop_previous_reader: bool,
+    ) {
+        if announce_before_replace {
+            self.announce_terminal_run(terminal_id, run_generation);
+        }
+        if stop_previous_reader {
+            self.abort_reader(terminal_id);
+        }
+        self.remember_run(terminal_id, child_pid, child_pidfd, run_generation);
+        if let Some(child_pid) = self.live_stored_shell_pid(terminal_id) {
+            self.capture_initial_cwd(terminal_id, child_pid);
+        }
+        if let Some((reader, context)) = reader {
+            self.spawn_terminal_reader(
+                terminal_id,
+                reader,
+                run_generation,
+                !announce_before_replace,
+                context,
+            );
+        }
+    }
+    fn abort_reader(&mut self, terminal_id: u32) {
+        if let Some(task) = self.task_handles.remove(&terminal_id) {
+            task.abort();
+        }
+    }
+    fn announce_terminal_run(&self, terminal_id: u32, run_generation: u64) {
+        let _ = self
+            .bus
+            .senders
+            .send_to_screen(ScreenInstruction::TerminalRunStarted(
+                terminal_id,
+                run_generation,
+            ));
+    }
+    fn spawn_terminal_reader(
+        &mut self,
+        terminal_id: u32,
+        reader: Box<dyn AsyncReader>,
+        run_generation: u64,
+        announce_run: bool,
+        context: String,
+    ) {
+        if self.stored_run_generation(terminal_id) != Some(run_generation) {
+            log::error!("not reading terminal {terminal_id}: its run was not registered");
+            return;
+        }
+        if announce_run {
+            self.announce_terminal_run(terminal_id, run_generation);
+        }
+        let activity_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let activity_flag_for_task = activity_flag.clone();
+        let senders = self.bus.senders.clone();
+        let debug_to_file = self.debug_to_file;
+        let terminal_bytes = async_runtime().spawn(async move {
+            TerminalBytes::new(
+                terminal_id,
+                run_generation,
+                reader,
+                senders,
+                debug_to_file,
+                activity_flag_for_task,
+            )
+            .listen()
+            .await
+            .context(context)
+            .fatal();
+        });
+        if self.stored_run_generation(terminal_id) != Some(run_generation) {
+            terminal_bytes.abort();
+            log::error!("not reading terminal {terminal_id}: its run was not registered");
+            return;
+        }
+        if let Some(previous) = self.task_handles.insert(terminal_id, terminal_bytes) {
+            previous.abort();
+        }
+        self.pane_activity_flags.insert(terminal_id, activity_flag);
+    }
+    fn forget_child_pid(&mut self, terminal_id: u32) -> Option<u32> {
+        let pid = self.id_to_child_pid.remove(&terminal_id);
+        if let Some(run) = self.terminal_runs.get_mut(&terminal_id) {
+            run.generation = None;
+            #[cfg(target_os = "linux")]
+            {
+                run.pidfd = None;
+            }
+        }
+        // The reader can still be draining after the process is gone.
+        // Dropping that task is not what forgets the pid.
+        if !self.task_handles.contains_key(&terminal_id) {
+            self.terminal_runs.remove(&terminal_id);
+        }
+        pid
+    }
+    /// A pane's command exited and was reaped. Forget it unless a later run
+    /// has already replaced this generation. Reader EOF is not this path.
+    fn clear_exited_process_identity(&mut self, terminal_id: u32, run_generation: u64) {
+        if self.stored_run_generation(terminal_id) == Some(run_generation) {
+            // Mark reaped before dropping the slot. Close may already be
+            // queued behind this instruction; once it runs, the pid is gone
+            // and a numeric kill is refused.
+            self.reaped_generations.insert(terminal_id, run_generation);
+            self.forget_child_pid(terminal_id);
+        }
+    }
+    /// `true` when this thread has applied the exit of the slot's generation.
+    fn child_exit_observed(&self, terminal_id: u32) -> bool {
+        match self.reaped_generations.get(&terminal_id).copied() {
+            Some(reaped) => self
+                .stored_run_generation(terminal_id)
+                .map(|current| current == reaped)
+                .unwrap_or(true),
+            None => false,
+        }
+    }
+    /// Take the pidfd without dropping the pid. `OwnedFd`'s drop closes it.
+    #[cfg(target_os = "linux")]
+    fn take_child_pidfd(&mut self, terminal_id: u32) -> Option<std::os::fd::OwnedFd> {
+        self.terminal_runs.get_mut(&terminal_id)?.pidfd.take()
+    }
+    fn hangup_child_on_close(&mut self, terminal_id: u32) {
+        let exit_observed = self.child_exit_observed(terminal_id);
+        #[cfg(target_os = "linux")]
+        let pidfd = self.take_child_pidfd(terminal_id);
+        let child_pid = self.forget_child_pid(terminal_id);
+        self.reaped_generations.remove(&terminal_id);
+        #[cfg(target_os = "linux")]
+        if let Some(pidfd) = pidfd {
+            // The fd names the process that was stored. No numeric fallback.
+            signal_pidfd_sighup(pidfd);
+            return;
+        }
+        if exit_observed {
+            return;
+        }
+        // Linux never numeric-kills here. Without a pidfd the number may
+        // already belong to another process. Other targets have no pidfd
+        // and still signal the stored pid while this thread has not
+        // observed the exit.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(child_pid) = child_pid {
+                log::warn!(
+                    "not sending SIGHUP to pane {terminal_id} (pid {child_pid}): no pidfd, refusing a numeric kill"
+                );
+            }
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(child_pid) = child_pid {
+            let err_context = || format!("failed to kill child processes for pane {terminal_id}");
+            self.bus
+                .os_input
+                .as_mut()
+                .with_context(err_context)
+                .fatal()
+                .kill(child_pid)
+                .with_context(err_context)
+                .non_fatal();
+        }
     }
     pub fn spawn_terminal(
         &mut self,
@@ -1222,11 +1504,18 @@ impl Pty {
             return Ok((terminal_id, starts_held));
         }
 
+        let run_generation = self.mint_run_generation();
         let originating_command_plugin = Arc::new(originating_command_plugin.clone());
         let originating_edit_plugin = Arc::new(originating_edit_plugin.clone());
         let quit_cb = Box::new({
             let senders = self.bus.senders.clone();
             move |pane_id, exit_status, command| {
+                // The child has been reaped, so its PID may be reused by an
+                // unrelated process: forget it before anything can signal it.
+                let _ = senders.send_to_pty(PtyInstruction::ClearPaneProcessIdentity(
+                    pane_id,
+                    run_generation,
+                ));
                 // if this command originated in a plugin, we send the plugin an event letting it
                 // know the command exited and some other useful information
                 if let PaneId::Terminal(pane_id) = pane_id {
@@ -1256,20 +1545,13 @@ impl Pty {
                     }
                 }
 
-                if hold_on_close {
-                    let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
-                        pane_id,
-                        exit_status,
-                        command,
-                    ));
-                } else {
-                    let _ = senders.send_to_screen(ScreenInstruction::ClosePane(
-                        pane_id,
-                        None,
-                        None,
-                        exit_status,
-                    ));
-                }
+                send_child_run_exited(
+                    &senders,
+                    pane_id,
+                    exit_status,
+                    run_generation,
+                    if hold_on_close { Some(command) } else { None },
+                );
             }
         });
         let pane_env = pane_env_with_origin(&self.pane_env, origin_pane_id);
@@ -1279,7 +1561,7 @@ impl Pty {
             .as_mut()
             .context("no OS I/O interface found")
             .and_then(|os_input| {
-                os_input.spawn_terminal(
+                os_input.spawn_terminal_for_run(
                     terminal_action,
                     quit_cb,
                     self.default_editor.clone(),
@@ -1299,30 +1581,24 @@ impl Pty {
                     .insert(spawned_terminal_id, origin_pane_id);
             }
         }
-        let (terminal_id, reader, child_pid): (u32, Box<dyn AsyncReader>, Option<u32>) =
-            spawn_result.with_context(err_context)?;
-        let activity_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let terminal_bytes = async_runtime().spawn({
-            let err_context =
-                |terminal_id: u32| format!("failed to run async task for terminal {terminal_id}");
-            let senders = self.bus.senders.clone();
-            let debug_to_file = self.debug_to_file;
-            let activity_flag = activity_flag.clone();
-            async move {
-                TerminalBytes::new(terminal_id, reader, senders, debug_to_file, activity_flag)
-                    .listen()
-                    .await
-                    .with_context(|| err_context(terminal_id))
-                    .fatal();
-            }
-        });
-
-        self.task_handles.insert(terminal_id, terminal_bytes);
-        self.pane_activity_flags.insert(terminal_id, activity_flag);
-        if let Some(child_pid) = child_pid {
-            self.id_to_child_pid.insert(terminal_id, child_pid);
-            self.capture_initial_cwd(terminal_id, child_pid);
-        }
+        let (terminal_id, reader, child_pid, child_pidfd): (
+            u32,
+            Box<dyn AsyncReader>,
+            Option<u32>,
+            Option<ChildPidFd>,
+        ) = spawn_result.with_context(err_context)?;
+        self.install_run(
+            terminal_id,
+            child_pid,
+            child_pidfd,
+            run_generation,
+            Some((
+                reader,
+                format!("failed to run async task for terminal {terminal_id}"),
+            )),
+            false,
+            false,
+        );
 
         let starts_held = false;
         Ok((terminal_id, starts_held))
@@ -1504,28 +1780,19 @@ impl Pty {
             }
             match reader_result {
                 Ok(reader) => {
-                    let activity_flag =
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let terminal_bytes = async_runtime().spawn({
-                        let senders = self.bus.senders.clone();
-                        let debug_to_file = self.debug_to_file;
-                        let activity_flag = activity_flag.clone();
-                        async move {
-                            TerminalBytes::new(
-                                terminal_id,
-                                reader,
-                                senders,
-                                debug_to_file,
-                                activity_flag,
-                            )
-                            .listen()
-                            .await
-                            .context("failed to spawn terminals for layout")
-                            .fatal();
-                        }
-                    });
-                    self.task_handles.insert(terminal_id, terminal_bytes);
-                    self.pane_activity_flags.insert(terminal_id, activity_flag);
+                    let Some(run_generation) = self.stored_run_generation(terminal_id) else {
+                        log::error!(
+                            "not reading terminal {terminal_id}: its run generation was not recorded"
+                        );
+                        continue;
+                    };
+                    self.spawn_terminal_reader(
+                        terminal_id,
+                        reader,
+                        run_generation,
+                        true,
+                        "failed to spawn terminals for layout".to_string(),
+                    );
                 },
                 _ => match run_command {
                     Some(run_command) => {
@@ -1682,28 +1949,19 @@ impl Pty {
             }
             match reader_result {
                 Ok(reader) => {
-                    let activity_flag =
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let terminal_bytes = async_runtime().spawn({
-                        let senders = self.bus.senders.clone();
-                        let debug_to_file = self.debug_to_file;
-                        let activity_flag = activity_flag.clone();
-                        async move {
-                            TerminalBytes::new(
-                                terminal_id,
-                                reader,
-                                senders,
-                                debug_to_file,
-                                activity_flag,
-                            )
-                            .listen()
-                            .await
-                            .context("failed to spawn terminals for layout")
-                            .fatal();
-                        }
-                    });
-                    self.task_handles.insert(terminal_id, terminal_bytes);
-                    self.pane_activity_flags.insert(terminal_id, activity_flag);
+                    let Some(run_generation) = self.stored_run_generation(terminal_id) else {
+                        log::error!(
+                            "not reading terminal {terminal_id}: its run generation was not recorded"
+                        );
+                        continue;
+                    };
+                    self.spawn_terminal_reader(
+                        terminal_id,
+                        reader,
+                        run_generation,
+                        true,
+                        "failed to spawn terminals for layout".to_string(),
+                    );
                 },
                 _ => match run_command {
                     Some(run_command) => {
@@ -1759,15 +2017,15 @@ impl Pty {
         // command
         // successfully opened
         let err_context = || format!("failed to apply run instruction");
+        let run_generation = self.mint_run_generation();
         let quit_cb = Box::new({
             let senders = self.bus.senders.clone();
             move |pane_id, exit_status, _command| {
-                let _ = senders.send_to_screen(ScreenInstruction::ClosePane(
+                let _ = senders.send_to_pty(PtyInstruction::ClearPaneProcessIdentity(
                     pane_id,
-                    None,
-                    None,
-                    exit_status,
+                    run_generation,
                 ));
+                send_child_run_exited(&senders, pane_id, exit_status, run_generation, None);
             }
         });
 
@@ -1786,6 +2044,10 @@ impl Pty {
                 let quit_cb = Box::new({
                     let senders = self.bus.senders.clone();
                     move |pane_id, exit_status, command| {
+                        let _ = senders.send_to_pty(PtyInstruction::ClearPaneProcessIdentity(
+                            pane_id,
+                            run_generation,
+                        ));
                         if let PaneId::Terminal(terminal_pane_id) = pane_id {
                             if let Some(originating_plugin) = originating_plugin.as_ref() {
                                 let update_event = Event::CommandPaneExited(
@@ -1801,20 +2063,13 @@ impl Pty {
                             }
                         }
 
-                        if hold_on_close {
-                            let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
-                                pane_id,
-                                exit_status,
-                                command,
-                            ));
-                        } else {
-                            let _ = senders.send_to_screen(ScreenInstruction::ClosePane(
-                                pane_id,
-                                None,
-                                None,
-                                exit_status,
-                            ));
-                        }
+                        send_child_run_exited(
+                            &senders,
+                            pane_id,
+                            exit_status,
+                            run_generation,
+                            if hold_on_close { Some(command) } else { None },
+                        );
                     }
                 });
                 if command.cwd.is_none() {
@@ -1850,7 +2105,7 @@ impl Pty {
                         .as_mut()
                         .context("no OS I/O interface found")
                         .with_context(err_context)?
-                        .spawn_terminal(
+                        .spawn_terminal_for_run(
                             cmd,
                             quit_cb,
                             self.default_editor.clone(),
@@ -1858,11 +2113,16 @@ impl Pty {
                         )
                         .with_context(err_context)
                     {
-                        Ok((terminal_id, reader, child_pid)) => {
-                            if let Some(child_pid) = child_pid {
-                                self.id_to_child_pid.insert(terminal_id, child_pid);
-                                self.capture_initial_cwd(terminal_id, child_pid);
-                            }
+                        Ok((terminal_id, reader, child_pid, child_pidfd)) => {
+                            self.install_run(
+                                terminal_id,
+                                child_pid,
+                                child_pidfd,
+                                run_generation,
+                                None,
+                                false,
+                                false,
+                            );
                             Ok(Some((
                                 terminal_id,
                                 starts_held,
@@ -1890,7 +2150,7 @@ impl Pty {
                     .as_mut()
                     .context("no OS I/O interface found")
                     .with_context(err_context)?
-                    .spawn_terminal(
+                    .spawn_terminal_for_run(
                         shell,
                         quit_cb,
                         self.default_editor.clone(),
@@ -1898,11 +2158,16 @@ impl Pty {
                     )
                     .with_context(err_context)
                 {
-                    Ok((terminal_id, reader, child_pid)) => {
-                        if let Some(child_pid) = child_pid {
-                            self.id_to_child_pid.insert(terminal_id, child_pid);
-                            self.capture_initial_cwd(terminal_id, child_pid);
-                        }
+                    Ok((terminal_id, reader, child_pid, child_pidfd)) => {
+                        self.install_run(
+                            terminal_id,
+                            child_pid,
+                            child_pidfd,
+                            run_generation,
+                            None,
+                            false,
+                            false,
+                        );
                         Ok(Some((terminal_id, starts_held, None, Ok(reader))))
                     },
                     Err(err) => match err.downcast_ref::<ZellijError>() {
@@ -1921,7 +2186,7 @@ impl Pty {
                     .as_mut()
                     .context("no OS I/O interface found")
                     .with_context(err_context)?
-                    .spawn_terminal(
+                    .spawn_terminal_for_run(
                         TerminalAction::OpenFile(OpenFilePayload::new(
                             path_to_file,
                             line_number,
@@ -1933,11 +2198,16 @@ impl Pty {
                     )
                     .with_context(err_context)
                 {
-                    Ok((terminal_id, reader, child_pid)) => {
-                        if let Some(child_pid) = child_pid {
-                            self.id_to_child_pid.insert(terminal_id, child_pid);
-                            self.capture_initial_cwd(terminal_id, child_pid);
-                        }
+                    Ok((terminal_id, reader, child_pid, child_pidfd)) => {
+                        self.install_run(
+                            terminal_id,
+                            child_pid,
+                            child_pidfd,
+                            run_generation,
+                            None,
+                            false,
+                            false,
+                        );
                         Ok(Some((terminal_id, starts_held, None, Ok(reader))))
                     },
                     Err(err) => match err.downcast_ref::<ZellijError>() {
@@ -1956,7 +2226,7 @@ impl Pty {
                     .as_mut()
                     .context("no OS I/O interface found")
                     .with_context(err_context)?
-                    .spawn_terminal(
+                    .spawn_terminal_for_run(
                         default_shell.clone(),
                         quit_cb,
                         self.default_editor.clone(),
@@ -1964,11 +2234,16 @@ impl Pty {
                     )
                     .with_context(err_context)
                 {
-                    Ok((terminal_id, reader, child_pid)) => {
-                        if let Some(child_pid) = child_pid {
-                            self.id_to_child_pid.insert(terminal_id, child_pid);
-                            self.capture_initial_cwd(terminal_id, child_pid);
-                        }
+                    Ok((terminal_id, reader, child_pid, child_pidfd)) => {
+                        self.install_run(
+                            terminal_id,
+                            child_pid,
+                            child_pidfd,
+                            run_generation,
+                            None,
+                            false,
+                            false,
+                        );
                         Ok(Some((terminal_id, starts_held, None, Ok(reader))))
                     },
                     Err(err) => match err.downcast_ref::<ZellijError>() {
@@ -1987,20 +2262,14 @@ impl Pty {
         let err_context = || format!("failed to close for pane {id:?}");
         match id {
             PaneId::Terminal(id) => {
-                if let Some(handle) = self.task_handles.remove(&id) {
-                    handle.abort();
-                }
-                if let Some(child_pid) = self.id_to_child_pid.remove(&id) {
-                    let err_context = || format!("failed to kill child processes for pane {id}");
-                    self.bus
-                        .os_input
-                        .as_mut()
-                        .with_context(err_context)
-                        .fatal()
-                        .kill(child_pid)
-                        .with_context(err_context)
-                        .non_fatal();
-                }
+                let _ = self
+                    .bus
+                    .senders
+                    .send_to_pty_writer(PtyWriteInstruction::ForgetRun(id));
+                self.abort_reader(id);
+                self.hangup_child_on_close(id);
+                self.terminal_runs.remove(&id);
+                self.reaped_generations.remove(&id);
                 self.pane_activity_flags.remove(&id);
                 self.terminal_cwds.remove(&id);
                 self.terminal_cmds.remove(&id);
@@ -2048,11 +2317,11 @@ impl Pty {
             return;
         };
         let folder = self.terminal_cwds.get(&terminal_id).cloned().or_else(|| {
-            self.id_to_child_pid.get(&terminal_id).and_then(|pid| {
+            self.live_stored_shell_pid(terminal_id).and_then(|pid| {
                 self.bus
                     .os_input
                     .as_ref()
-                    .and_then(|os_input| os_input.get_cwd(*pid))
+                    .and_then(|os_input| os_input.get_cwd(pid))
             })
         });
         let _ = self
@@ -2074,15 +2343,20 @@ impl Pty {
                 if let Some(originating_plugins) = self.originating_plugins.get(&id) {
                     run_command.originating_plugin = Some(originating_plugins.clone());
                 }
-                let _ = self.task_handles.remove(&id); // if all is well, this shouldn't be here
-                let _ = self.id_to_child_pid.remove(&id); // if all is wlel, this shouldn't be here
 
+                let run_generation = self.mint_run_generation();
                 let hold_on_close = run_command.hold_on_close;
                 let command_text = run_command.to_string();
                 let originating_plugin = Arc::new(run_command.originating_plugin.clone());
                 let quit_cb = Box::new({
                     let senders = self.bus.senders.clone();
                     move |pane_id, exit_status, command| {
+                        // The child has been reaped, so its PID may be reused by an
+                        // unrelated process: forget it before anything can signal it.
+                        let _ = senders.send_to_pty(PtyInstruction::ClearPaneProcessIdentity(
+                            pane_id,
+                            run_generation,
+                        ));
                         if let PaneId::Terminal(pane_id) = pane_id {
                             if let Some(originating_plugin) = originating_plugin.as_ref() {
                                 let update_event = Event::CommandPaneExited(
@@ -2097,55 +2371,44 @@ impl Pty {
                                 )]));
                             }
                         }
-                        if hold_on_close {
-                            let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
-                                pane_id,
-                                exit_status,
-                                command,
-                            ));
-                        } else {
-                            let _ = senders.send_to_screen(ScreenInstruction::ClosePane(
-                                pane_id,
-                                None,
-                                None,
-                                exit_status,
-                            ));
-                        }
+                        send_child_run_exited(
+                            &senders,
+                            pane_id,
+                            exit_status,
+                            run_generation,
+                            if hold_on_close { Some(command) } else { None },
+                        );
                     }
                 });
                 let pane_env =
                     pane_env_with_origin(&self.pane_env, self.origin_pane_ids.get(&id).copied());
-                let (reader, child_pid): (Box<dyn AsyncReader>, Option<u32>) = self
+                let (reader, child_pid, child_pidfd): (
+                    Box<dyn AsyncReader>,
+                    Option<u32>,
+                    Option<ChildPidFd>,
+                ) = self
                     .bus
                     .os_input
                     .as_mut()
                     .context("no OS I/O interface found")
                     .and_then(|os_input| {
-                        os_input.re_run_command_in_terminal(id, run_command, quit_cb, &pane_env)
+                        os_input.re_run_command_for_run(id, run_command, quit_cb, &pane_env)
                     })
                     .with_context(err_context)?;
-                let activity_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let terminal_bytes = async_runtime().spawn({
-                    let err_context =
-                        |pane_id| format!("failed to run async task for pane {pane_id:?}");
-                    let senders = self.bus.senders.clone();
-                    let debug_to_file = self.debug_to_file;
-                    let activity_flag = activity_flag.clone();
-                    async move {
-                        TerminalBytes::new(id, reader, senders, debug_to_file, activity_flag)
-                            .listen()
-                            .await
-                            .with_context(|| err_context(pane_id))
-                            .fatal();
-                    }
-                });
-
-                self.task_handles.insert(id, terminal_bytes);
-                self.pane_activity_flags.insert(id, activity_flag);
-                if let Some(child_pid) = child_pid {
-                    self.id_to_child_pid.insert(id, child_pid);
-                    self.capture_initial_cwd(id, child_pid);
-                }
+                // Only replace the current run after the new process exists.
+                // A failed spawn leaves the old generation and reader intact.
+                self.install_run(
+                    id,
+                    child_pid,
+                    child_pidfd,
+                    run_generation,
+                    Some((
+                        reader,
+                        format!("failed to run async task for pane {pane_id:?}"),
+                    )),
+                    true,
+                    true,
+                );
                 let _ = self.bus.senders.send_to_screen(
                     ScreenInstruction::AttentionCommandPaneStarted(
                         PaneId::Terminal(id),
@@ -2193,21 +2456,18 @@ impl Pty {
         let mut terminal_ids_to_commands: HashMap<u32, Vec<String>> = HashMap::new();
         let mut terminal_ids_to_cwds: HashMap<u32, PathBuf> = HashMap::new();
 
-        let pids: Vec<_> = terminal_ids
+        let panes: Vec<(u32, u32)> = terminal_ids
             .iter()
-            .filter_map(|id| self.id_to_child_pid.get(&id))
-            .copied()
+            .filter_map(|id| self.live_stored_shell_pid(*id).map(|pid| (*id, pid)))
             .collect();
+        let pid_of: HashMap<u32, u32> = panes.iter().copied().collect();
+        let pids: Vec<_> = panes.iter().map(|(_, pid)| *pid).collect();
         let (pids_to_cwds, pids_to_cmds) = self
             .bus
             .os_input
             .as_ref()
             .map(|os_input| os_input.get_cwds(pids))
             .unwrap_or_default();
-        let panes: Vec<(u32, u32)> = terminal_ids
-            .iter()
-            .filter_map(|id| self.id_to_child_pid.get(id).map(|pid| (*id, *pid)))
-            .collect();
         let foreground_cmds = self
             .bus
             .os_input
@@ -2216,7 +2476,7 @@ impl Pty {
             .unwrap_or_default();
 
         for terminal_id in terminal_ids {
-            let process_id = self.id_to_child_pid.get(&terminal_id);
+            let process_id = pid_of.get(&terminal_id);
             let cwd = process_id.and_then(|pid| pids_to_cwds.get(pid));
             let cmd_sysinfo = process_id.and_then(|pid| pids_to_cmds.get(pid));
             let cmd_foreground = foreground_cmds.get(&terminal_id);
@@ -2266,10 +2526,11 @@ impl Pty {
                 .and_then(|pane| match pane {
                     PaneId::Plugin(plugin_id) => self.plugin_cwds.get(plugin_id).cloned(),
                     PaneId::Terminal(id) => {
-                        // Try to get CWD from OS, fall back to cached value
-                        self.id_to_child_pid
-                            .get(id)
-                            .and_then(|&pid| {
+                        // Try to get CWD from OS, fall back to cached value.
+                        // The stored number is used only while it still names
+                        // this run.
+                        self.live_stored_shell_pid(*id)
+                            .and_then(|pid| {
                                 self.bus
                                     .os_input
                                     .as_ref()
@@ -2335,14 +2596,18 @@ impl Pty {
             })
             .collect();
 
+        let active_terminal_ids: Vec<u32> = active_terminal_ids
+            .into_iter()
+            .filter(|id| self.live_stored_shell_pid(*id).is_some())
+            .collect();
+
         if active_terminal_ids.is_empty() {
             return;
         }
 
         let pids: Vec<_> = active_terminal_ids
             .iter()
-            .filter_map(|id| self.id_to_child_pid.get(id))
-            .copied()
+            .filter_map(|id| self.live_stored_shell_pid(*id))
             .collect();
 
         let (pids_to_cwds, pids_to_cmds) = self
@@ -2353,8 +2618,8 @@ impl Pty {
             .unwrap_or_default();
 
         for terminal_id in &active_terminal_ids {
-            let process_id = self.id_to_child_pid.get(terminal_id);
-            let cwd = process_id.and_then(|pid| pids_to_cwds.get(pid));
+            let process_id = self.live_stored_shell_pid(*terminal_id);
+            let cwd = process_id.and_then(|pid| pids_to_cwds.get(&pid));
 
             let cwd = cwd.filter(|_| !self.terminals_with_shell_cwd.contains(terminal_id));
             if let Some(cwd) = cwd {
@@ -2382,7 +2647,7 @@ impl Pty {
                 self.terminal_cwds.insert(*terminal_id, cwd.clone());
             }
 
-            let cmd = process_id.and_then(|pid| pids_to_cmds.get(pid));
+            let cmd = process_id.and_then(|pid| pids_to_cmds.get(&pid));
             if let Some(cmd) = cmd {
                 self.terminal_cmds.insert(*terminal_id, cmd.clone());
             }
@@ -2390,7 +2655,7 @@ impl Pty {
 
         let panes: Vec<(u32, u32)> = active_terminal_ids
             .iter()
-            .filter_map(|id| self.id_to_child_pid.get(id).map(|pid| (*id, *pid)))
+            .filter_map(|id| self.live_stored_shell_pid(*id).map(|pid| (*id, pid)))
             .collect();
         let foreground_cmds = self
             .bus
@@ -2502,16 +2767,24 @@ impl Pty {
     }
 
     pub fn send_sigint_to_pane(&self, pane_id: PaneId) {
-        let err_context = || format!("failed to send SIGINT to pane {:?}", pane_id);
+        self.signal_pane(pane_id, ForegroundSignal::Interrupt);
+    }
+
+    pub fn send_sigkill_to_pane(&self, pane_id: PaneId) {
+        self.signal_pane(pane_id, ForegroundSignal::Kill);
+    }
+
+    fn signal_pane(&self, pane_id: PaneId, signal: ForegroundSignal) {
+        let signal_name = match signal {
+            ForegroundSignal::Interrupt => "SIGINT",
+            ForegroundSignal::Kill => "SIGKILL",
+        };
+        let err_context = || format!("failed to send {signal_name} to pane {:?}", pane_id);
 
         match pane_id {
             PaneId::Terminal(terminal_id) => {
-                if let Some(&child_pid) = self.id_to_child_pid.get(&terminal_id) {
-                    self.bus
-                        .os_input
-                        .as_ref()
-                        .context("no OS I/O interface found")
-                        .and_then(|os_input| os_input.send_sigint(child_pid))
+                if let Some(child_pid) = self.stored_child_pid(terminal_id) {
+                    self.deliver_terminal_signal(terminal_id, child_pid, signal)
                         .with_context(err_context)
                         .non_fatal();
                 } else {
@@ -2519,30 +2792,63 @@ impl Pty {
                 }
             },
             PaneId::Plugin(plugin_id) => {
-                log::warn!("Cannot send SIGINT to plugin pane {}", plugin_id);
+                log::warn!("Cannot send {signal_name} to plugin pane {}", plugin_id);
             },
         }
     }
 
-    pub fn send_sigkill_to_pane(&self, pane_id: PaneId) {
-        let err_context = || format!("failed to send SIGKILL to pane {:?}", pane_id);
+    /// Foreground group first, so vim receives Ctrl-C. On Linux the shell pid
+    /// is not a kill target: the exit watcher reaps on another thread, so this
+    /// instruction can still hold a reused number. The spawn-time pidfd is the
+    /// fallback, and a missing pidfd is a refusal.
+    fn deliver_terminal_signal(
+        &self,
+        terminal_id: u32,
+        child_pid: u32,
+        signal: ForegroundSignal,
+    ) -> Result<()> {
+        let os_input = self
+            .bus
+            .os_input
+            .as_ref()
+            .context("no OS I/O interface found")?;
+        #[cfg(target_os = "linux")]
+        {
+            if os_input.signal_terminal_foreground_group(terminal_id, signal)? {
+                return Ok(());
+            }
+            self.signal_stored_pidfd(terminal_id, child_pid, signal);
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match signal {
+                ForegroundSignal::Interrupt => {
+                    os_input.send_sigint_to_terminal(terminal_id, child_pid)
+                },
+                ForegroundSignal::Kill => os_input.force_kill_terminal(terminal_id, child_pid),
+            }
+        }
+    }
 
-        match pane_id {
-            PaneId::Terminal(terminal_id) => {
-                if let Some(&child_pid) = self.id_to_child_pid.get(&terminal_id) {
-                    self.bus
-                        .os_input
-                        .as_ref()
-                        .context("no OS I/O interface found")
-                        .and_then(|os_input| os_input.force_kill(child_pid))
-                        .with_context(err_context)
-                        .non_fatal();
-                } else {
-                    log::warn!("Terminal pane {} not found or not running", terminal_id);
-                }
-            },
-            PaneId::Plugin(plugin_id) => {
-                log::warn!("Cannot send SIGKILL to plugin pane {}", plugin_id);
+    /// Borrow the spawn-time pidfd. No pidfd: log and return. Do not kill the
+    /// stored number.
+    #[cfg(target_os = "linux")]
+    fn signal_stored_pidfd(&self, terminal_id: u32, child_pid: u32, signal: ForegroundSignal) {
+        let (signo, name) = match signal {
+            ForegroundSignal::Interrupt => (libc::SIGINT, "SIGINT"),
+            ForegroundSignal::Kill => (libc::SIGKILL, "SIGKILL"),
+        };
+        match self
+            .terminal_runs
+            .get(&terminal_id)
+            .and_then(|run| run.pidfd.as_ref())
+        {
+            Some(pidfd) => signal_pidfd(pidfd, signo, name),
+            None => {
+                log::warn!(
+                    "not sending {name} to pane {terminal_id} (pid {child_pid}): no pidfd, refusing a numeric kill"
+                );
             },
         }
     }
@@ -2550,7 +2856,7 @@ impl Pty {
     pub fn get_pane_pid(&self, pane_id: PaneId) -> GetPanePidResponse {
         match pane_id {
             PaneId::Terminal(terminal_id) => {
-                if let Some(&child_pid) = self.id_to_child_pid.get(&terminal_id) {
+                if let Some(child_pid) = self.live_stored_shell_pid(terminal_id) {
                     GetPanePidResponse::Ok(child_pid as i32)
                 } else {
                     GetPanePidResponse::Err(format!(
@@ -2567,7 +2873,7 @@ impl Pty {
     pub fn get_pane_running_command(&self, pane_id: PaneId) -> GetPaneRunningCommandResponse {
         match pane_id {
             PaneId::Terminal(terminal_id) => {
-                if let Some(&child_pid) = self.id_to_child_pid.get(&terminal_id) {
+                if let Some(child_pid) = self.live_stored_shell_pid(terminal_id) {
                     // Query OS for current running command
                     if let Some(os_input) = self.bus.os_input.as_ref() {
                         // First, try to get the foreground command (e.g., nvim running in bash)
@@ -2610,7 +2916,7 @@ impl Pty {
     pub fn get_pane_cwd(&self, pane_id: PaneId) -> GetPaneCwdResponse {
         match pane_id {
             PaneId::Terminal(terminal_id) => {
-                if let Some(&child_pid) = self.id_to_child_pid.get(&terminal_id) {
+                if let Some(child_pid) = self.live_stored_shell_pid(terminal_id) {
                     // Query OS for current working directory
                     if let Some(os_input) = self.bus.os_input.as_ref() {
                         let (cwds, _cmds) = os_input.get_cwds(vec![child_pid]);
@@ -2637,6 +2943,54 @@ impl Pty {
             },
         }
     }
+
+    /// Stored shell pid that may be passed to `/proc` or sysinfo.
+    /// `None` means there is no stored pid, or on Linux the spawn-time pidfd
+    /// did not prove that number is still that task.
+    fn live_stored_shell_pid(&self, terminal_id: u32) -> Option<u32> {
+        let pid = self.stored_child_pid(terminal_id)?;
+        self.may_lookup_stored_shell_pid(terminal_id).then_some(pid)
+    }
+
+    /// Whether cwd / command / pid queries may pass the stored shell pid to
+    /// `/proc` or sysinfo. On Linux that requires a spawn-time pidfd whose
+    /// signal-0 probe succeeded. No pidfd, ESRCH, and every other errno are
+    /// not evidence the number is still that task. Other targets have no
+    /// pidfd and keep the numeric lookup.
+    fn may_lookup_stored_shell_pid(&self, terminal_id: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            return numeric_shell_lookup_allowed(self.probe_stored_shell_pid(terminal_id));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            #[cfg(test)]
+            {
+                let _ = self.test_shell_pid_probe;
+            }
+            let _ = terminal_id;
+            true
+        }
+    }
+
+    /// Borrow the spawn-time pidfd and probe it. Does not remove the map
+    /// entry and does not call `pidfd_open`.
+    #[cfg(target_os = "linux")]
+    fn probe_stored_shell_pid(&self, terminal_id: u32) -> Option<std::result::Result<(), i32>> {
+        if self.stored_child_pid(terminal_id).is_none() {
+            return None;
+        }
+        // Tests inject the probe result. Production asks the spawn-time
+        // pidfd. A missing fd is `None`, which does not allow the lookup.
+        #[cfg(test)]
+        if let Some(injected) = self.test_shell_pid_probe {
+            return Some(injected);
+        }
+        self.terminal_runs
+            .get(&terminal_id)
+            .and_then(|run| run.pidfd.as_ref())
+            .map(pidfd_signal0)
+    }
 }
 
 impl Drop for Pty {
@@ -2648,6 +3002,83 @@ impl Drop for Pty {
                 .fatal();
         }
     }
+}
+
+/// SIGHUP through the pidfd. The fd is closed when `pidfd` is dropped.
+#[cfg(target_os = "linux")]
+fn signal_pidfd_sighup(pidfd: std::os::fd::OwnedFd) {
+    signal_pidfd(&pidfd, libc::SIGHUP, "SIGHUP");
+}
+
+/// `Some(Ok(()))` is the only probe that allows a numeric lookup.
+#[cfg(target_os = "linux")]
+fn numeric_shell_lookup_allowed(probe: Option<std::result::Result<(), i32>>) -> bool {
+    matches!(probe, Some(Ok(())))
+}
+
+/// `pidfd_send_signal` with signal 0 checks that the fd still names a live
+/// task and does not kill it.
+#[cfg(target_os = "linux")]
+fn pidfd_signal0(pidfd: &impl std::os::fd::AsRawFd) -> std::result::Result<(), i32> {
+    // SAFETY: `pidfd` is an open fd held by the caller. Signal 0 performs
+    // the kernel's existence check and delivers nothing. A non-pidfd fails
+    // the syscall; that failure is not treated as success.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            0,
+            std::ptr::null_mut::<libc::siginfo_t>(),
+            0u32,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EINVAL))
+    }
+}
+
+/// `pidfd_send_signal` does not consume the fd. ESRCH means the process is
+/// already gone, which is success. Any other errno is logged and is not
+/// turned into a numeric kill.
+#[cfg(target_os = "linux")]
+fn signal_pidfd(pidfd: &impl std::os::fd::AsRawFd, signal: i32, name: &str) {
+    // SAFETY: `pidfd` is an open fd held by the caller. A null siginfo and
+    // zero flags send `signal` to that process without following a reused
+    // pid number. A non-pidfd fails the syscall and is not a kill of any pid.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null_mut::<libc::siginfo_t>(),
+            0u32,
+        )
+    };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            log::warn!("failed to send {name} through pidfd: {err}");
+        }
+    }
+}
+
+fn send_child_run_exited(
+    senders: &ThreadSenders,
+    pane_id: PaneId,
+    exit_status: Option<i32>,
+    run_generation: u64,
+    hold_command: Option<RunCommand>,
+) {
+    let _ = senders.send_to_screen(ScreenInstruction::ChildRunExited {
+        pane_id,
+        exit_status,
+        run_generation,
+        hold_command,
+    });
 }
 
 fn send_command_not_found_to_screen(

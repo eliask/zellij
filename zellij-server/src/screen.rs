@@ -45,6 +45,7 @@ mod hidden_bars;
 mod live_view;
 mod mirror;
 mod popups;
+mod terminal_run;
 
 use log::{debug, warn};
 use zellij_utils::data::{
@@ -369,6 +370,30 @@ pub struct TabOverrideResult {
 #[derive(Debug, Clone)]
 pub enum ScreenInstruction {
     PtyBytes(u32, VteBytes),
+    /// PTY output that belongs to one run of the pane's process.
+    /// Bytes whose generation is not the pane's current run are dropped.
+    PtyRunBytes(u32, u64, VteBytes),
+    /// The pty thread is about to read a new process for this terminal.
+    /// Output and a deferred exit from the previous run no longer apply,
+    /// unless this start is the same generation as an exit that arrived first.
+    TerminalRunStarted(u32, u64),
+    /// The reader for this run has delivered every byte it will deliver.
+    /// A deferred child exit for the same generation may now close or hold.
+    PtyRunDrained(u32, u64),
+    /// The child exited. Staged until `PtyRunDrained` for the same generation.
+    /// `hold_command` selects hold instead of close.
+    ChildRunExited {
+        pane_id: PaneId,
+        exit_status: Option<i32>,
+        run_generation: u64,
+        hold_command: Option<RunCommand>,
+    },
+    /// Apply a child exit as a close, but only while `generation` is still
+    /// this terminal's run. An unstamped `ClosePane` would also close a
+    /// replacement that started while this was queued.
+    ChildExitClose(PaneId, Option<i32>, u64),
+    /// Apply a child exit as a hold, checked against `generation` the same way.
+    ChildExitHold(PaneId, Option<i32>, RunCommand, u64),
     PluginBytes(Vec<PluginRenderAsset>),
     Render,
     RenderToClients,
@@ -1252,7 +1277,21 @@ pub enum ScreenInstruction {
 impl From<&ScreenInstruction> for ScreenContext {
     fn from(screen_instruction: &ScreenInstruction) -> Self {
         match *screen_instruction {
-            ScreenInstruction::PtyBytes(..) => ScreenContext::HandlePtyBytes,
+            ScreenInstruction::PtyBytes(..)
+            | ScreenInstruction::PtyRunBytes(..)
+            | ScreenInstruction::TerminalRunStarted(..)
+            | ScreenInstruction::PtyRunDrained(..) => ScreenContext::HandlePtyBytes,
+            ScreenInstruction::ChildRunExited {
+                ref hold_command, ..
+            } => {
+                if hold_command.is_some() {
+                    ScreenContext::HoldPane
+                } else {
+                    ScreenContext::ClosePane
+                }
+            },
+            ScreenInstruction::ChildExitClose(..) => ScreenContext::ClosePane,
+            ScreenInstruction::ChildExitHold(..) => ScreenContext::HoldPane,
             ScreenInstruction::PluginBytes(..) => ScreenContext::PluginBytes,
             ScreenInstruction::Render => ScreenContext::Render,
             ScreenInstruction::RenderToClients => ScreenContext::RenderToClients,
@@ -2208,6 +2247,7 @@ pub(crate) struct Screen {
     last_mobile_state_sent: HashMap<ClientId, MobileStatePayload>,
     pane_output_activity: HashMap<PaneId, Instant>,
     pane_ids_never_created: BTreeSet<PaneId>,
+    terminal_runs: HashMap<u32, terminal_run::TerminalRun>,
     pane_not_created_reasons: HashMap<PaneId, PaneNotCreatedReason>,
     mobile_web_prefs: HashMap<ClientId, MobileWebPrefs>,
     client_host_focused: HashMap<ClientId, bool>,
@@ -2584,6 +2624,7 @@ impl Screen {
             last_mobile_state_sent: HashMap::new(),
             pane_output_activity: HashMap::new(),
             pane_ids_never_created: BTreeSet::new(),
+            terminal_runs: HashMap::new(),
             pane_not_created_reasons: HashMap::new(),
             mobile_web_prefs: HashMap::new(),
             client_host_focused: HashMap::new(),
@@ -9363,6 +9404,15 @@ impl Screen {
                         ScreenInstruction::PtyBytes(terminal_id, vte_bytes) => {
                             self.apply_pty_bytes(terminal_id, vte_bytes).non_fatal();
                         },
+                        ScreenInstruction::PtyRunBytes(terminal_id, generation, vte_bytes) => {
+                            if terminal_run::run_generation_accepts(
+                                &mut self.terminal_runs,
+                                terminal_id,
+                                generation,
+                            ) {
+                                self.apply_pty_bytes(terminal_id, vte_bytes).non_fatal();
+                            }
+                        },
                         event => {
                             self.bus.senders.send_to_screen(event).non_fatal();
                         },
@@ -11075,6 +11125,63 @@ pub(crate) fn screen_thread_main(
                     }
                 }
             },
+            ScreenInstruction::PtyRunBytes(pid, generation, vte_bytes) => {
+                if terminal_run::run_generation_accepts(&mut screen.terminal_runs, pid, generation)
+                {
+                    if let Some(vte_bytes) = screen.apply_pty_bytes(pid, vte_bytes)? {
+                        if !screen.pane_will_never_be_created(&PaneId::Terminal(pid)) {
+                            pending_events_waiting_for_pane
+                                .entry(PaneId::Terminal(pid))
+                                .or_default()
+                                .push(ScreenInstruction::PtyRunBytes(pid, generation, vte_bytes));
+                        }
+                    }
+                }
+            },
+            ScreenInstruction::TerminalRunStarted(terminal_id, generation) => {
+                terminal_run::stage_run_started(&mut screen.terminal_runs, terminal_id, generation);
+            },
+            ScreenInstruction::PtyRunDrained(terminal_id, generation) => {
+                if let Some(exit) = terminal_run::stage_run_drained(
+                    &mut screen.terminal_runs,
+                    terminal_id,
+                    generation,
+                ) {
+                    // Re-queue so a `TerminalRunStarted` already ahead of this
+                    // drain is applied before the exit, and so the exit is
+                    // checked against the generation at apply time.
+                    let _ = screen.bus.senders.send_to_screen(exit);
+                }
+            },
+            ScreenInstruction::ChildRunExited {
+                pane_id,
+                exit_status,
+                run_generation,
+                hold_command,
+            } => {
+                let PaneId::Terminal(terminal_id) = pane_id else {
+                    continue;
+                };
+                let instruction = match hold_command {
+                    Some(command) => ScreenInstruction::ChildExitHold(
+                        pane_id,
+                        exit_status,
+                        command,
+                        run_generation,
+                    ),
+                    None => ScreenInstruction::ChildExitClose(pane_id, exit_status, run_generation),
+                };
+                if let Some(ready) = terminal_run::stage_child_exit(
+                    &mut screen.terminal_runs,
+                    terminal_id,
+                    run_generation,
+                    instruction,
+                ) {
+                    // Do not apply inline. A start for the replacement run may
+                    // already be queued ahead of this re-send.
+                    let _ = screen.bus.senders.send_to_screen(ready);
+                }
+            },
             ScreenInstruction::PluginBytes(mut plugin_render_assets) => {
                 for plugin_render_asset in plugin_render_assets.iter_mut() {
                     let plugin_id = plugin_render_asset.plugin_id;
@@ -12651,6 +12758,97 @@ pub(crate) fn screen_thread_main(
                         .push(ScreenInstruction::HoldPane(id, exit_status, run_command));
                 }
                 screen.log_and_report_session_state()?;
+            },
+            ScreenInstruction::ChildExitClose(id, exit_status, generation) => {
+                let PaneId::Terminal(terminal_id) = id else {
+                    continue;
+                };
+                if !terminal_run::run_generation_matches(
+                    &screen.terminal_runs,
+                    terminal_id,
+                    generation,
+                ) {
+                    // The pane has started another run. This exit must not
+                    // close it or send PtyInstruction::ClosePane for it.
+                } else {
+                    let mut found = false;
+                    for tab in screen.tabs.values_mut() {
+                        if tab.get_all_pane_ids().contains(&id) {
+                            tab.close_pane(id, false, exit_status);
+                            found = true;
+                            break;
+                        }
+                    }
+                    let mut closed_pane_was_never_created = false;
+                    let mut waiting_for_pane = false;
+                    if !found {
+                        if screen.pane_ids_never_created.remove(&id) {
+                            pending_events_waiting_for_pane.remove(&id);
+                            closed_pane_was_never_created = true;
+                        } else {
+                            pending_events_waiting_for_pane.entry(id).or_default().push(
+                                ScreenInstruction::ChildExitClose(id, exit_status, generation),
+                            );
+                            waiting_for_pane = true;
+                        }
+                    }
+                    if !waiting_for_pane {
+                        screen.clear_nested_guest(id);
+                        screen.close_popups_with_missing_anchor();
+                        let pty_cleanup = if closed_pane_was_never_created {
+                            PtyInstruction::ClosePaneThatWasNotCreated(id, None)
+                        } else {
+                            PtyInstruction::ClosePane(id, None)
+                        };
+                        let _ = screen.bus.senders.send_to_pty(pty_cleanup);
+                        let connected_client_ids: Vec<ClientId> =
+                            screen.active_tab_ids.keys().copied().collect();
+                        for connected_client_id in connected_client_ids {
+                            screen.sync_scroll_mode_on_focus(connected_client_id)?;
+                        }
+                        screen.log_and_report_session_state().non_fatal();
+                        screen.retain_only_existing_panes_in_pane_groups();
+                    }
+                }
+            },
+            ScreenInstruction::ChildExitHold(id, exit_status, run_command, generation) => {
+                let PaneId::Terminal(terminal_id) = id else {
+                    continue;
+                };
+                if !terminal_run::run_generation_matches(
+                    &screen.terminal_runs,
+                    terminal_id,
+                    generation,
+                ) {
+                    // A replacement run is current. Do not hold that pane for
+                    // the command that already exited.
+                } else {
+                    let is_first_run = false;
+                    let mut found = false;
+                    for tab in screen.tabs.values_mut() {
+                        if tab.get_all_pane_ids().contains(&id) {
+                            tab.hold_pane(id, exit_status, is_first_run, run_command.clone());
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found {
+                        screen.attention_pane_exited(id, exit_status);
+                    }
+                    if !found && screen.pane_ids_never_created.remove(&id) {
+                        pending_events_waiting_for_pane.remove(&id);
+                    } else if !found {
+                        pending_events_waiting_for_pane.entry(id).or_default().push(
+                            ScreenInstruction::ChildExitHold(
+                                id,
+                                exit_status,
+                                run_command,
+                                generation,
+                            ),
+                        );
+                    }
+                    screen.log_and_report_session_state()?;
+                }
             },
             ScreenInstruction::UpdatePaneName(
                 c,

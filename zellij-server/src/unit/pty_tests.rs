@@ -18,6 +18,7 @@ struct MockOsApi {
     cwds: Arc<Mutex<HashMap<u32, PathBuf>>>,
     cmds: Arc<Mutex<HashMap<u32, Vec<String>>>>,
     cmds_by_ppid: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    signals: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl MockOsApi {
@@ -26,6 +27,7 @@ impl MockOsApi {
             cwds: Arc::new(Mutex::new(HashMap::new())),
             cmds: Arc::new(Mutex::new(HashMap::new())),
             cmds_by_ppid: Arc::new(Mutex::new(HashMap::new())),
+            signals: Arc::new(Mutex::new(Vec::new())),
         }
     }
     fn set_cwd(&self, pid: u32, path: PathBuf) {
@@ -72,12 +74,15 @@ impl ServerOsApi for MockOsApi {
         Ok(())
     }
     fn kill(&self, _: u32) -> anyhow::Result<()> {
+        self.signals.lock().unwrap().push("kill");
         Ok(())
     }
     fn force_kill(&self, _: u32) -> anyhow::Result<()> {
+        self.signals.lock().unwrap().push("force_kill");
         Ok(())
     }
     fn send_sigint(&self, _: u32) -> anyhow::Result<()> {
+        self.signals.lock().unwrap().push("send_sigint");
         Ok(())
     }
     fn box_clone(&self) -> Box<dyn ServerOsApi> {
@@ -173,6 +178,9 @@ fn set_active_terminal(pty: &mut Pty, terminal_id: u32, child_pid: u32) {
     let flag = Arc::new(AtomicBool::new(true));
     pty.id_to_child_pid.insert(terminal_id, child_pid);
     pty.pane_activity_flags.insert(terminal_id, flag);
+    // The stored pid is consulted only after a successful pidfd probe.
+    // Existing tests do not open a pidfd, so they inject that probe.
+    pty.test_shell_pid_probe = Some(Ok(()));
 }
 
 fn collect_cwd_changed_events(
@@ -646,4 +654,110 @@ fn resurrect_command_for_unknown_terminal_is_rejected() {
 
     assert!(result.is_err());
     assert!(pty.resurrect_commands.is_empty());
+}
+
+#[test]
+fn a_late_exit_from_a_replaced_run_does_not_erase_the_new_process() {
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(MockOsApi::new());
+    pty.remember_run(1, Some(10), None, 1);
+    pty.remember_run(1, Some(20), None, 2);
+    pty.clear_exited_process_identity(1, 1);
+    assert_eq!(pty.id_to_child_pid.get(&1), Some(&20));
+    assert_eq!(pty.stored_run_generation(1), Some(2));
+}
+
+#[test]
+fn forgetting_a_child_drops_its_run_generation() {
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(MockOsApi::new());
+    pty.remember_run(1, Some(10), None, 4);
+    assert_eq!(pty.forget_child_pid(1), Some(10));
+    assert!(pty.id_to_child_pid.get(&1).is_none());
+    assert_eq!(pty.stored_run_generation(1), None);
+}
+
+#[test]
+fn clear_exited_process_identity_forgets_only_the_matching_generation() {
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(MockOsApi::new());
+    pty.remember_run(1, Some(10), None, 5);
+    pty.clear_exited_process_identity(1, 4);
+    assert_eq!(pty.id_to_child_pid.get(&1), Some(&10));
+    assert_eq!(pty.stored_run_generation(1), Some(5));
+    pty.clear_exited_process_identity(1, 5);
+    assert!(pty.id_to_child_pid.get(&1).is_none());
+    assert_eq!(pty.stored_run_generation(1), None);
+}
+
+#[test]
+fn reader_eof_does_not_clear_process_identity() {
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(MockOsApi::new());
+    pty.remember_run(1, Some(10), None, 8);
+    assert!(pty.task_handles.remove(&1).is_none());
+    assert_eq!(pty.id_to_child_pid.get(&1), Some(&10));
+    assert_eq!(pty.stored_run_generation(1), Some(8));
+}
+
+#[cfg(target_os = "linux")]
+fn devnull_fd() -> std::os::fd::OwnedFd {
+    std::fs::File::open("/dev/null").unwrap().into()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn close_pane_after_clear_does_not_kill() {
+    let mock = MockOsApi::new();
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock.clone());
+    pty.remember_run(1, Some(10), None, 3);
+    pty.clear_exited_process_identity(1, 3);
+    pty.close_pane(PaneId::Terminal(1)).unwrap();
+    assert!(mock.signals.lock().unwrap().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn closing_a_running_child_hangs_it_up_via_pidfd_and_does_not_numeric_kill() {
+    let mock = MockOsApi::new();
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock.clone());
+    pty.remember_run(1, Some(10), Some(devnull_fd()), 3);
+    pty.close_pane(PaneId::Terminal(1)).unwrap();
+    assert!(mock.signals.lock().unwrap().is_empty());
+    assert!(pty.id_to_child_pid.get(&1).is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn close_pane_without_pidfd_does_not_kill() {
+    let mock = MockOsApi::new();
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock.clone());
+    pty.remember_run(1, Some(10), None, 3);
+    pty.close_pane(PaneId::Terminal(1)).unwrap();
+    assert!(mock.signals.lock().unwrap().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sigint_and_sigkill_without_a_pidfd_do_not_numeric_kill() {
+    let mock = MockOsApi::new();
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock.clone());
+    pty.remember_run(1, Some(10), None, 3);
+    pty.send_sigint_to_pane(PaneId::Terminal(1));
+    pty.send_sigkill_to_pane(PaneId::Terminal(1));
+    assert!(mock.signals.lock().unwrap().is_empty());
+    assert_eq!(pty.stored_child_pid(1), Some(10));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sigint_and_sigkill_use_the_stored_pidfd_when_tcgetpgrp_is_none() {
+    let mock = MockOsApi::new();
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock.clone());
+    pty.remember_run(1, Some(10), Some(devnull_fd()), 3);
+    pty.send_sigint_to_pane(PaneId::Terminal(1));
+    pty.send_sigkill_to_pane(PaneId::Terminal(1));
+    assert!(mock.signals.lock().unwrap().is_empty());
+    assert_eq!(pty.stored_child_pid(1), Some(10));
+    assert!(pty
+        .terminal_runs
+        .get(&1)
+        .and_then(|run| run.pidfd.as_ref())
+        .is_some());
 }

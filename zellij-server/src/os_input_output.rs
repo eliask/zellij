@@ -36,6 +36,19 @@ use std::{
     },
 };
 
+/// Pidfd opened in the spawning thread, before the exit watcher can reap.
+/// Other targets have no pidfd; callers return `None`.
+#[cfg(target_os = "linux")]
+pub type ChildPidFd = std::os::fd::OwnedFd;
+
+/// Pidfd opened in the spawning thread, before the exit watcher can reap.
+/// Other targets have no pidfd; callers return `None`.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub struct ChildPidFd {
+    _private: (),
+}
+
 pub use async_trait::async_trait;
 
 /// Check whether a candidate path refers to an executable file, considering
@@ -360,6 +373,27 @@ impl AsyncReader for NullAsyncReader {
     }
 }
 
+/// The endpoint was replaced before a stamped write reached it. The writer
+/// keeps the queued bytes and retries until the matching `AdoptRun` settles
+/// the queue, instead of treating it as a fatal write error.
+#[derive(Debug)]
+pub(crate) struct TerminalRunChangedBeforeWrite;
+
+impl std::fmt::Display for TerminalRunChangedBeforeWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "terminal run changed before the write")
+    }
+}
+
+impl std::error::Error for TerminalRunChangedBeforeWrite {}
+
+/// A signal for a terminal's foreground process group, not a numeric pid.
+#[derive(Clone, Copy, Debug)]
+pub enum ForegroundSignal {
+    Interrupt,
+    Kill,
+}
+
 /// The `ServerOsApi` trait represents an abstract interface to the features of an operating system that
 /// Zellij server requires.
 pub trait ServerOsApi: Send + Sync {
@@ -388,6 +422,40 @@ pub trait ServerOsApi: Send + Sync {
     }
     /// Write bytes to the standard input of the virtual terminal referred to by `terminal_id`.
     fn write_to_tty_stdin(&self, terminal_id: u32, buf: &[u8]) -> Result<usize>;
+    /// Write `buf` only if `terminal_id` still has `generation`.
+    ///
+    /// `None` is an unstamped write from before any run was adopted. A
+    /// `Some` that does not match the endpoint is not written: the
+    /// descriptor currently registered for the id may already belong to
+    /// a later process. The default ignores the generation so test
+    /// doubles keep compiling; the real server backend overrides it.
+    fn write_to_tty_stdin_for_run(
+        &self,
+        terminal_id: u32,
+        generation: Option<u64>,
+        buf: &[u8],
+    ) -> Result<usize> {
+        let _ = generation;
+        self.write_to_tty_stdin(terminal_id, buf)
+    }
+    /// Record `generation` on the endpoint already registered for `terminal_id`.
+    /// A missing endpoint is left missing. Stamped writes fail until this
+    /// matches the generation they were admitted with.
+    fn bind_terminal_generation(&self, _terminal_id: u32, _generation: u64) {}
+    /// Spawn, also returning the pidfd opened before the exit watcher starts.
+    /// The default calls [`Self::spawn_terminal`] and reports no pidfd so
+    /// existing doubles keep their 3-tuple signature.
+    fn spawn_terminal_for_run(
+        &self,
+        terminal_action: TerminalAction,
+        quit_cb: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
+        default_editor: Option<PathBuf>,
+        pane_env: &PaneEnv,
+    ) -> Result<(u32, Box<dyn AsyncReader>, Option<u32>, Option<ChildPidFd>)> {
+        let (terminal_id, reader, child_pid) =
+            self.spawn_terminal(terminal_action, quit_cb, default_editor, pane_env)?;
+        Ok((terminal_id, reader, child_pid, None))
+    }
     /// Wait until all output written to the terminal has been transmitted.
     fn tcdrain(&self, terminal_id: u32) -> Result<()>;
     /// Terminate the process with process ID `pid`. (SIGHUP)
@@ -396,6 +464,30 @@ pub trait ServerOsApi: Send + Sync {
     fn force_kill(&self, pid: u32) -> Result<()>;
     /// Send SIGINT to the process with process ID `pid`
     fn send_sigint(&self, pid: u32) -> Result<()>;
+    /// Send SIGINT to the terminal's foreground process group, falling back
+    /// to `pid` when the group cannot be determined. The default signals the
+    /// pid directly so backends without terminal introspection still work.
+    fn send_sigint_to_terminal(&self, _terminal_id: u32, pid: u32) -> Result<()> {
+        self.send_sigint(pid)
+    }
+    /// Force-kill the terminal's foreground process group, falling back to
+    /// `pid` when the group cannot be determined.
+    fn force_kill_terminal(&self, _terminal_id: u32, pid: u32) -> Result<()> {
+        self.force_kill(pid)
+    }
+    /// `killpg` the terminal's foreground group.
+    ///
+    /// `Ok(true)` when the group was signaled or is already gone (`ESRCH`).
+    /// `Ok(false)` when `tcgetpgrp` finds no positive group or `killpg` fails
+    /// for another reason. Does not signal a numeric pid. The default reports
+    /// no group so callers can choose their own fallback.
+    fn signal_terminal_foreground_group(
+        &self,
+        _terminal_id: u32,
+        _signal: ForegroundSignal,
+    ) -> Result<bool> {
+        Ok(false)
+    }
     /// Returns a [`Box`] pointer to this [`ServerOsApi`] struct.
     fn box_clone(&self) -> Box<dyn ServerOsApi>;
     fn send_to_client(&self, client_id: ClientId, msg: ServerToClientMsg) -> Result<()>;
@@ -440,6 +532,19 @@ pub trait ServerOsApi: Send + Sync {
         quit_cb: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
         pane_env: &PaneEnv,
     ) -> Result<(Box<dyn AsyncReader>, Option<u32>)>;
+    /// Like [`Self::re_run_command_in_terminal`], plus the pidfd opened before
+    /// the replacement's exit watcher starts. The default reports no pidfd.
+    fn re_run_command_for_run(
+        &self,
+        terminal_id: u32,
+        run_command: RunCommand,
+        quit_cb: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
+        pane_env: &PaneEnv,
+    ) -> Result<(Box<dyn AsyncReader>, Option<u32>, Option<ChildPidFd>)> {
+        let (reader, child_pid) =
+            self.re_run_command_in_terminal(terminal_id, run_command, quit_cb, pane_env)?;
+        Ok((reader, child_pid, None))
+    }
     fn clear_terminal_id(&self, terminal_id: u32) -> Result<()>;
     fn cache_resizes(&mut self) {}
     fn apply_cached_resizes(&mut self) {}
@@ -468,6 +573,20 @@ impl ServerOsApi for ServerOsInputOutput {
         default_editor: Option<PathBuf>,
         pane_env: &PaneEnv,
     ) -> Result<(u32, Box<dyn AsyncReader>, Option<u32>)> {
+        let (terminal_id, reader, child_pid, child_pidfd) =
+            self.spawn_terminal_for_run(terminal_action, quit_cb, default_editor, pane_env)?;
+        // The exit watcher holds its own duplicate. This copy is for the
+        // caller that tracks the run; the 3-tuple API does not.
+        drop(child_pidfd);
+        Ok((terminal_id, reader, child_pid))
+    }
+    fn spawn_terminal_for_run(
+        &self,
+        terminal_action: TerminalAction,
+        quit_cb: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
+        default_editor: Option<PathBuf>,
+        pane_env: &PaneEnv,
+    ) -> Result<(u32, Box<dyn AsyncReader>, Option<u32>, Option<ChildPidFd>)> {
         let err_context = || "failed to spawn terminal".to_string();
 
         let terminal_id = self
@@ -479,12 +598,26 @@ impl ServerOsApi for ServerOsInputOutput {
 
         let (cmd, failover_cmd) = build_command(terminal_action, default_editor, pane_env);
 
-        let (async_reader, child_fd) = self
-            .pty_backend
-            .spawn_terminal(cmd, failover_cmd, quit_cb, terminal_id, pane_env)
-            .with_context(err_context)?;
+        let (async_reader, child_fd, child_pidfd) =
+            match self
+                .pty_backend
+                .spawn_terminal(cmd, failover_cmd, quit_cb, terminal_id, pane_env)
+            {
+                Ok(spawned) => spawned,
+                Err(err) => {
+                    // A failed spawn must not leave the reserved id pointing at
+                    // a placeholder, including CommandNotFound.
+                    self.pty_backend.clear_terminal_id(terminal_id);
+                    return Err(err).with_context(err_context);
+                },
+            };
 
-        Ok((terminal_id, async_reader, Some(child_fd as u32)))
+        Ok((
+            terminal_id,
+            async_reader,
+            Some(child_fd as u32),
+            child_pidfd,
+        ))
     }
     fn reserve_terminal_id(&self) -> Result<u32> {
         let terminal_id = self
@@ -495,7 +628,21 @@ impl ServerOsApi for ServerOsInputOutput {
         Ok(terminal_id)
     }
     fn write_to_tty_stdin(&self, terminal_id: u32, buf: &[u8]) -> Result<usize> {
-        self.pty_backend.write_to_tty_stdin(terminal_id, buf)
+        self.pty_backend
+            .write_to_tty_stdin_for_run(terminal_id, None, buf)
+    }
+    fn write_to_tty_stdin_for_run(
+        &self,
+        terminal_id: u32,
+        generation: Option<u64>,
+        buf: &[u8],
+    ) -> Result<usize> {
+        self.pty_backend
+            .write_to_tty_stdin_for_run(terminal_id, generation, buf)
+    }
+    fn bind_terminal_generation(&self, terminal_id: u32, generation: u64) {
+        self.pty_backend
+            .bind_terminal_generation(terminal_id, generation);
     }
     fn tcdrain(&self, terminal_id: u32) -> Result<()> {
         self.pty_backend.tcdrain(terminal_id)
@@ -511,6 +658,23 @@ impl ServerOsApi for ServerOsInputOutput {
     }
     fn send_sigint(&self, pid: u32) -> Result<()> {
         self.pty_backend.send_sigint(pid)
+    }
+    #[cfg(unix)]
+    fn send_sigint_to_terminal(&self, terminal_id: u32, pid: u32) -> Result<()> {
+        self.pty_backend.send_sigint_to_terminal(terminal_id, pid)
+    }
+    #[cfg(unix)]
+    fn force_kill_terminal(&self, terminal_id: u32, pid: u32) -> Result<()> {
+        self.pty_backend.force_kill_terminal(terminal_id, pid)
+    }
+    #[cfg(unix)]
+    fn signal_terminal_foreground_group(
+        &self,
+        terminal_id: u32,
+        signal: ForegroundSignal,
+    ) -> Result<bool> {
+        self.pty_backend
+            .signal_terminal_foreground_group(terminal_id, signal)
     }
     fn send_to_client(&self, client_id: ClientId, msg: ServerToClientMsg) -> Result<()> {
         let err_context = || format!("failed to send message to client {client_id}");
@@ -733,10 +897,24 @@ impl ServerOsApi for ServerOsInputOutput {
         quit_cb: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
         pane_env: &PaneEnv,
     ) -> Result<(Box<dyn AsyncReader>, Option<u32>)> {
-        let (async_reader, child_fd) =
+        let (reader, child_pid, child_pidfd) =
+            self.re_run_command_for_run(terminal_id, run_command, quit_cb, pane_env)?;
+        drop(child_pidfd);
+        Ok((reader, child_pid))
+    }
+    fn re_run_command_for_run(
+        &self,
+        terminal_id: u32,
+        run_command: RunCommand,
+        quit_cb: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
+        pane_env: &PaneEnv,
+    ) -> Result<(Box<dyn AsyncReader>, Option<u32>, Option<ChildPidFd>)> {
+        // Failure leaves the previous endpoint registered. A failed rerun
+        // must not clear the id of the run that is still alive.
+        let (async_reader, child_fd, child_pidfd) =
             self.pty_backend
                 .spawn_terminal(run_command, None, quit_cb, terminal_id, pane_env)?;
-        Ok((async_reader, Some(child_fd as u32)))
+        Ok((async_reader, Some(child_fd as u32), child_pidfd))
     }
     fn clear_terminal_id(&self, terminal_id: u32) -> Result<()> {
         self.pty_backend.clear_terminal_id(terminal_id);
