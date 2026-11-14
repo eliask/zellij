@@ -1194,32 +1194,99 @@ pub fn write_session_state_to_disk(
     let (current_session_layout, layout_files_to_write) = current_session_layout;
     let new_metadata = current_session_info.to_string();
     if file_content_changed(&metadata_cache_file_name, new_metadata.as_bytes()) {
-        let _wrote_metadata_file =
-            std::fs::create_dir_all(session_info_folder_for_session(&session_id).as_path())
-                .and_then(|_| std::fs::File::create(&metadata_cache_file_name))
-                .and_then(|mut f| write!(f, "{}", new_metadata));
+        if let Err(error) =
+            write_file_atomically(&metadata_cache_file_name, new_metadata.as_bytes())
+        {
+            log::error!("Failed to write session metadata file: {:?}", error);
+        }
     }
 
     if !current_session_layout.is_empty() {
         let layout_cache_file_name = session_layout_cache_file_name(&session_id);
         if file_content_changed(&layout_cache_file_name, current_session_layout.as_bytes()) {
-            let _wrote_layout_file =
-                std::fs::create_dir_all(session_info_folder_for_session(&session_id).as_path())
-                    .and_then(|_| std::fs::File::create(&layout_cache_file_name))
-                    .and_then(|mut f| write!(f, "{}", current_session_layout));
+            // Replacing the file gives it a new creation time; keep the session's own.
+            zellij_utils::sessions::record_session_layout_creation_time(&layout_cache_file_name);
+            if let Err(error) =
+                write_file_atomically(&layout_cache_file_name, current_session_layout.as_bytes())
+            {
+                log::error!("Failed to write session layout file: {:?}", error);
+            }
         }
         let session_info_folder = session_info_folder_for_session(&session_id);
         for (external_file_name, external_file_contents) in layout_files_to_write {
             let external_file_path = session_info_folder.join(&external_file_name);
             if file_content_changed(&external_file_path, external_file_contents.as_bytes()) {
-                std::fs::File::create(&external_file_path)
-                    .and_then(|mut f| write!(f, "{}", external_file_contents))
-                    .unwrap_or_else(|e| {
-                        log::error!("Failed to write layout metadata file: {:?}", e);
-                    });
+                if let Err(error) =
+                    write_file_atomically(&external_file_path, external_file_contents.as_bytes())
+                {
+                    log::error!("Failed to write layout metadata file: {:?}", error);
+                }
             }
         }
     }
+}
+
+/// Publish one state file by renaming a unique sibling temporary over it.
+///
+/// The temporary is synced before the rename, so a failed write or sync leaves
+/// the previous file in place. Callers must not share one temporary path.
+fn write_file_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let file = stage_atomic_write(path, contents)?;
+    persist_atomic_write(file, path)
+}
+
+fn stage_atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<tempfile::NamedTempFile> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file path has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let mut temporary_file = tempfile::Builder::new()
+        .prefix(".zellij-session-")
+        .tempfile_in(parent)?;
+    temporary_file.write_all(contents)?;
+    // Sync before rename so a failed sync drops the temporary and keeps the
+    // previous file. The rename is what readers observe.
+    temporary_file.as_file().sync_all()?;
+    Ok(temporary_file)
+}
+
+fn persist_atomic_write(file: tempfile::NamedTempFile, path: &Path) -> std::io::Result<()> {
+    file.persist(path).map_err(|error| error.error)?;
+    sync_parent_directory(path)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let directory = fs::File::open(parent)?;
+        match directory.sync_all() {
+            Ok(()) => {},
+            // Some filesystems cannot sync a directory. The rename already
+            // published the file; that is not a failed save.
+            Err(error) if directory_sync_unsupported(&error) => {},
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn directory_sync_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EINVAL || code == libc::ENOTSUP
+    )
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 pub fn scan_session_list(
@@ -1283,9 +1350,9 @@ fn find_resurrectable_sessions(
                         return None;
                     }
                     let layout_file_name = folder_name.join("session-layout.kdl");
-                    let ctime = match std::fs::metadata(&layout_file_name)
-                        .and_then(|metadata| metadata.created())
-                    {
+                    let ctime = match zellij_utils::sessions::session_layout_creation_time(
+                        &layout_file_name,
+                    ) {
                         Ok(created) => Some(created),
                         Err(e) => {
                             if e.kind() == std::io::ErrorKind::NotFound {
@@ -1354,6 +1421,7 @@ fn query_webserver_via_ipc(web_server_base_url: &str) -> Result<WebServerStatus>
 #[cfg(unix)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use tempfile::tempdir;
     use zellij_utils::data::SessionInfo;
@@ -1486,6 +1554,307 @@ mod tests {
             info_dir.path(),
         );
         assert_eq!(read.keys().collect::<Vec<_>>(), vec!["visible"]);
+    }
+
+    #[test]
+    fn atomic_file_write_replaces_contents_without_leaving_a_temporary_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session-state");
+        std::fs::write(&path, b"old").unwrap();
+
+        write_file_atomically(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let entries = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(entries, 1);
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_never_expose_mixed_contents() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session-state");
+        std::fs::write(&path, vec![b'Z'; 4096]).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let stop = Arc::new(AtomicBool::new(false));
+        let torn = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let path = path.clone();
+            let stop = Arc::clone(&stop);
+            let torn = Arc::clone(&torn);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match std::fs::read(&path) {
+                        Ok(buf) if buf.len() == 4096 && buf.iter().all(|byte| *byte == buf[0]) => {
+                        },
+                        Ok(_) => {
+                            torn.store(true, Ordering::Relaxed);
+                            break;
+                        },
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            torn.store(true, Ordering::Relaxed);
+                            break;
+                        },
+                        Err(_) => {},
+                    }
+                }
+            })
+        };
+        let handles = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let contents = vec![b'a' + index; 4096];
+                    barrier.wait();
+                    write_file_atomically(&path, &contents).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        assert!(
+            !torn.load(Ordering::Relaxed),
+            "a reader observed a partial or mixed state file"
+        );
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents.len(), 4096);
+        assert!(contents.windows(2).all(|window| window[0] == window[1]));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_reader_during_save_sees_only_whole_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session-state");
+        let width = 1024 * 1024;
+        std::fs::write(&path, vec![b'Z'; width]).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let torn = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let path = path.clone();
+            let stop = Arc::clone(&stop);
+            let torn = Arc::clone(&torn);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match std::fs::read(&path) {
+                        Ok(buf) if buf.len() == width && buf.iter().all(|byte| *byte == buf[0]) => {
+                        },
+                        _ => {
+                            torn.store(true, Ordering::Relaxed);
+                            break;
+                        },
+                    }
+                }
+            })
+        };
+        for index in 0..4 {
+            let contents = vec![b'a' + index; width];
+            write_file_atomically(&path, &contents).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        assert!(
+            !torn.load(Ordering::Relaxed),
+            "a reader observed a partial state file during save"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), vec![b'd'; width]);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_previous_file_intact() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session-state");
+        std::fs::write(&path, b"previous").unwrap();
+        let _restore = RestoreDirectoryMode::readonly(dir.path());
+
+        let error = write_file_atomically(&path, b"next").unwrap_err();
+
+        drop(_restore);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_failed_rename_leaves_the_previous_file_intact() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session-state");
+        std::fs::write(&path, b"previous").unwrap();
+        let staged = stage_atomic_write(&path, b"next").unwrap();
+        let _restore = RestoreDirectoryMode::readonly(dir.path());
+
+        let error = persist_atomic_write(staged, &path).unwrap_err();
+
+        // The failed rename drops its temporary while the directory is still
+        // read-only, so that unlink can fail. The published file must still
+        // be the previous contents. Restore write permission before cleanup.
+        drop(_restore);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".zellij-session-")
+            {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn dropping_a_staged_file_before_rename_keeps_the_previous_contents() {
+        // A failed file sync returns from staging before persist. Dropping the
+        // temporary is that failure's cleanup.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session-state");
+        std::fs::write(&path, b"previous").unwrap();
+        drop(stage_atomic_write(&path, b"next").unwrap());
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unsupported_parent_directory_sync_is_not_a_save_failure() {
+        use std::io::Error;
+
+        assert!(directory_sync_unsupported(&Error::from_raw_os_error(
+            libc::EINVAL
+        )));
+        assert!(directory_sync_unsupported(&Error::from_raw_os_error(
+            libc::ENOTSUP
+        )));
+        assert!(!directory_sync_unsupported(&Error::from_raw_os_error(
+            libc::EIO
+        )));
+    }
+
+    #[test]
+    fn a_parent_directory_sync_error_fails_without_creating_a_file() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("gone").join("session-state");
+
+        let error = sync_parent_directory(&missing).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn saving_a_session_keeps_an_existing_layouts_creation_time() {
+        let session_id = format!(
+            "atomic-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let folder = session_info_folder_for_session(&session_id);
+        let _cleanup = RemoveTree(folder.clone());
+        std::fs::create_dir_all(&folder).unwrap();
+        let layout_path = session_layout_cache_file_name(&session_id);
+        std::fs::write(&layout_path, "layout { old }").unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+
+        write_session_state_to_disk(
+            session_id.clone(),
+            SessionInfo::new(session_id.clone()),
+            (
+                "layout { new }".to_owned(),
+                BTreeMap::from([("pane.txt".to_owned(), "contents".to_owned())]),
+            ),
+        );
+
+        assert_eq!(std::fs::read(&layout_path).unwrap(), b"layout { new }");
+        assert_eq!(std::fs::read(folder.join("pane.txt")).unwrap(), b"contents");
+        let recorded = zellij_utils::sessions::session_layout_creation_time(&layout_path).unwrap();
+        assert!(
+            recorded.elapsed().unwrap() >= Duration::from_secs(1),
+            "the save replaced the layout but must not reset its creation time: {:?}",
+            recorded.elapsed()
+        );
+        let leftovers = std::fs::read_dir(&folder)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".zellij-session-")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn a_dead_sessions_age_survives_replacing_its_layout_file() {
+        let sock_dir = tempdir().unwrap();
+        let info_dir = tempdir().unwrap();
+        write_layout(info_dir.path(), "long-running");
+        let layout = info_dir.path().join("long-running/session-layout.kdl");
+        // the session started two hours ago
+        let started = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        let started_secs = started
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(
+            layout.with_file_name("session-layout-created"),
+            started_secs.to_string(),
+        )
+        .unwrap();
+
+        // every later save replaces the file, which gets a fresh timestamp
+        write_file_atomically(&layout, b"layout { pane }").unwrap();
+        zellij_utils::sessions::record_session_layout_creation_time(&layout);
+
+        let (_, resurrectable) = scan_session_list(
+            "me",
+            &[],
+            &BTreeMap::new(),
+            sock_dir.path(),
+            info_dir.path(),
+        );
+        assert!(resurrectable["long-running"] >= Duration::from_secs(2 * 3600 - 10));
+    }
+
+    struct RestoreDirectoryMode(std::path::PathBuf);
+
+    impl RestoreDirectoryMode {
+        fn readonly(path: &std::path::Path) -> Self {
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o555);
+            std::fs::set_permissions(path, perms).unwrap();
+            Self(path.to_path_buf())
+        }
+    }
+
+    impl Drop for RestoreDirectoryMode {
+        fn drop(&mut self) {
+            if let Ok(metadata) = std::fs::metadata(&self.0) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(&self.0, perms);
+            }
+        }
+    }
+
+    struct RemoveTree(std::path::PathBuf);
+
+    impl Drop for RemoveTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 

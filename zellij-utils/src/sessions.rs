@@ -126,6 +126,53 @@ pub fn get_sessions() -> Result<Vec<(String, Duration)>, io::ErrorKind> {
     }
 }
 
+/// Sidecar recording when a session's layout file was first written.
+///
+/// The layout file is replaced through a temporary file, so its own creation
+/// timestamp is that of the latest replacement rather than of the session.
+const SESSION_LAYOUT_CREATED_FILE_NAME: &str = "session-layout-created";
+
+fn session_layout_created_marker(layout_file: &Path) -> PathBuf {
+    layout_file.with_file_name(SESSION_LAYOUT_CREATED_FILE_NAME)
+}
+
+/// Remember when `layout_file` first came into existence, before it is
+/// replaced. Does nothing once recorded. A layout file that already exists
+/// contributes its own creation (or modification) time; otherwise now.
+pub fn record_session_layout_creation_time(layout_file: &Path) {
+    let marker = session_layout_created_marker(layout_file);
+    if marker.exists() {
+        return;
+    }
+    let created = fs::metadata(layout_file)
+        .and_then(|metadata| metadata.created().or_else(|_| metadata.modified()))
+        .unwrap_or_else(|_| SystemTime::now());
+    let seconds = created
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_secs())
+        .unwrap_or_default();
+    if let Err(error) = fs::write(&marker, seconds.to_string()) {
+        log::error!("Failed to record session creation time: {:?}", error);
+    }
+}
+
+/// When the session owning `layout_file` was created: the recorded time if
+/// any, else the layout file's creation (falling back to modification) time.
+/// Fails with the metadata error when the layout file does not exist.
+pub fn session_layout_creation_time(layout_file: &Path) -> io::Result<SystemTime> {
+    let metadata = fs::metadata(layout_file)?;
+    if let Some(recorded) = fs::read_to_string(session_layout_created_marker(layout_file))
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u64>().ok())
+    {
+        // A marker of `u64::MAX` seconds does not fit in `SystemTime`.
+        if let Some(created) = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(recorded)) {
+            return Ok(created);
+        }
+    }
+    metadata.created().or_else(|_| metadata.modified())
+}
+
 pub fn get_resurrectable_sessions() -> Vec<(String, Duration)> {
     match fs::read_dir(&*ZELLIJ_SESSION_INFO_CACHE_DIR) {
         Ok(files_in_session_info_folder) => {
@@ -137,12 +184,10 @@ pub fn get_resurrectable_sessions() -> Vec<(String, Duration)> {
                 .filter_map(|folder_name| {
                     let layout_file_name =
                         session_layout_cache_file_name(&folder_name.display().to_string());
-                    // Try to get creation time, fall back to modification time on platforms where it's not supported (e.g., musl)
-                    let ctime = std::fs::metadata(&layout_file_name)
-                        .ok()
-                        .and_then(|metadata| {
-                            metadata.created().ok().or_else(|| metadata.modified().ok())
-                        });
+                    // Renaming a new inode over the layout resets its birth time, so
+                    // prefer the sidecar. Fall back to modification time where birth
+                    // time is absent.
+                    let ctime = session_layout_creation_time(&layout_file_name).ok();
                     let elapsed_duration = ctime
                         .map(|ctime| {
                             Duration::from_secs(ctime.elapsed().ok().unwrap_or_default().as_secs())
@@ -1066,5 +1111,88 @@ mod session_folder_name_tests {
                 name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_creation_time_tests {
+    use super::*;
+
+    #[test]
+    fn recorded_creation_time_survives_replacing_the_layout_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = dir.path().join("session-layout.kdl");
+        fs::write(&layout, "layout { }").unwrap();
+        // pretend the session was created an hour ago
+        let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        let seconds = an_hour_ago
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        fs::write(session_layout_created_marker(&layout), seconds.to_string()).unwrap();
+
+        // replace the layout file the way the server does: temp file + rename
+        let replacement = dir.path().join(".tmp-layout");
+        fs::write(&replacement, "layout { pane }").unwrap();
+        fs::rename(&replacement, &layout).unwrap();
+        record_session_layout_creation_time(&layout);
+
+        let age = session_layout_creation_time(&layout)
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(age >= Duration::from_secs(3590), "{:?}", age);
+    }
+
+    #[test]
+    fn first_recording_keeps_an_existing_layout_files_time_and_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = dir.path().join("session-layout.kdl");
+        // no layout yet: a missing layout is an error, not a time
+        assert_eq!(
+            session_layout_creation_time(&layout).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        record_session_layout_creation_time(&layout);
+        fs::write(&layout, "layout { }").unwrap();
+        let first = session_layout_creation_time(&layout).unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        record_session_layout_creation_time(&layout);
+        assert_eq!(session_layout_creation_time(&layout).unwrap(), first);
+    }
+
+    #[test]
+    fn an_existing_file_time_is_captured_before_a_later_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = dir.path().join("session-layout.kdl");
+        fs::write(&layout, "layout { }").unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        record_session_layout_creation_time(&layout);
+        let recorded = session_layout_creation_time(&layout).unwrap();
+        assert!(
+            recorded.elapsed().unwrap() >= Duration::from_secs(1),
+            "recording must keep the file's time, not the moment it was recorded: {:?}",
+            recorded.elapsed()
+        );
+
+        let replacement = dir.path().join(".tmp-layout");
+        fs::write(&replacement, "layout { pane }").unwrap();
+        fs::rename(&replacement, &layout).unwrap();
+        record_session_layout_creation_time(&layout);
+        assert_eq!(session_layout_creation_time(&layout).unwrap(), recorded);
+    }
+
+    #[test]
+    fn an_out_of_range_recorded_time_falls_back_to_file_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = dir.path().join("session-layout.kdl");
+        fs::write(&layout, "layout { }").unwrap();
+        fs::write(session_layout_created_marker(&layout), u64::MAX.to_string()).unwrap();
+        let metadata = fs::metadata(&layout).unwrap();
+        let fallback = metadata
+            .created()
+            .or_else(|_| metadata.modified())
+            .expect("the fixture file has a timestamp");
+        assert_eq!(session_layout_creation_time(&layout).unwrap(), fallback);
     }
 }
