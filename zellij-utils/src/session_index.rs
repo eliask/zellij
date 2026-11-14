@@ -1089,6 +1089,14 @@ pub fn dead_session_ids_in(sock_dir: &Path, cache_dir: &Path) -> Vec<String> {
     dead
 }
 
+/// `true` when `session_id` is in the dead set from [`dead_session_ids_in`].
+/// Callers that already hold the socket claim re-check here before deleting.
+pub fn session_id_is_definitely_dead(sock_dir: &Path, cache_dir: &Path, session_id: &str) -> bool {
+    dead_session_ids_in(sock_dir, cache_dir)
+        .iter()
+        .any(|id| id == session_id)
+}
+
 pub fn delete_dead_sessions_in(
     sock_dir: &Path,
     cache_dir: &Path,
@@ -1098,29 +1106,83 @@ pub fn delete_dead_sessions_in(
     if dead_sessions.is_empty() {
         return Ok(0);
     }
-    if let Some(index) = index {
-        if let Err(e) = index.delete_by_ids(&dead_sessions) {
-            log::error!(
-                "Failed to remove dead sessions from the session index: {}",
-                e
-            );
-        }
-    }
     let mut first_error = None;
-    let mut deleted = 0;
-    for session_id in &dead_sessions {
-        match std::fs::remove_dir_all(cache_dir.join(session_id)) {
-            Ok(()) => deleted += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
-            Err(e) => {
+    let mut selected = Vec::new();
+    let mut claims = Vec::new();
+    for session_id in dead_sessions {
+        let claim = match crate::sessions::try_acquire_session_socket_claim(sock_dir, &session_id) {
+            Ok(Some(claim)) => claim,
+            Ok(None) => continue,
+            Err(error) => {
                 first_error.get_or_insert_with(|| {
-                    format!("Failed to delete dead session {:?}: {}", session_id, e)
+                    format!(
+                        "Failed to claim the socket of dead session {:?}: {}",
+                        session_id, error
+                    )
+                });
+                continue;
+            },
+        };
+        // The candidate list was taken before the claim. Decide death again
+        // while the claim is held, so a resurrection cannot bind between the
+        // inventory and the incarnation read.
+        if !session_id_is_definitely_dead(sock_dir, cache_dir, &session_id) {
+            claim.release();
+            continue;
+        }
+        match crate::sessions::selected_session_lifetime(cache_dir, &session_id) {
+            Ok(lifetime) => {
+                selected.push((session_id, lifetime));
+                claims.push(claim);
+            },
+            Err(error) => {
+                claim.release();
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "Failed to read the incarnation of dead session {:?}: {}",
+                        session_id, error
+                    )
                 });
             },
         }
     }
+    let mut deleted = 0;
+    for (session_id, lifetime) in &selected {
+        match crate::sessions::remove_fenced_session_cache_for_lifetime(
+            cache_dir, session_id, *lifetime,
+        ) {
+            Ok(crate::sessions::SessionCacheRemoval::Removed) => {
+                deleted += 1;
+                // The row goes only after this session's cache is gone.
+                if let Some(index) = index {
+                    if let Err(error) = index.delete_by_ids(std::slice::from_ref(session_id)) {
+                        log::error!(
+                            "Failed to remove dead session {:?} from the session index: {}",
+                            session_id,
+                            error
+                        );
+                    }
+                }
+            },
+            Ok(crate::sessions::SessionCacheRemoval::NotFound) => {},
+            Err(error) if crate::sessions::is_selected_lifetime_mismatch(&error) => {
+                log::warn!(
+                    "dead session {:?} was admitted again; its cache was left in place",
+                    session_id
+                );
+            },
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    format!("Failed to delete dead session {:?}: {}", session_id, error)
+                });
+            },
+        }
+    }
+    for claim in claims {
+        claim.release();
+    }
     match first_error {
-        Some(e) => Err(e),
+        Some(error) => Err(error),
         None => Ok(deleted),
     }
 }

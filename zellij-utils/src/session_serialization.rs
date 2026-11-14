@@ -1,6 +1,65 @@
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+
+/// Prefix shared by the pane-content files referenced from a saved layout.
+///
+/// Names are content-addressed so publishing a new generation never mutates
+/// the files a previously committed layout points at.
+pub const PANE_CONTENTS_FILE_PREFIX: &str = "initial_contents_";
+const PANE_CONTENTS_HASH_BYTES: usize = 16;
+
+pub fn pane_contents_file_name(contents: &str) -> String {
+    let digest = Sha256::digest(contents.as_bytes());
+    let mut file_name =
+        String::with_capacity(PANE_CONTENTS_FILE_PREFIX.len() + 2 * PANE_CONTENTS_HASH_BYTES);
+    file_name.push_str(PANE_CONTENTS_FILE_PREFIX);
+    for byte in &digest[..PANE_CONTENTS_HASH_BYTES] {
+        use std::fmt::Write as _;
+        let _ = write!(file_name, "{:02x}", byte);
+    }
+    file_name
+}
+
+/// Every `contents_file` reference in a serialized layout, in document order.
+///
+/// Duplicates are kept: a reader counts them against loaded pane contents to
+/// detect a file that disappeared while the layout was being parsed.
+pub fn session_layout_content_file_references(layout: &str) -> Vec<String> {
+    fn visit(node: &KdlNode, references: &mut Vec<String>) {
+        let contents_file = node
+            .get("contents_file")
+            .and_then(|entry| entry.value().as_string())
+            .or_else(|| {
+                node.children()
+                    .and_then(|children| children.get("contents_file"))
+                    .and_then(|child| child.get(0))
+                    .and_then(|entry| entry.value().as_string())
+            });
+        if let Some(contents_file) = contents_file {
+            references.push(contents_file.to_owned());
+        }
+        if let Some(children) = node.children() {
+            for child in children.nodes() {
+                visit(child, references);
+            }
+        }
+    }
+    let mut references = Vec::new();
+    if let Ok(document) = layout.parse::<KdlDocument>() {
+        for node in document.nodes() {
+            visit(node, &mut references);
+        }
+    }
+    references
+}
+
+pub fn session_layout_referenced_content_files(layout: &str) -> HashSet<String> {
+    session_layout_content_file_references(layout)
+        .into_iter()
+        .collect()
+}
 
 use crate::{
     data::{BorderStyleOverride, LineStyle},
@@ -369,7 +428,7 @@ fn serialize_pane_title_and_attributes(
     }
     if let Some(initial_pane_contents) = initial_pane_contents.as_ref() {
         if command.is_none() && edit.is_none() {
-            let file_name = format!("initial_contents_{}", pane_contents.keys().len() + 1);
+            let file_name = pane_contents_file_name(initial_pane_contents);
             kdl_node
                 .entries_mut()
                 .push(KdlEntry::new_prop("contents_file", file_name.clone()));
@@ -1284,6 +1343,46 @@ mod tests {
     use insta::assert_snapshot;
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn pane_contents_file_names_are_content_addressed() {
+        let first = pane_contents_file_name("pane contents A");
+        assert_eq!(first, pane_contents_file_name("pane contents A"));
+        assert_ne!(first, pane_contents_file_name("pane contents B"));
+        assert!(first.starts_with(PANE_CONTENTS_FILE_PREFIX));
+        assert_eq!(
+            first.len(),
+            PANE_CONTENTS_FILE_PREFIX.len() + 2 * PANE_CONTENTS_HASH_BYTES
+        );
+        // A stable digest keeps old layouts readable across restarts.
+        assert_eq!(first, "initial_contents_7553f71f1610255c385f29edc8d011f9");
+    }
+
+    #[test]
+    fn content_file_references_keep_property_and_child_forms() {
+        let layout = r#"
+layout {
+    tab {
+        pane contents_file="initial_contents_one"
+        pane {
+            contents_file "initial_contents_two"
+        }
+        floating_panes {
+            pane contents_file="initial_contents_three"
+        }
+    }
+}
+"#;
+        assert_eq!(
+            session_layout_content_file_references(layout),
+            vec![
+                "initial_contents_one".to_owned(),
+                "initial_contents_two".to_owned(),
+                "initial_contents_three".to_owned(),
+            ]
+        );
+    }
+
     const PANEGEOMS_JSON: &[&[&str]] = &[
         &[
             r#"{ "x": 0, "y": 1, "rows": { "constraint": "Percent(100.0)", "inner": 43 }, "cols": { "constraint": "Percent(100.0)", "inner": 211 }, "is_stacked": false }"#,

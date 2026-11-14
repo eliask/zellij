@@ -3961,6 +3961,12 @@ pub fn start_server_impl(
                 };
 
                 info!("FirstClientConnected: initializing session");
+                // A recycled id or a leftover fence from a delete must not block
+                // this session's writers. Admit before those writers start, and
+                // only after the socket is already bound.
+                if !session_id.is_empty() {
+                    zellij_utils::sessions::clear_session_deletion_fence(&session_id);
+                }
                 let mut session = init_session(
                     os_input.clone(),
                     to_server.clone(),
@@ -5440,10 +5446,12 @@ pub fn start_server_impl(
     // Drop cached session data before exit.
     *session_data.write().unwrap() = None;
 
-    server_socket.remove_on_exit();
+    // Drop the cache while this process still owns the socket, so a
+    // resurrection cannot bind and admit into the incarnation being removed.
     if delete_session_on_exit {
         delete_unused_session_after_exit(&session_id, &own_session_name);
     }
+    server_socket.remove_on_exit();
 }
 
 // The session-info cache folder is named by session id; the session index row by name.
@@ -5451,12 +5459,25 @@ fn delete_unused_session_after_exit(session_id: &str, session_name: &str) {
     if session_id.is_empty() {
         return;
     }
-    if let Ok(index) = zellij_utils::session_index::SessionIndex::open_default() {
-        let _ = index.delete(session_name);
+    // Fence first. The index row is removed only after this session's cache is
+    // gone; a fence failure leaves both the folder and the row.
+    match zellij_utils::sessions::remove_fenced_session_cache(session_id) {
+        Ok(
+            zellij_utils::sessions::SessionCacheRemoval::Removed
+            | zellij_utils::sessions::SessionCacheRemoval::NotFound,
+        ) => {
+            if let Ok(index) = zellij_utils::session_index::SessionIndex::open_default() {
+                let _ = index.delete(session_name);
+            }
+        },
+        Err(error) => {
+            log::error!(
+                "Failed to delete session cache for {} on exit: {}",
+                session_id,
+                error
+            );
+        },
     }
-    let _ = std::fs::remove_dir_all(zellij_utils::consts::session_info_folder_for_session(
-        session_id,
-    ));
 }
 
 fn init_session(

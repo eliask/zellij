@@ -51,6 +51,25 @@ pub fn session_info_folder_for_session(session_id: &str) -> PathBuf {
     ZELLIJ_SESSION_INFO_CACHE_DIR.join(session_id)
 }
 
+/// Tombstone sibling of a session-info folder. Lives outside the folder so
+/// `remove_dir_all` does not drop it, and a late writer of that incarnation
+/// stays refused.
+pub fn session_deletion_tombstone_path(session_id: &str) -> PathBuf {
+    ZELLIJ_SESSION_INFO_CACHE_DIR.join(format!("{session_id}.deleted"))
+}
+
+/// Sibling of the session directory. Writers and deleters share this lock so
+/// it outlives `remove_dir_all` of the session folder. One file per session id.
+pub fn session_publication_lock_path(session_id: &str) -> PathBuf {
+    ZELLIJ_SESSION_INFO_CACHE_DIR.join(format!("{session_id}.lock"))
+}
+
+/// Sibling incarnation file. A writer stores the value it read at creation and
+/// may publish only while the file still contains that value.
+pub fn session_incarnation_path(session_id: &str) -> PathBuf {
+    ZELLIJ_SESSION_INFO_CACHE_DIR.join(format!("{session_id}.incarnation"))
+}
+
 /// Length of a generated session id (hex chars). Kept short so the socket/pipe
 /// path stays within the platform limit (104 bytes on macOS) even under a long
 /// temp dir — a full 36-char UUID would overflow it. The client checks the socket

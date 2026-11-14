@@ -203,11 +203,11 @@ pub fn saved_session_preview_from_layout(
     layout_path: Option<PathBuf>,
 ) -> SavedSessionPreview {
     let folder = layout_cwd(raw_layout).map(|cwd| cwd.display().to_string());
-    match Layout::from_kdl(
+    // A missing contents file parses as empty pane contents. Use the same
+    // reference-vs-loaded check as resurrection so that is an error.
+    match Layout::from_kdl_with_verified_contents(
         raw_layout,
         layout_path.map(|path| path.display().to_string()),
-        None,
-        None,
     ) {
         Ok(layout) => {
             let focused_tab = layout.focused_tab_index();
@@ -310,6 +310,24 @@ layout {
     fn unreadable_layouts_report_an_error() {
         let preview = saved_session_preview_from_layout("broken", "layout {", None);
         assert!(preview.error.is_some());
+    }
+
+    #[test]
+    fn saved_layout_missing_content_file_is_an_error() {
+        let folder = tempfile::tempdir().unwrap();
+        let raw = r#"
+layout {
+    tab name="editor" focus=true {
+        pane contents_file="missing" focus=true
+    }
+}
+"#;
+        let layout_path = folder.path().join("session-layout.kdl");
+        let preview = saved_session_preview_from_layout("saved", raw, Some(layout_path));
+        assert!(
+            preview.error.is_some(),
+            "a missing contents file must not preview as success: {preview:?}"
+        );
     }
 
     #[test]

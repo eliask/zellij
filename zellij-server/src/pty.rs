@@ -255,6 +255,13 @@ pub(crate) struct Pty {
 }
 
 pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: String) -> Result<()> {
+    // Read once, after the session has claimed an incarnation. Not refreshed:
+    // a newer file must not reauthorize this thread.
+    let session_incarnation = if session_id.is_empty() {
+        None
+    } else {
+        zellij_utils::sessions::read_session_incarnation(&session_id).ok()
+    };
     loop {
         let (event, mut err_ctx) = pty.bus.recv().expect("failed to receive event on channel");
         err_ctx.add_call(ContextType::Pty((&event).into()));
@@ -868,20 +875,37 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: Str
                 ) {
                     Ok(kdl_and_files) => {
                         // Cache is keyed by the stable session id, not the name.
-                        write_session_state_to_disk(
-                            session_id.clone(),
-                            session_info,
-                            kdl_and_files.clone(),
-                        );
-
-                        // Update session save time for plugin query
-                        let timestamp_millis = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        let _ = pty.bus.senders.send_to_plugin(
-                            PluginInstruction::UpdateSessionSaveTime(timestamp_millis),
-                        );
+                        match session_incarnation {
+                            None => {
+                                log::error!(
+                                    "Refusing to persist session state for {} without a captured incarnation",
+                                    session_id
+                                );
+                            },
+                            Some(incarnation) => match write_session_state_to_disk(
+                                session_id.clone(),
+                                incarnation,
+                                session_info,
+                                kdl_and_files.clone(),
+                            ) {
+                                Ok(()) => {
+                                    let timestamp_millis = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        as u64;
+                                    let _ = pty.bus.senders.send_to_plugin(
+                                        PluginInstruction::UpdateSessionSaveTime(timestamp_millis),
+                                    );
+                                },
+                                Err(error) => {
+                                    log::error!(
+                                        "Failed to persist session state to disk: {}",
+                                        error
+                                    );
+                                },
+                            },
+                        }
 
                         let _ = pty.bus.senders.send_to_background_jobs(
                             BackgroundJob::ReportLayoutInfo(kdl_and_files),
