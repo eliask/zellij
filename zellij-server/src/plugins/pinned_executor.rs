@@ -406,8 +406,6 @@ mod tests {
         PluginCache,
         Engine,
     ) {
-        use std::path::PathBuf;
-        use wasmi::Module;
         use zellij_utils::channels::{self, SenderWithContext};
 
         let (send_to_pty, _receive_pty) = channels::bounded(1);
@@ -438,9 +436,7 @@ mod tests {
         let plugin_map = Arc::new(Mutex::new(PluginMap::default()));
         let connected_clients = Arc::new(Mutex::new(vec![]));
 
-        let plugin_cache = Arc::new(Mutex::new(
-            std::collections::HashMap::<PathBuf, Module>::new(),
-        ));
+        let plugin_cache: PluginCache = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         let engine = Engine::default();
 

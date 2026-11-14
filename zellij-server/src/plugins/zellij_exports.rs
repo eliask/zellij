@@ -1,7 +1,7 @@
 use super::PluginInstruction;
 use crate::background_jobs::BackgroundJob;
 use crate::global_async_runtime::get_tokio_runtime;
-use crate::plugins::plugin_map::PluginEnv;
+use crate::plugins::plugin_map::{next_permission_prompt_id, PluginEnv};
 use crate::plugins::wasm_bridge::handle_plugin_crash;
 use crate::plugins::{PluginId, PromptCaller};
 use crate::pty::{ClientTabIndexOrPaneId, PtyInstruction};
@@ -1681,34 +1681,45 @@ fn show_cursor(env: &PluginEnv, cursor_position: Option<(usize, usize)>) {
 }
 
 fn request_permission(env: &PluginEnv, permissions: Vec<PermissionType>) -> Result<()> {
+    let permission_cache_key = permission_cache_key(env);
     if env.plugin.is_builtin()
         || PermissionCache::from_path_or_default(None)
-            .check_permissions(env.plugin.location.to_string(), &permissions)
+            .check_permissions(permission_cache_key, &permissions)
     {
+        // Already granted for these exact module bytes. The instruction carries this load's
+        // generation and digest so a replacement cannot inherit the grant.
         return env
             .senders
-            .send_to_plugin(PluginInstruction::PermissionRequestResult(
+            .send_to_plugin(PluginInstruction::GrantKnownPermissions(
                 env.plugin_id,
                 Some(acting_client(env)),
                 permissions.to_vec(),
-                PermissionStatus::Granted,
-                None,
+                env.generation,
+                env.plugin_digest.clone(),
             ));
     }
 
-    // we do this so that messages that have arrived while the user is seeing the permission screen
-    // will be cached and reapplied once the permission is granted
+    // Messages that arrive while the user is seeing the permission screen are cached and
+    // reapplied once this prompt is answered. The prompt id is allocated with the prompt.
+    let prompt_id = next_permission_prompt_id();
     let _ = env
         .senders
         .send_to_plugin(PluginInstruction::CachePluginEvents {
             plugin_id: env.plugin_id,
+            generation: env.generation,
+            digest: env.plugin_digest.clone(),
+            prompt_id,
         });
 
     env.senders
         .send_to_screen(ScreenInstruction::RequestPluginPermissions(
             permission_pane_id(env),
-            PluginPermission::new(env.plugin.location.to_string(), permissions),
+            PluginPermission::new(env.plugin.location.to_string(), permissions, prompt_id),
         ))
+}
+
+fn permission_cache_key(env: &PluginEnv) -> String {
+    format!("{}#{}", env.plugin.location, env.plugin_digest)
 }
 
 fn get_plugin_ids(env: &PluginEnv) {
@@ -2232,6 +2243,7 @@ fn run_action(env: &PluginEnv, mut action: Action, context: BTreeMap<String, Str
     let action_clone = action.clone();
     let client_id = acting_client(env);
     let plugin_id = env.plugin_id;
+    let scheduled_generation = env.generation;
     let senders = env.senders.clone();
     let default_shell = env.default_shell.clone();
     let default_mode = env.default_mode.clone();
@@ -2262,17 +2274,14 @@ fn run_action(env: &PluginEnv, mut action: Action, context: BTreeMap<String, Str
             },
         };
 
-        // After action completes, send ActionComplete event with context
-        // Convert server PaneId to zellij_utils PaneId
+        // The generation stays on the instruction so a replacement load does not observe it.
         let pane_id_for_event = pane_id.map(|p| p.into());
-        let updates = vec![(
-            Some(plugin_id),
-            Some(client_id),
-            Event::ActionComplete(action_clone, pane_id_for_event, context),
-        )];
-
-        // Send the ActionComplete event back to the plugin
-        if let Err(e) = senders.send_to_plugin(PluginInstruction::Update(updates)) {
+        if let Err(e) = senders.send_to_plugin(PluginInstruction::ApplyLoadResult {
+            plugin_id,
+            client_id,
+            event: Event::ActionComplete(action_clone, pane_id_for_event, context),
+            generation: scheduled_generation,
+        }) {
             log::error!("Failed to send ActionComplete event: {:?}", e);
         }
     });
@@ -3316,9 +3325,11 @@ fn switch_tab_to(env: &PluginEnv, tab_idx: u32) {
 
 fn set_timeout(env: &PluginEnv, secs: f64) {
     let send_plugin_instructions = env.senders.to_plugin.clone();
-    let update_target = Some(env.plugin_id);
+    let plugin_id = env.plugin_id;
     let client_id = acting_client(env);
     let plugin_name = env.name();
+    // The timer is bound to this load. A reload that reuses the plugin id must not receive it.
+    let scheduled_generation = env.generation;
     // Use tokio runtime for async I/O (timer operation)
     get_tokio_runtime().spawn(async move {
         let start_time = Instant::now();
@@ -3331,17 +3342,18 @@ fn set_timeout(env: &PluginEnv, secs: f64) {
             .ok_or(anyhow!("found no sender to send plugin instruction to"))
             .and_then(|sender| {
                 sender
-                    .send(PluginInstruction::Update(vec![(
-                        update_target,
-                        Some(client_id),
-                        Event::Timer(elapsed_time),
-                    )]))
+                    .send(PluginInstruction::ApplyTimer {
+                        plugin_id,
+                        client_id,
+                        elapsed_seconds: elapsed_time,
+                        generation: scheduled_generation,
+                    })
                     .to_anyhow()
             })
             .with_context(|| {
                 format!(
-                    "failed to set host timeout of {secs} s for plugin {}",
-                    plugin_name
+                    "failed to set host timeout of {secs} s for plugin {} (generation {})",
+                    plugin_name, scheduled_generation
                 )
             })
             .non_fatal();
@@ -3395,6 +3407,7 @@ fn run_command(
                 env_variables,
                 cwd,
                 context,
+                env.generation,
             ));
     }
 }
@@ -3417,6 +3430,7 @@ fn web_request(
             headers,
             body,
             context,
+            env.generation,
         ));
 }
 

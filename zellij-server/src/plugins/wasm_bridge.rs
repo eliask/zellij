@@ -6,8 +6,8 @@ use crate::plugins::pipes::{
 };
 use crate::plugins::plugin_loader::PluginLoader;
 use crate::plugins::plugin_map::{
-    AtomicEvent, PluginEnv, PluginMap, PluginMetadata, RemovedPluginAssets, RunningPlugin,
-    SharedSlot, Subscriptions,
+    next_plugin_generation, AtomicEvent, PluginEnv, PluginMap, PluginMetadata, RemovedPluginAssets,
+    RunningPlugin, SharedSlot, Subscriptions,
 };
 use crate::plugins::prompt_requests::{PromptAction, PromptCaller, PromptRequests};
 use crate::plugins::settings_entries::{PluginIdentity, SettingsEntries};
@@ -79,7 +79,9 @@ fn make_plugin_url_path_safe(url: String) -> String {
 
 #[derive(Debug, Clone)]
 pub enum EventOrPipeMessage {
-    Event(Event, Option<ClientId>),
+    /// The third field is the load generation a timer or other load-scoped callback was scheduled
+    /// against. `None` for events that are not bound to one load.
+    Event(Event, Option<ClientId>, Option<u64>),
     PipeMessage(PipeMessage, Option<ClientId>),
 }
 
@@ -152,6 +154,8 @@ pub struct LoadingContext {
     pub keybinds: SharedKeybinds,
     pub plugin_dir: PathBuf,
     pub size: Size,
+    /// Identifies the instance this context creates. A reload of the same plugin id gets a new one.
+    pub generation: u64,
 }
 
 impl LoadingContext {
@@ -201,6 +205,7 @@ impl LoadingContext {
             tab_index,
             plugin_dir: wasm_bridge.plugin_dir.clone(),
             size,
+            generation: next_plugin_generation(),
         }
     }
     pub fn update_plugin_path(&mut self, new_path: PathBuf) {
@@ -208,7 +213,8 @@ impl LoadingContext {
     }
 }
 
-pub type PluginCache = Arc<Mutex<HashMap<PathBuf, Module>>>;
+/// Compiled modules keyed by path and the digest of the bytes they were compiled from.
+pub type PluginCache = Arc<Mutex<HashMap<PathBuf, (String, Module)>>>;
 
 const SLOT_ADDED_WAIT_MS: u64 = 200;
 
@@ -281,6 +287,11 @@ pub struct WasmBridge {
     plugin_executor: Arc<PinnedExecutor>,
     next_plugin_id: PluginId,
     plugin_ids_waiting_for_permission_request: HashSet<PluginId>,
+    /// plugin id or shared instance id -> (prompt id, generation, module digest)
+    permission_prompts: HashMap<PluginId, (u64, u64, String)>,
+    /// Generation captured by `ApplyTimer` or `ApplyLoadResult`, consumed by the next
+    /// `update_plugins`. Not a guest-visible field.
+    scheduled_timer_generation: Option<u64>,
     cached_events_for_pending_plugins: HashMap<PluginId, Vec<EventOrPipeMessage>>,
     cached_resizes_for_pending_plugins: HashMap<PluginId, (usize, usize)>, // (rows, columns)
     cached_worker_messages: HashMap<PluginId, Vec<(ClientId, String, String, String)>>, // Vec<clientid,
@@ -339,8 +350,7 @@ impl WasmBridge {
     ) -> Self {
         let plugin_map = Arc::new(Mutex::new(PluginMap::default()));
         let connected_clients: Arc<Mutex<Vec<ClientId>>> = Arc::new(Mutex::new(vec![]));
-        let plugin_cache: Arc<Mutex<HashMap<PathBuf, Module>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let plugin_cache: PluginCache = Arc::new(Mutex::new(HashMap::new()));
         let watcher = None;
         let downloader = Downloader::new(ZELLIJ_CACHE_DIR.to_path_buf());
         let max_threads = num_cpus::get().max(4).min(16);
@@ -363,6 +373,8 @@ impl WasmBridge {
             next_plugin_id: 0,
             cached_events_for_pending_plugins: HashMap::new(),
             plugin_ids_waiting_for_permission_request: HashSet::new(),
+            permission_prompts: HashMap::new(),
+            scheduled_timer_generation: None,
             cached_resizes_for_pending_plugins: HashMap::new(),
             cached_worker_messages: HashMap::new(),
             loading_plugins: HashSet::new(),
@@ -655,6 +667,7 @@ impl WasmBridge {
     }
     pub fn unload_plugin(&mut self, pid: PluginId) -> Result<()> {
         info!("Bye from plugin {}", &pid);
+        self.clear_permission_prompt(pid);
         let _ = self
             .senders
             .send_to_screen(ScreenInstruction::ClearLiveViewsOfPlugin(pid));
@@ -764,6 +777,8 @@ impl WasmBridge {
         Ok(())
     }
     pub fn reload_plugin_with_id(&mut self, plugin_id: u32) -> Result<()> {
+        // A prompt answered after this reload must not grant the replacement.
+        self.clear_permission_prompt(plugin_id);
         let _ = self
             .senders
             .send_to_screen(ScreenInstruction::ClearLiveViewsOfPlugin(plugin_id));
@@ -1109,11 +1124,15 @@ impl WasmBridge {
         }
         Ok(())
     }
+    pub fn set_scheduled_timer_generation(&mut self, generation: u64) {
+        self.scheduled_timer_generation = Some(generation);
+    }
     pub fn update_plugins(
         &mut self,
         mut updates: Vec<(Option<PluginId>, Option<ClientId>, Event)>,
         shutdown_sender: Sender<()>,
     ) -> Result<()> {
+        let scheduled_timer_generation = self.scheduled_timer_generation.take();
         for (plugin_id, client_id, event) in updates.iter() {
             if plugin_id.is_none() && client_id.is_none() {
                 if let Event::HostTerminalThemeChanged(mode) = event {
@@ -1121,7 +1140,11 @@ impl WasmBridge {
                 }
             }
         }
-        updates = self.dispatch_shared_updates(updates, shutdown_sender.clone());
+        updates = self.dispatch_shared_updates(
+            updates,
+            shutdown_sender.clone(),
+            scheduled_timer_generation,
+        );
         let plugins_to_update: Vec<(
             PluginId,
             ClientId,
@@ -1164,6 +1187,11 @@ impl WasmBridge {
                             None
                         };
                         let latest_hovers = self.latest_hovers.clone();
+                        let scheduled_for_event = if event_is_scoped_to_load(&event) {
+                            scheduled_timer_generation
+                        } else {
+                            None
+                        };
                         // Execute directly on pinned thread (no async I/O needed for event processing)
                         plugin_executor.execute_for_plugin(*plugin_id, {
                             let plugin_id = *plugin_id;
@@ -1197,6 +1225,7 @@ impl WasmBridge {
                                     &mut plugin_render_assets,
                                     senders.clone(),
                                     &plugin_subs,
+                                    scheduled_for_event,
                                 ) {
                                     Ok(()) => {
                                         let _ = senders.send_to_screen(
@@ -1227,9 +1256,18 @@ impl WasmBridge {
         // loop once more to update the cached events for the pending plugins (probably currently
         // being loaded, we'll send them these events when they load)
         for (pid, cid, event) in updates.drain(..) {
+            let timer_generation = if event_is_scoped_to_load(&event) {
+                scheduled_timer_generation
+            } else {
+                None
+            };
             for (plugin_id, cached_events) in self.cached_events_for_pending_plugins.iter_mut() {
                 if pid.is_none() || pid.as_ref() == Some(plugin_id) {
-                    cached_events.push(EventOrPipeMessage::Event(event.clone(), cid));
+                    cached_events.push(EventOrPipeMessage::Event(
+                        event.clone(),
+                        cid,
+                        timer_generation,
+                    ));
                 }
             }
         }
@@ -1817,7 +1855,7 @@ impl WasmBridge {
         shutdown_sender: Sender<()>,
     ) -> Result<()> {
         if let Some(cached_events) = self.cached_events_for_pending_plugins.get_mut(&plugin_id) {
-            cached_events.insert(0, EventOrPipeMessage::Event(event, Some(client_id)));
+            cached_events.insert(0, EventOrPipeMessage::Event(event, Some(client_id), None));
             return Ok(());
         }
         self.update_plugins(
@@ -1992,7 +2030,11 @@ impl WasmBridge {
                             let _s = _s; // guard to allow the task to complete before cleanup/shutdown
                             for event_or_pipe_message in events_or_pipe_messages {
                                 match event_or_pipe_message {
-                                    EventOrPipeMessage::Event(event, target_client_id) => {
+                                    EventOrPipeMessage::Event(
+                                        event,
+                                        target_client_id,
+                                        scheduled_generation,
+                                    ) => {
                                         if target_client_id
                                             .map(|target| target != client_id)
                                             .unwrap_or(false)
@@ -2017,6 +2059,7 @@ impl WasmBridge {
                                                     &mut plugin_render_assets,
                                                     senders.clone(),
                                                     &subs,
+                                                    scheduled_generation,
                                                 ) {
                                                     Ok(()) => {
                                                         let _ = senders.send_to_screen(
@@ -2270,16 +2313,181 @@ impl WasmBridge {
             };
         }
     }
-    pub fn cache_plugin_permissions(
+    /// Apply a cache-hit permission grant only when `generation` and `digest` are still the
+    /// running instance. A mismatch is not written and does not emit `PermissionRequestResult`.
+    pub(crate) fn grant_known_permissions(
+        &mut self,
+        plugin_id: PluginId,
+        client_id: Option<ClientId>,
+        permissions: Vec<PermissionType>,
+        generation: u64,
+        digest: &str,
+        cache_path: Option<PathBuf>,
+        shutdown_sender: Sender<()>,
+    ) -> Result<()> {
+        self.apply_verified_permissions(
+            plugin_id,
+            client_id,
+            permissions,
+            PermissionStatus::Granted,
+            cache_path,
+            generation,
+            digest,
+            None,
+            shutdown_sender,
+        )
+    }
+
+    /// Apply an answer to the interactive prompt `prompt_id`. The stored prompt must still be
+    /// that id, and its generation and digest must still be the running instance.
+    pub(crate) fn apply_permission_prompt_result(
         &mut self,
         plugin_id: PluginId,
         client_id: Option<ClientId>,
         permissions: Vec<PermissionType>,
         status: PermissionStatus,
         cache_path: Option<PathBuf>,
+        prompt_id: u64,
+        shutdown_sender: Sender<()>,
     ) -> Result<()> {
-        let err_context = || format!("Failed to write plugin permission {plugin_id}");
+        let Some((stored_id, generation, digest)) = self.permission_prompt_identity(plugin_id)
+        else {
+            log::warn!(
+                "Ignoring a permission response for plugin {plugin_id}: its prompt belongs to a module that is no longer running"
+            );
+            return Ok(());
+        };
+        // A different prompt id still reaches the write so it is refused there instead of
+        // matching whatever prompt is now stored for this plugin id.
+        if stored_id == prompt_id && !self.permission_prompt_is_current(plugin_id, client_id) {
+            log::warn!(
+                "Ignoring a permission response for plugin {plugin_id}: its prompt belongs to a module that is no longer running"
+            );
+            self.clear_permission_prompt(plugin_id);
+            return Ok(());
+        }
+        let result = self.apply_verified_permissions(
+            plugin_id,
+            client_id,
+            permissions,
+            status,
+            cache_path,
+            generation,
+            &digest,
+            Some(prompt_id),
+            shutdown_sender,
+        );
+        if stored_id == prompt_id {
+            self.clear_permission_prompt(plugin_id);
+        }
+        result
+    }
 
+    /// Write `permissions` and deliver the result only while `generation` and `digest` are the
+    /// instance resolved for this write. `prompt_id`, when set, must still be the prompt stored
+    /// for this plugin.
+    pub(crate) fn apply_verified_permissions(
+        &mut self,
+        plugin_id: PluginId,
+        client_id: Option<ClientId>,
+        permissions: Vec<PermissionType>,
+        status: PermissionStatus,
+        cache_path: Option<PathBuf>,
+        generation: u64,
+        digest: &str,
+        prompt_id: Option<u64>,
+        shutdown_sender: Sender<()>,
+    ) -> Result<()> {
+        match self.cache_plugin_permissions(
+            plugin_id,
+            client_id,
+            permissions,
+            status,
+            cache_path,
+            Some((generation, digest)),
+            prompt_id,
+        ) {
+            Ok(false) => {
+                log::warn!(
+                    "Ignoring a permission grant for plugin {plugin_id}: its generation or module digest does not match the running instance"
+                );
+                return Ok(());
+            },
+            Ok(true) => {},
+            Err(e) => {
+                log::error!("{}", e);
+            },
+        }
+        if !self.running_instance_matches(plugin_id, client_id, generation, digest) {
+            log::warn!(
+                "Ignoring a permission grant for plugin {plugin_id}: its generation or module digest does not match the running instance"
+            );
+            return Ok(());
+        }
+        self.update_plugins(
+            vec![(
+                Some(plugin_id),
+                client_id,
+                Event::PermissionRequestResult(status),
+            )],
+            shutdown_sender.clone(),
+        )?;
+        self.apply_cached_events(vec![plugin_id], true, shutdown_sender)?;
+        Ok(())
+    }
+
+    pub(crate) fn running_instance_matches(
+        &self,
+        plugin_id: PluginId,
+        client_id: Option<ClientId>,
+        generation: u64,
+        digest: &str,
+    ) -> bool {
+        let Some(running_plugin) = self.running_plugin_for_permissions(plugin_id, client_id) else {
+            return false;
+        };
+        let running_plugin = running_plugin.lock().unwrap();
+        let data = running_plugin.store.data();
+        data.generation == generation && data.plugin_digest == digest
+    }
+
+    /// An answer still concerns the module that is running when the stored prompt's generation
+    /// and digest are that instance. A reload, a replaced module, or a missing prompt is stale.
+    pub fn permission_prompt_is_current(
+        &self,
+        plugin_id: PluginId,
+        client_id: Option<ClientId>,
+    ) -> bool {
+        let Some((_, prompt_generation, prompt_digest)) =
+            self.permission_prompt_identity(plugin_id)
+        else {
+            return false;
+        };
+        self.running_instance_matches(plugin_id, client_id, prompt_generation, &prompt_digest)
+    }
+
+    pub fn clear_permission_prompt(&mut self, plugin_id: PluginId) {
+        let prompt_key = self.prompt_key(plugin_id);
+        self.permission_prompts.remove(&prompt_key);
+    }
+
+    pub(crate) fn permission_prompt_identity(
+        &self,
+        plugin_id: PluginId,
+    ) -> Option<(u64, u64, String)> {
+        let prompt_key = self.prompt_key(plugin_id);
+        self.permission_prompts.get(&prompt_key).cloned()
+    }
+
+    fn prompt_key(&self, plugin_id: PluginId) -> PluginId {
+        self.shared_instance_of(plugin_id).unwrap_or(plugin_id)
+    }
+
+    fn running_plugin_for_permissions(
+        &self,
+        plugin_id: PluginId,
+        client_id: Option<ClientId>,
+    ) -> Option<Arc<Mutex<RunningPlugin>>> {
         let shared_running_plugin = self.shared_instance_of(plugin_id).and_then(|instance_id| {
             self.plugin_map
                 .lock()
@@ -2287,42 +2495,123 @@ impl WasmBridge {
                 .shared_running_plugin(instance_id)
                 .map(|(running_plugin, _)| running_plugin)
         });
-        let running_plugin = match shared_running_plugin {
-            Some(running_plugin) => running_plugin,
+        match shared_running_plugin {
+            Some(running_plugin) => Some(running_plugin),
             None => self
                 .plugin_map
                 .lock()
                 .unwrap()
-                .get_running_plugin(plugin_id, client_id)
-                .ok_or_else(|| anyhow!("Failed to get running plugin"))?,
+                .get_running_plugin(plugin_id, client_id),
+        }
+    }
+
+    /// `expected_instance` is the generation and module digest validated for this grant. When
+    /// set, both are compared to the resolved instance under the running-plugin lock immediately
+    /// before the permission set is written. `expected_prompt_id`, when set, must still be the
+    /// prompt stored for this plugin. A mismatch writes nothing and returns `Ok(false)`.
+    ///
+    /// Grants add to the permissions this load already holds. A denial does not remove them and
+    /// is not written to the durable cache. The cache key includes the module digest, so a
+    /// different module at the same location does not inherit the grant.
+    pub fn cache_plugin_permissions(
+        &mut self,
+        plugin_id: PluginId,
+        client_id: Option<ClientId>,
+        permissions: Vec<PermissionType>,
+        status: PermissionStatus,
+        cache_path: Option<PathBuf>,
+        expected_instance: Option<(u64, &str)>,
+        expected_prompt_id: Option<u64>,
+    ) -> Result<bool> {
+        let err_context = || format!("Failed to write plugin permission {plugin_id}");
+        let prompt_key = self.prompt_key(plugin_id);
+        let stored_prompt = self.permission_prompts.get(&prompt_key).cloned();
+
+        let Some(running_plugin) = self.running_plugin_for_permissions(plugin_id, client_id) else {
+            if expected_instance.is_some() {
+                return Ok(false);
+            }
+            return Err(anyhow!("Failed to get running plugin"));
         };
 
         let mut running_plugin = running_plugin.lock().unwrap();
+        {
+            let data = running_plugin.store.data();
+            if let Some(prompt_id) = expected_prompt_id {
+                let prompt_matches = stored_prompt.as_ref().is_some_and(
+                    |(stored_id, stored_generation, stored_digest)| {
+                        *stored_id == prompt_id
+                            && data.generation == *stored_generation
+                            && data.plugin_digest == *stored_digest
+                    },
+                );
+                if !prompt_matches {
+                    return Ok(false);
+                }
+            }
+            if let Some((generation, digest)) = expected_instance {
+                if data.generation != generation || data.plugin_digest != digest {
+                    return Ok(false);
+                }
+            }
+        }
 
-        let permissions = if status == PermissionStatus::Granted {
-            permissions
-        } else {
-            vec![]
-        };
-
+        let mut runtime_permissions = running_plugin
+            .store
+            .data()
+            .permissions
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        if status == PermissionStatus::Granted {
+            runtime_permissions.extend(permissions.iter().cloned());
+        }
         running_plugin
             .store
             .data_mut()
-            .set_permissions(HashSet::from_iter(permissions.clone()));
+            .set_permissions(runtime_permissions);
 
         if running_plugin.store.data().plugin.is_builtin() {
-            return Ok(());
+            return Ok(true);
+        }
+        if status != PermissionStatus::Granted {
+            return Ok(true);
         }
 
-        let mut permission_cache = PermissionCache::from_path_or_default(cache_path);
-        permission_cache.cache(
-            running_plugin.store.data().plugin.location.to_string(),
-            permissions,
+        let permission_cache_key = format!(
+            "{}#{}",
+            running_plugin.store.data().plugin.location,
+            running_plugin.store.data().plugin_digest
         );
-
-        permission_cache.write_to_file().with_context(err_context)
+        let mut permission_cache = PermissionCache::from_path_or_default(cache_path);
+        let mut durable = permission_cache
+            .get_permissions(permission_cache_key.clone())
+            .cloned()
+            .unwrap_or_default();
+        let mut changed = false;
+        for permission in permissions {
+            if !durable.contains(&permission) {
+                durable.push(permission);
+                changed = true;
+            }
+        }
+        if changed {
+            permission_cache.cache(permission_cache_key, durable);
+            permission_cache.write_to_file().with_context(err_context)?;
+        }
+        Ok(true)
     }
-    pub fn cache_plugin_events(&mut self, plugin_id: PluginId) {
+
+    pub fn cache_plugin_events(
+        &mut self,
+        plugin_id: PluginId,
+        generation: u64,
+        digest: String,
+        prompt_id: u64,
+    ) {
+        self.permission_prompts
+            .insert(plugin_id, (prompt_id, generation, digest));
         if self.shared_instance_of(plugin_id).is_some() {
             return;
         }
@@ -2989,6 +3278,7 @@ impl WasmBridge {
             None => true,
         };
         if tear_down {
+            self.clear_permission_prompt(instance_id);
             if let Some(info) = self.shared_instances.remove(&instance_id) {
                 self.shared_keys.remove(&info.key);
             }
@@ -3044,6 +3334,8 @@ impl WasmBridge {
         if !self.shared_instances.contains_key(&instance_id) {
             return;
         }
+        // The open prompt belonged to the instance being replaced.
+        self.clear_permission_prompt(instance_id);
         self.unregister_settings_entry(instance_id);
         let Some(info) = self.shared_instances.get(&instance_id) else {
             return;
@@ -3240,6 +3532,30 @@ impl WasmBridge {
             event => (event.clone(), None),
         }
     }
+    fn shared_callback_is_stale(
+        &self,
+        instance_id: PluginId,
+        event: &Event,
+        scheduled_timer_generation: Option<u64>,
+    ) -> bool {
+        let Some(scheduled) = scheduled_timer_generation else {
+            return false;
+        };
+        if !event_is_scoped_to_load(event) {
+            return false;
+        }
+        let Some(running) = self
+            .plugin_map
+            .lock()
+            .unwrap()
+            .shared_running_plugin(instance_id)
+            .map(|(running_plugin, _)| running_plugin)
+        else {
+            return true;
+        };
+        let running_generation = running.lock().unwrap().store.data().generation;
+        scheduled < running_generation
+    }
     fn push_shared_event(
         &self,
         batches: &mut BTreeMap<PluginId, Vec<SharedEventBatchEntry>>,
@@ -3265,6 +3581,7 @@ impl WasmBridge {
         &mut self,
         updates: Vec<(Option<PluginId>, Option<ClientId>, Event)>,
         shutdown_sender: Sender<()>,
+        scheduled_timer_generation: Option<u64>,
     ) -> Vec<(Option<PluginId>, Option<ClientId>, Event)> {
         if self.shared_instances.is_empty() {
             return updates;
@@ -3276,6 +3593,13 @@ impl WasmBridge {
             match plugin_id {
                 Some(plugin_id) => match self.shared_instance_of(plugin_id) {
                     Some(instance_id) => {
+                        if self.shared_callback_is_stale(
+                            instance_id,
+                            &event,
+                            scheduled_timer_generation,
+                        ) {
+                            continue;
+                        }
                         let slot_id = if plugin_id != instance_id {
                             Some(plugin_id)
                         } else {
@@ -3293,6 +3617,13 @@ impl WasmBridge {
                 },
                 None => {
                     for instance_id in &all_instance_ids {
+                        if self.shared_callback_is_stale(
+                            *instance_id,
+                            &event,
+                            scheduled_timer_generation,
+                        ) {
+                            continue;
+                        }
                         self.push_shared_event(&mut batches, *instance_id, None, client_id, &event);
                     }
                     legacy_updates.push((None, client_id, event));
@@ -3618,6 +3949,27 @@ pub(crate) fn apply_pending_popup_size(running_plugin: &mut RunningPlugin) -> bo
     changed
 }
 
+/// Timer and the asynchronous plugin results that name a plugin id without a generation of
+/// their own. A later load of that id must not observe them.
+pub(crate) fn event_is_scoped_to_load(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Timer(_)
+            | Event::RunCommandResult(..)
+            | Event::WebRequestResult(..)
+            | Event::ActionComplete(..)
+    )
+}
+
+pub(crate) fn stale_timer_for_load(
+    event: &Event,
+    scheduled_generation: Option<u64>,
+    running_generation: u64,
+) -> bool {
+    event_is_scoped_to_load(event)
+        && scheduled_generation.is_some_and(|scheduled| scheduled < running_generation)
+}
+
 pub fn apply_event_to_plugin(
     plugin_id: PluginId,
     client_id: ClientId,
@@ -3626,7 +3978,15 @@ pub fn apply_event_to_plugin(
     plugin_render_assets: &mut Vec<PluginRenderAsset>,
     senders: ThreadSenders,
     plugin_subscriptions: &HashSet<EventType>,
+    scheduled_timer_generation: Option<u64>,
 ) -> Result<()> {
+    if stale_timer_for_load(
+        event,
+        scheduled_timer_generation,
+        running_plugin.store.data().generation,
+    ) {
+        return Ok(());
+    }
     let instance = running_plugin.instance.clone();
 
     let err_context = || format!("Failed to apply event to plugin {plugin_id}");
@@ -3814,3 +4174,7 @@ mod hover_merge_tests;
 #[cfg(test)]
 #[path = "unit/startup_tests.rs"]
 mod startup_tests;
+
+#[cfg(test)]
+#[path = "unit/permission_binding_tests.rs"]
+mod permission_binding_tests;

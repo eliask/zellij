@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -337,9 +337,32 @@ impl PluginMap {
 
 pub type Subscriptions = HashSet<EventType>;
 
+static NEXT_PLUGIN_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Numbers each plugin load. Later loads, including a reload that reuses a plugin id, get a
+/// larger number so a delayed grant or callback can be told apart from the instance it replaced.
+pub fn next_plugin_generation() -> u64 {
+    NEXT_PLUGIN_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+static NEXT_PERMISSION_PROMPT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Opaque id for one permission prompt. Zero is never issued.
+pub fn next_permission_prompt_id() -> u64 {
+    loop {
+        let id = NEXT_PERMISSION_PROMPT_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
 pub struct PluginEnv {
     pub plugin_id: PluginId,
+    pub generation: u64,
     pub plugin: PluginConfig,
+    /// Digest of the module bytes this load actually instantiated.
+    pub plugin_digest: String,
     pub permissions: Arc<Mutex<Option<HashSet<PermissionType>>>>,
     pub senders: ThreadSenders,
     pub wasi_ctx: WasiCtx,

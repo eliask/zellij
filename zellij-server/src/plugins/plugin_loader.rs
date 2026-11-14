@@ -7,6 +7,7 @@ use crate::plugins::wasm_bridge::{LoadingContext, PluginCache};
 use crate::plugins::zellij_exports::{wasi_write_object, zellij_exports};
 use crate::plugins::PluginId;
 use prost::Message;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -63,6 +64,11 @@ fn create_plugin_fs_entries(plugin_own_data_dir: &PathBuf, plugin_own_cache_dir:
 pub struct PluginLoader<'a> {
     skip_cache: bool,
     plugin_id: PluginId,
+    generation: u64,
+    plugin_digest: String,
+    /// Module instantiated for this load. Other clients and workers of the load reuse it instead
+    /// of reading the path again.
+    module: Option<Module>,
     client_id: ClientId,
     plugin_cwd: PathBuf,
     plugin_own_data_dir: PathBuf,
@@ -104,6 +110,9 @@ impl<'a> PluginLoader<'a> {
         );
         Self {
             plugin_id: loading_context.plugin_id,
+            generation: loading_context.generation,
+            plugin_digest: String::new(),
+            module: None,
             client_id: loading_context.client_id,
             plugin_cwd: loading_context.plugin_cwd,
             plugin_own_data_dir: loading_context.plugin_own_data_dir,
@@ -134,27 +143,47 @@ impl<'a> PluginLoader<'a> {
     }
     pub fn start_plugin(&mut self) -> Result<()> {
         self.record_plugin_metadata();
-        let module = if self.skip_cache {
-            self.interpret_module()?
-        } else {
-            self.load_module_from_memory()
-                .or_else(|_e| self.interpret_module())?
-        };
+        let module = self.load_module()?;
         let (store, instance) = self.create_plugin_environment(module)?;
         self.load_plugin_instance(store, &instance, false)?;
         self.clone_instance_for_other_clients()?;
         Ok(())
     }
     pub fn start_shared_plugin(&mut self) -> Result<Arc<Mutex<RunningPlugin>>> {
-        let module = if self.skip_cache {
-            self.interpret_module()?
-        } else {
-            self.load_module_from_memory()
-                .or_else(|_e| self.interpret_module())?
-        };
+        let module = self.load_module()?;
         let (mut store, instance) = self.create_plugin_environment(module)?;
         store.data_mut().shared = Some(SharedEnv::default());
         self.load_plugin_instance(store, &instance, true)
+    }
+    /// Read this load's bytes once and fingerprint them. A cached module is used only when it was
+    /// compiled from those exact bytes. Clients and workers of this load reuse that module.
+    fn load_module(&mut self) -> Result<Module> {
+        if let Some(module) = &self.module {
+            return Ok(module.clone());
+        }
+        let wasm_bytes = self.plugin_config.resolve_wasm_bytes(&self.plugin_dir)?;
+        self.plugin_digest = plugin_digest_from_bytes(&wasm_bytes);
+        if !self.skip_cache {
+            if let Some(module) = self.cached_module_matching_digest() {
+                self.module = Some(module.clone());
+                return Ok(module);
+            }
+        }
+        let module = self.interpret_module(&wasm_bytes)?;
+        self.module = Some(module.clone());
+        Ok(module)
+    }
+    fn cached_module_matching_digest(&self) -> Option<Module> {
+        let cached = self
+            .plugin_cache
+            .lock()
+            .unwrap()
+            .get(&self.plugin_config.path)
+            .cloned();
+        match cached {
+            Some((digest, module)) if digest == self.plugin_digest => Some(module),
+            _ => None,
+        }
     }
     fn record_plugin_metadata(&mut self) {
         self.plugin_map.insert_metadata(
@@ -169,26 +198,15 @@ impl<'a> PluginLoader<'a> {
             },
         );
     }
-    fn interpret_module(&mut self) -> Result<Module> {
+    fn interpret_module(&mut self, wasm_bytes: &[u8]) -> Result<Module> {
         self.loading_indication.override_previous_error();
-        let wasm_bytes = self.plugin_config.resolve_wasm_bytes(&self.plugin_dir)?;
         let timer = std::time::Instant::now();
-        let module = Module::new(&self.engine, &wasm_bytes)?;
+        let module = Module::new(&self.engine, wasm_bytes)?;
         log::info!(
             "Loaded plugin '{}' in {:?}",
             self.plugin_config.path.display(),
             timer.elapsed()
         );
-        Ok(module)
-    }
-    fn load_module_from_memory(&mut self) -> Result<Module> {
-        let module = self
-            .plugin_cache
-            .lock()
-            .unwrap()
-            .remove(&self.plugin_config.path) // TODO: do we still bring it back later?
-            // maybe we can forgo this dance?
-            .ok_or(anyhow!("Plugin is not stored in memory"))?;
         Ok(module)
     }
     fn load_plugin_instance(
@@ -299,8 +317,10 @@ impl<'a> PluginLoader<'a> {
         let plugin_path = self.plugin_config.path.clone();
         let plugin_env = PluginEnv {
             plugin_id: self.plugin_id,
+            generation: self.generation,
             client_id: self.client_id,
             plugin: self.plugin_config.clone(), // TODO: change field name in PluginEnv to plugin_config
+            plugin_digest: self.plugin_digest.clone(),
             permissions: Arc::new(Mutex::new(None)),
             senders: self.senders.clone(),
             wasi_ctx,
@@ -347,7 +367,7 @@ impl<'a> PluginLoader<'a> {
         self.plugin_cache
             .lock()
             .unwrap()
-            .insert(plugin_path.clone(), module);
+            .insert(plugin_path.clone(), (self.plugin_digest.clone(), module));
         Ok((store, instance))
     }
     pub fn clone_instance_for_other_clients(&mut self) -> Result<()> {
@@ -379,13 +399,7 @@ impl<'a> PluginLoader<'a> {
                 plugin_id
             )
         };
-        let module = self
-            .plugin_cache
-            .lock()
-            .unwrap()
-            .get(&self.plugin_config.path)
-            .with_context(err_context)?
-            .clone();
+        let module = self.module.clone().with_context(err_context)?;
         let (store, instance) = self.create_plugin_instance_env(&module)?;
         Ok((store, instance))
     }
@@ -412,8 +426,10 @@ impl<'a> PluginLoader<'a> {
         let plugin_config = self.plugin_config.clone();
         let plugin_env = PluginEnv {
             plugin_id: self.plugin_id,
+            generation: self.generation,
             client_id: self.client_id,
             plugin: plugin_config,
+            plugin_digest: self.plugin_digest.clone(),
             permissions: Arc::new(Mutex::new(None)),
             senders: self.senders.clone(),
             wasi_ctx,
@@ -518,6 +534,17 @@ impl<'a> PluginLoader<'a> {
     }
 }
 
+pub(crate) fn plugin_digest_from_bytes(wasm_bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(wasm_bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
 fn create_optimized_store_limits() -> StoreLimits {
     use wasmi::StoreLimitsBuilder;
     StoreLimitsBuilder::new()
@@ -527,4 +554,174 @@ fn create_optimized_store_limits() -> StoreLimits {
         .tables(16) // Small table element limit
         .trap_on_grow_failure(true) // Fail fast on resource exhaustion
         .build()
+}
+
+#[cfg(test)]
+mod module_digest_tests {
+    use super::*;
+    use wasmi::{Engine, Linker, Module, Store};
+
+    fn wasm_with_export(name: &str) -> Vec<u8> {
+        wat::parse_str(format!("(module (func (export \"{name}\")))")).unwrap()
+    }
+
+    fn has_export(engine: &Engine, module: &Module, name: &str) -> bool {
+        let mut store = Store::<()>::new(engine, ());
+        let linker = Linker::new(engine);
+        let instance = linker
+            .instantiate_and_start(&mut store, module)
+            .expect("instantiate");
+        instance.get_func(&store, name).is_some()
+    }
+
+    /// `cached` is `(digest stored beside the module, bytes the module was compiled from)`.
+    fn load_case(
+        skip_cache: bool,
+        file_bytes: &[u8],
+        cached: Option<(String, Vec<u8>)>,
+    ) -> (String, bool, bool, Option<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guest.wasm");
+        std::fs::write(&path, file_bytes).unwrap();
+        let mut plugin_map = PluginMap::default();
+        let plugin_cache: PluginCache = Arc::new(Mutex::new(HashMap::new()));
+        let context = LoadingContext {
+            plugin_id: 1,
+            client_id: 1,
+            plugin_cwd: dir.path().to_path_buf(),
+            plugin_own_data_dir: dir.path().join("data"),
+            plugin_own_cache_dir: dir.path().join("cache"),
+            plugin_config: PluginConfig {
+                path: path.clone(),
+                _allow_exec_host_cmd: false,
+                location: zellij_utils::input::layout::RunPluginLocation::File(path.clone()),
+                initial_userspace_configuration: Default::default(),
+                initial_cwd: None,
+            },
+            tab_index: None,
+            path_to_default_shell: PathBuf::from("/bin/sh"),
+            session_env_vars: Default::default(),
+            default_shell: None,
+            layout_dir: None,
+            default_mode: Default::default(),
+            keybinds: Arc::new(Vec::new()),
+            plugin_dir: dir.path().to_path_buf(),
+            size: Size { rows: 2, cols: 2 },
+            generation: 1,
+        };
+        let mut loader = PluginLoader::new(
+            skip_cache,
+            context,
+            ThreadSenders::default(),
+            Engine::default(),
+            plugin_cache.clone(),
+            &mut plugin_map,
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        if let Some((digest, bytes)) = cached {
+            let module = Module::new(&loader.engine, &bytes).unwrap();
+            plugin_cache
+                .lock()
+                .unwrap()
+                .insert(path.clone(), (digest, module));
+        }
+        let module = loader.load_module().unwrap();
+        let marker_a = has_export(&loader.engine, &module, "marker_a");
+        let marker_b = has_export(&loader.engine, &module, "marker_b");
+        let cache_digest = plugin_cache
+            .lock()
+            .unwrap()
+            .get(&path)
+            .map(|(digest, _)| digest.clone());
+        (
+            loader.plugin_digest.clone(),
+            marker_a,
+            marker_b,
+            cache_digest,
+        )
+    }
+
+    #[test]
+    fn a_cached_module_is_reused_only_when_its_digest_matches_the_file() {
+        let bytes_a = wasm_with_export("marker_a");
+        let bytes_b = wasm_with_export("marker_b");
+        let digest_a = plugin_digest_from_bytes(&bytes_a);
+        let digest_b = plugin_digest_from_bytes(&bytes_b);
+
+        let (digest, marker_a, marker_b, cache_digest) =
+            load_case(false, &bytes_b, Some((digest_a.clone(), bytes_a.clone())));
+        assert_eq!(digest, digest_b);
+        assert!(!marker_a && marker_b);
+        assert_eq!(cache_digest.as_deref(), Some(digest_a.as_str()));
+
+        let (digest, marker_a, marker_b, _) =
+            load_case(false, &bytes_a, Some((digest_a.clone(), bytes_a.clone())));
+        assert_eq!(digest, digest_a);
+        assert!(marker_a && !marker_b);
+
+        // A matching digest is the cache identity, so a poisoned entry is what the load reuses.
+        let (digest, marker_a, marker_b, _) =
+            load_case(false, &bytes_b, Some((digest_b.clone(), bytes_a.clone())));
+        assert_eq!(digest, digest_b);
+        assert!(marker_a && !marker_b);
+
+        let (digest, marker_a, marker_b, _) =
+            load_case(true, &bytes_b, Some((digest_b.clone(), bytes_a)));
+        assert_eq!(digest, digest_b);
+        assert!(
+            !marker_a && marker_b,
+            "skip_cache recompiles instead of reusing the cached module"
+        );
+    }
+
+    #[test]
+    fn the_same_load_reuses_its_module_after_the_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guest.wasm");
+        let bytes_a = wasm_with_export("marker_a");
+        let bytes_b = wasm_with_export("marker_b");
+        std::fs::write(&path, &bytes_a).unwrap();
+        let mut plugin_map = PluginMap::default();
+        let context = LoadingContext {
+            plugin_id: 3,
+            client_id: 1,
+            plugin_cwd: dir.path().to_path_buf(),
+            plugin_own_data_dir: dir.path().join("data"),
+            plugin_own_cache_dir: dir.path().join("cache"),
+            plugin_config: PluginConfig {
+                path: path.clone(),
+                _allow_exec_host_cmd: false,
+                location: zellij_utils::input::layout::RunPluginLocation::File(path),
+                initial_userspace_configuration: Default::default(),
+                initial_cwd: None,
+            },
+            tab_index: None,
+            path_to_default_shell: PathBuf::from("/bin/sh"),
+            session_env_vars: Default::default(),
+            default_shell: None,
+            layout_dir: None,
+            default_mode: Default::default(),
+            keybinds: Arc::new(Vec::new()),
+            plugin_dir: dir.path().to_path_buf(),
+            size: Size { rows: 2, cols: 2 },
+            generation: 9,
+        };
+        let mut loader = PluginLoader::new(
+            true,
+            context,
+            ThreadSenders::default(),
+            Engine::default(),
+            Arc::new(Mutex::new(HashMap::new())),
+            &mut plugin_map,
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let first = loader.load_module().unwrap();
+        assert!(has_export(&loader.engine, &first, "marker_a"));
+        let digest = loader.plugin_digest.clone();
+        std::fs::write(&loader.plugin_config.path, bytes_b).unwrap();
+        let second = loader.load_module().unwrap();
+        assert_eq!(loader.plugin_digest, digest);
+        assert!(has_export(&loader.engine, &second, "marker_a"));
+        assert!(!has_export(&loader.engine, &second, "marker_b"));
+    }
 }

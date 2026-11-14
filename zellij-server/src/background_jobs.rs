@@ -55,6 +55,7 @@ pub enum BackgroundJob {
         BTreeMap<String, String>,
         PathBuf,
         BTreeMap<String, String>,
+        u64, // load generation that scheduled the command
     ), // command, args, env_variables, cwd, context
     RunInBackground {
         command: PathBuf,
@@ -70,6 +71,7 @@ pub enum BackgroundJob {
         BTreeMap<String, String>, // headers
         Vec<u8>,                  // body
         BTreeMap<String, String>, // context
+        u64,                      // load generation that scheduled the request
     ),
     HighlightPanesWithMessage(Vec<PaneId>, String),
     RenderToClients,
@@ -541,6 +543,7 @@ pub(crate) fn background_jobs_main(
                 env_variables,
                 cwd,
                 context,
+                generation,
             ) => {
                 runtime.spawn({
                     let senders = bus.senders.clone();
@@ -559,22 +562,30 @@ pub(crate) fn background_jobs_main(
                                 let stdout = output.stdout;
                                 let stderr = output.stderr;
                                 let exit_code = output.exit_code;
-                                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                    Some(plugin_id),
-                                    Some(client_id),
-                                    Event::RunCommandResult(exit_code, stdout, stderr, context),
-                                )]));
+                                let _ =
+                                    senders.send_to_plugin(PluginInstruction::ApplyLoadResult {
+                                        plugin_id,
+                                        client_id,
+                                        event: Event::RunCommandResult(
+                                            exit_code, stdout, stderr, context,
+                                        ),
+                                        generation,
+                                    });
                             },
                             Err(e) => {
                                 log::error!("Failed to run command: {}", e);
                                 let stdout = vec![];
                                 let stderr = format!("{}", e).as_bytes().to_vec();
                                 let exit_code = Some(2);
-                                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                    Some(plugin_id),
-                                    Some(client_id),
-                                    Event::RunCommandResult(exit_code, stdout, stderr, context),
-                                )]));
+                                let _ =
+                                    senders.send_to_plugin(PluginInstruction::ApplyLoadResult {
+                                        plugin_id,
+                                        client_id,
+                                        event: Event::RunCommandResult(
+                                            exit_code, stdout, stderr, context,
+                                        ),
+                                        generation,
+                                    });
                             },
                         }
                     }
@@ -588,7 +599,16 @@ pub(crate) fn background_jobs_main(
             } => {
                 runtime.spawn(run_in_background(command, args, cwd, env));
             },
-            BackgroundJob::WebRequest(plugin_id, client_id, url, verb, headers, body, context) => {
+            BackgroundJob::WebRequest(
+                plugin_id,
+                client_id,
+                url,
+                verb,
+                headers,
+                body,
+                context,
+                generation,
+            ) => {
                 runtime.spawn({
                     let senders = bus.senders.clone();
                     let http_client = http_client.clone();
@@ -646,25 +666,27 @@ pub(crate) fn background_jobs_main(
 
                         match web_request(url, verb, headers, body, http_client).await {
                             Ok((status, headers, body)) => {
-                                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                    Some(plugin_id),
-                                    Some(client_id),
-                                    Event::WebRequestResult(status, headers, body, context),
-                                )]));
+                                let _ = senders.send_to_plugin(PluginInstruction::ApplyLoadResult {
+                                    plugin_id,
+                                    client_id,
+                                    event: Event::WebRequestResult(status, headers, body, context),
+                                    generation,
+                                });
                             },
                             Err(e) => {
                                 log::error!("Failed to send web request: {}", e);
                                 let error_body = e.to_string().as_bytes().to_vec();
-                                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                    Some(plugin_id),
-                                    Some(client_id),
-                                    Event::WebRequestResult(
+                                let _ = senders.send_to_plugin(PluginInstruction::ApplyLoadResult {
+                                    plugin_id,
+                                    client_id,
+                                    event: Event::WebRequestResult(
                                         400,
                                         BTreeMap::new(),
                                         error_body,
                                         context,
                                     ),
-                                )]));
+                                    generation,
+                                });
                             },
                         }
                     }

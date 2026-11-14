@@ -125,6 +125,7 @@ impl ScreenLog {
                         plugin_permission.permissions,
                         PermissionStatus::Granted,
                         Some(self.cache_path.clone()),
+                        plugin_permission.prompt_id,
                     ));
             },
             ScreenInstruction::SetPaneCollapsed(pane_id, true) => {

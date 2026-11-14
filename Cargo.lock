@@ -6603,6 +6603,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook 0.3.18",
  "sixel-image",
  "sixel-tokenizer",
@@ -6615,6 +6616,7 @@ dependencies = [
  "uuid",
  "wasmi",
  "wasmi_wasi",
+ "wat",
  "windows-sys 0.59.0",
  "zellij-utils",
 ]

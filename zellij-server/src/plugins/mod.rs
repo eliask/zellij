@@ -81,7 +81,20 @@ pub enum PluginInstruction {
     ),
     LoadBackgroundPlugin(RunPluginOrAlias, ClientId),
     Update(Vec<(Option<PluginId>, Option<ClientId>, Event)>), // Focused plugin / broadcast, client_id, event data
-    Unload(PluginId),                                         // plugin_id
+    ApplyTimer {
+        plugin_id: PluginId,
+        client_id: ClientId,
+        elapsed_seconds: f64,
+        generation: u64,
+    },
+    // Result of a run command, web request, or run action, tagged with the load that scheduled it.
+    ApplyLoadResult {
+        plugin_id: PluginId,
+        client_id: ClientId,
+        event: Event,
+        generation: u64,
+    },
+    Unload(PluginId), // plugin_id
     Reload(
         Option<bool>,   // should float
         Option<String>, // pane title
@@ -144,7 +157,11 @@ pub enum PluginInstruction {
         Vec<PermissionType>,
         PermissionStatus,
         Option<PathBuf>,
+        u64, // prompt id recorded when this prompt was shown
     ),
+    // Permissions this module already holds. `generation` and `digest` are the instance that
+    // checked the cache; a later instance with the same id must not inherit the grant.
+    GrantKnownPermissions(PluginId, Option<ClientId>, Vec<PermissionType>, u64, String),
     DumpLayout(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
     ListClientsMetadata(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
     DumpLayoutToPlugin {
@@ -214,6 +231,10 @@ pub enum PluginInstruction {
     },
     CachePluginEvents {
         plugin_id: PluginId,
+        // identify the module instance whose permission prompt is about to be shown
+        generation: u64,
+        digest: String,
+        prompt_id: u64,
     },
     MessageFromPlugin {
         source_plugin_id: u32,
@@ -297,6 +318,8 @@ impl From<&PluginInstruction> for PluginContext {
             PluginInstruction::LoadBackgroundPlugin(..) => PluginContext::LoadBackgroundPlugin,
             PluginInstruction::LoadPopup { .. } => PluginContext::LoadPopup,
             PluginInstruction::Update(..) => PluginContext::Update,
+            PluginInstruction::ApplyTimer { .. } => PluginContext::Update,
+            PluginInstruction::ApplyLoadResult { .. } => PluginContext::Update,
             PluginInstruction::Unload(..) => PluginContext::Unload,
             PluginInstruction::Reload(..) => PluginContext::Reload,
             PluginInstruction::ReloadPluginWithId(..) => PluginContext::ReloadPluginWithId,
@@ -321,6 +344,7 @@ impl From<&PluginInstruction> for PluginContext {
             PluginInstruction::PluginSubscribedToEvents(..) => {
                 PluginContext::PluginSubscribedToEvents
             },
+            PluginInstruction::GrantKnownPermissions(..) => PluginContext::PermissionRequestResult,
             PluginInstruction::PermissionRequestResult(..) => {
                 PluginContext::PermissionRequestResult
             },
@@ -602,6 +626,34 @@ pub(crate) fn plugin_thread_main(
             },
             PluginInstruction::Update(updates) => {
                 wasm_bridge.update_plugins(updates, shutdown_send.clone())?;
+            },
+            PluginInstruction::ApplyTimer {
+                plugin_id,
+                client_id,
+                elapsed_seconds,
+                generation,
+            } => {
+                wasm_bridge.set_scheduled_timer_generation(generation);
+                wasm_bridge.update_plugins(
+                    vec![(
+                        Some(plugin_id),
+                        Some(client_id),
+                        Event::Timer(elapsed_seconds),
+                    )],
+                    shutdown_send.clone(),
+                )?;
+            },
+            PluginInstruction::ApplyLoadResult {
+                plugin_id,
+                client_id,
+                event,
+                generation,
+            } => {
+                wasm_bridge.set_scheduled_timer_generation(generation);
+                wasm_bridge.update_plugins(
+                    vec![(Some(plugin_id), Some(client_id), event)],
+                    shutdown_send.clone(),
+                )?;
             },
             PluginInstruction::Unload(pid) => {
                 wasm_bridge.unload_plugin(pid)?;
@@ -978,27 +1030,34 @@ pub(crate) fn plugin_thread_main(
                 permissions,
                 status,
                 cache_path,
+                prompt_id,
             ) => {
-                if let Err(e) = wasm_bridge.cache_plugin_permissions(
+                // The answer names the prompt that was shown. A later prompt stored under the
+                // same plugin id must not accept this one.
+                wasm_bridge.apply_permission_prompt_result(
                     plugin_id,
                     client_id,
                     permissions,
                     status,
                     cache_path,
-                ) {
-                    log::error!("{}", e);
-                }
-
-                let updates = vec![(
-                    Some(plugin_id),
+                    prompt_id,
+                    shutdown_send.clone(),
+                )?;
+            },
+            PluginInstruction::GrantKnownPermissions(
+                plugin_id,
+                client_id,
+                permissions,
+                generation,
+                digest,
+            ) => {
+                wasm_bridge.grant_known_permissions(
+                    plugin_id,
                     client_id,
-                    Event::PermissionRequestResult(status),
-                )];
-                wasm_bridge.update_plugins(updates, shutdown_send.clone())?;
-                let done_receiving_permissions = true;
-                wasm_bridge.apply_cached_events(
-                    vec![plugin_id],
-                    done_receiving_permissions,
+                    permissions,
+                    generation,
+                    &digest,
+                    None,
                     shutdown_send.clone(),
                 )?;
             },
@@ -1402,8 +1461,13 @@ pub(crate) fn plugin_thread_main(
                     notification_end,
                 )?;
             },
-            PluginInstruction::CachePluginEvents { plugin_id } => {
-                wasm_bridge.cache_plugin_events(plugin_id);
+            PluginInstruction::CachePluginEvents {
+                plugin_id,
+                generation,
+                digest,
+                prompt_id,
+            } => {
+                wasm_bridge.cache_plugin_events(plugin_id, generation, digest, prompt_id);
             },
             PluginInstruction::MessageFromPlugin {
                 source_plugin_id,

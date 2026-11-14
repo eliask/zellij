@@ -648,7 +648,7 @@ impl Tab {
                     Event::Key(key_with_modifier),
                 )]));
             },
-            Some(AdjustedInput::PermissionRequestResult(permissions, status)) => {
+            Some(AdjustedInput::PermissionRequestResult(permissions, status, prompt_id)) => {
                 if let Some(pane) = self.popup_pane_mut(plugin_id) {
                     pane.request_permissions_from_user(None);
                 }
@@ -661,6 +661,7 @@ impl Tab {
                         permissions,
                         status,
                         None,
+                        prompt_id,
                     ));
                 self.set_force_render();
             },
